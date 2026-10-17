@@ -251,6 +251,7 @@ fn read_alignment(a: &El) -> Alignment {
         shrink: a.flag("shrinkToFit", false),
         indent: a.attr_u32("indent").unwrap_or(0).min(250) as u8,
         rotation: 0,
+        reading_order: a.attr_u32("readingOrder").filter(|r| *r <= 2).unwrap_or(0) as u8,
     };
     if let Some(r) = a.attr_i64("textRotation") {
         al.rotation = match r {
@@ -533,6 +534,9 @@ fn alignment_xml(a: &Alignment) -> Option<String> {
     }
     if a.shrink {
         s.push_str(" shrinkToFit=\"1\"");
+    }
+    if matches!(a.reading_order, 1 | 2) {
+        let _ = write!(s, " readingOrder=\"{}\"", a.reading_order);
     }
     s.push_str("/>");
     Some(s)

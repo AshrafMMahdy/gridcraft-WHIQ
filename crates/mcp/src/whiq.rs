@@ -156,14 +156,170 @@ pub fn definitions() -> Vec<Value> {
     v
 }
 
-/// The authoring, rendering and editing tools (later WHIQ steps).
+const PAPERS: &[&str] = &["Letter", "Legal", "A4", "A3", "A5", "Tabloid", "Executive", "Ledger", "B5"];
+
+/// The authoring, rendering and editing tools.
 fn more_definitions() -> Vec<Value> {
-    vec![]
+    let png_common = || {
+        json!({
+            "sheet": string("Sheet name (default: the active sheet)"),
+            "scale": number("Pixels per sheet pixel, 0.1–8 (default 2; 1 = 96 dpi)"),
+            "gridlines": boolean("Draw gridlines (default true)"),
+            "headings": boolean("Draw row numbers and column letters (default false)"),
+            "path": string("Write the PNG here (inside the write root). Without it the picture comes back inline (up to 2 MB)"),
+        })
+    };
+    let mut range_props = png_common();
+    range_props["range"] = string("Range to draw, e.g. \"A1:F20\" or \"Sheet2!B2:H30\"");
+    let mut sheet_props = png_common();
+    sheet_props["max_pixels"] = int("Longest side in pixels (default 4000): the scale shrinks to fit");
+    vec![
+        tool(
+            "render_range",
+            "Render range",
+            "A PNG picture of a range exactly as it prints: fills, borders, number formats, fonts, merged cells, conditional \
+             formats, charts, pictures and shapes. Arabic and other complex scripts are shaped and right-to-left; right-to-left \
+             sheets are mirrored. Give `path` to save the file, or get the picture inline.",
+            obj(range_props, &["range"]),
+            crate::tools::OVERWRITE,
+        ),
+        tool(
+            "render_sheet",
+            "Render sheet",
+            "A PNG picture of a whole sheet (its print area, else everything used, charts included), scaled to fit `max_pixels`.",
+            obj(sheet_props, &[]),
+            crate::tools::OVERWRITE,
+        ),
+        tool(
+            "export_pdf",
+            "Export PDF",
+            "Export the active sheet (or every sheet) to PDF with page setup: paper, orientation, fit to width, repeat header \
+             rows, margins, gridlines, headings, header/footer. Fonts are embedded as subsets (Arabic shaped, with an Arabic \
+             fallback font always available), so the PDF looks the same everywhere and its text can be selected. The page \
+             setup given is kept on the sheet (it prints the same way next time).",
+            obj(
+                json!({
+                    "path": string("Destination .pdf (inside the write root). Without it the PDF comes back as base64"),
+                    "sheets": enumeration("Which sheets (default: active)", &["active", "all"]),
+                    "range": string("Print only this range of the active sheet, e.g. \"A1:H60\""),
+                    "paper": enumeration("Paper size", PAPERS),
+                    "orientation": enumeration("Page orientation", &["portrait", "landscape"]),
+                    "fit_width": boolean("Fit all columns on one page width (pages run down as needed)"),
+                    "fit_to_page": boolean("Fit the whole print area on one page"),
+                    "repeat_header_rows": string("Rows repeated at the top of every page, e.g. \"1:1\" or \"1:2\""),
+                    "margins": {"type": "object", "description": "Margins in inches: {left, right, top, bottom, header, footer}"},
+                    "gridlines": boolean("Print gridlines"),
+                    "headings": boolean("Print row and column headings"),
+                    "header": string("Page header, e.g. \"&CQuarterly report\""),
+                    "footer": string("Page footer, e.g. \"&CPage &P of &N\""),
+                    "fonts": enumeration("embedded (default): every font embedded as a subset; auto: only non-Latin text; standard: PDF base fonts", &["embedded", "auto", "standard"]),
+                }),
+                &[],
+            ),
+            crate::tools::OVERWRITE,
+        ),
+    ]
+}
+
+fn enumeration(desc: &str, values: &[&str]) -> Value {
+    json!({"type": "string", "enum": values, "description": desc})
 }
 
 /// The WHIQ tools that upstream's dispatcher doesn't know.
-pub(crate) fn dispatch_extra(_b: &mut dyn Backend, name: &str, _a: &Args) -> Result<Value, String> {
-    Err(format!("unknown tool `{name}`"))
+pub(crate) fn dispatch_extra(b: &mut dyn Backend, name: &str, a: &Args) -> Result<Value, String> {
+    match name {
+        "render_range" | "render_sheet" => render(b, name, a),
+        "export_pdf" => export_pdf(b, a),
+        other => Err(format!("unknown tool `{other}`")),
+    }
+}
+
+/// Largest inline picture (bytes of PNG).
+const MAX_INLINE_PNG: usize = 2 * 1024 * 1024;
+
+fn render(b: &mut dyn Backend, name: &str, a: &Args) -> Result<Value, String> {
+    let mut p = pick(a, &["range", "sheet", "scale", "gridlines", "headings", "path"]);
+    if name == "render_sheet" {
+        p["maxPixels"] = json!(a.get("max_pixels").and_then(Value::as_f64).unwrap_or(4000.0));
+        if let Some(o) = p.as_object_mut() {
+            o.remove("range");
+        }
+    }
+    if let Some(r) = a.get("range").and_then(Value::as_str)
+        && let (Some(sheet), _) = split_sheet(r)
+    {
+        p["sheet"] = json!(sheet);
+    }
+    let mut v = exec(b, "file.renderPng", p)?;
+    if let Some(data) = v.as_object_mut().and_then(|o| o.remove("base64")) {
+        let size = v["bytes"].as_u64().unwrap_or(0) as usize;
+        if size > MAX_INLINE_PNG {
+            return Err(format!(
+                "the picture is too large to return inline ({size} bytes): pass `path` to save it, or a lower `scale` (render it in parts too large)"
+            ));
+        }
+        v["__image"] = json!({"data": data, "mimeType": "image/png"});
+    }
+    Ok(v)
+}
+
+fn export_pdf(b: &mut dyn Backend, a: &Args) -> Result<Value, String> {
+    let mut setup = Map::new();
+    for (from, to) in [
+        ("paper", "paper"),
+        ("orientation", "orientation"),
+        ("margins", "margins"),
+        ("gridlines", "gridlines"),
+        ("headings", "headings"),
+        ("header", "header"),
+        ("footer", "footer"),
+    ] {
+        if let Some(v) = a.get(from).filter(|v| !v.is_null()) {
+            setup.insert(to.into(), v.clone());
+        }
+    }
+    if a.get("fit_width").and_then(Value::as_bool) == Some(true) {
+        setup.insert("fitWidth".into(), json!(1));
+        setup.insert("fitHeight".into(), json!(0));
+    }
+    if let Some(rows) = a.get("repeat_header_rows").and_then(Value::as_str) {
+        let rows = rows.trim();
+        let rows = match rows.parse::<u32>() {
+            Ok(n) if n >= 1 => format!("1:{n}"),
+            _ => rows.trim_start_matches('$').to_string(),
+        };
+        setup.insert("titleRows".into(), json!(rows));
+    }
+    let all = a.get("sheets").and_then(Value::as_str) == Some("all");
+    if !setup.is_empty() {
+        let sheets: Vec<String> = if all {
+            b.call("document.inspect", json!({}))?["sheets"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|s| s["name"].as_str().map(str::to_string))
+                .collect()
+        } else {
+            vec![]
+        };
+        if sheets.is_empty() {
+            exec(b, "pageLayout.pageSetup", Value::Object(setup.clone()))?;
+        }
+        for sh in sheets {
+            let mut p = setup.clone();
+            p.insert("sheet".into(), json!(sh));
+            exec(b, "pageLayout.pageSetup", Value::Object(p))?;
+        }
+    }
+    let mut p = pick(a, &["path", "sheets", "range", "fit_to_page"]);
+    if let Some(o) = p.as_object_mut()
+        && let Some(f) = o.remove("fit_to_page")
+    {
+        o.insert("fitToPage".into(), f);
+    }
+    p["fonts"] = json!(a.get("fonts").and_then(Value::as_str).unwrap_or("embedded"));
+    exec(b, "file.exportPdf", p)
 }
 
 /// Upstream's and the WHIQ tools with the test hooks when enabled.
@@ -302,7 +458,12 @@ pub fn run_tool(b: &mut dyn Backend, st: &mut CallState, name: &str, args: &Valu
                     None => v["warnings"] = json!(warnings),
                 }
             }
-            ToolResult::json(&v)
+            let image = v.as_object_mut().and_then(|o| o.remove("__image"));
+            let mut r = ToolResult::json(&v);
+            if let Some(img) = image {
+                r.content.push(json!({"type": "image", "data": img["data"], "mimeType": img["mimeType"]}));
+            }
+            r
         }
         Err(e) => ToolResult::failure(&e),
     }

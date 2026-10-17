@@ -316,6 +316,10 @@ pub struct Alignment {
     pub indent: u8,
     /// Degrees -90..=90, or 255 for vertical stacked text.
     pub rotation: i16,
+    /// WHIQ: text direction (`readingOrder`): 0 context (the text's first strong character),
+    /// 1 left-to-right, 2 right-to-left.
+    #[serde(default)]
+    pub reading_order: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

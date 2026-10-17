@@ -277,3 +277,60 @@ fn info_strings_are_capped() {
     let pdf = doc.finish();
     assert_eq!(utf16_entry(&pdf, "/Title").chars().count(), MAX_INFO_CHARS);
 }
+
+// ---------- WHIQ: embedded shaped text ----------
+
+#[test]
+fn embedded_fonts_carry_arabic_as_subset_type0_fonts() {
+    let mut d = PdfDoc::new();
+    d.text_mode = TextMode::Auto;
+    let pg = d.add_page(300.0, 200.0);
+    pg.text(10.0, 20.0, 12.0, Font::Helvetica, [0, 0, 0], "plain");
+    assert!(!pg.embeds("plain"), "plain WinAnsi text keeps the standard fonts in Auto");
+    assert!(pg.embeds("مرحبا بالعالم"));
+    pg.text(10.0, 50.0, 12.0, Font::Helvetica, [0, 0, 0], "مرحبا بالعالم");
+    pg.text(10.0, 80.0, 12.0, Font::HelveticaBold, [0, 0, 0], "Total ١٢٣ ريال");
+    let w = pg.measure(Font::Helvetica, 12.0, "مرحبا");
+    assert!(w > 10.0 && w < 60.0, "{w}");
+    let pdf = d.finish();
+    let s = String::from_utf8_lossy(&pdf);
+    assert!(s.contains("(plain) Tj"));
+    assert!(s.contains("/Subtype /Type0") && s.contains("/Encoding /Identity-H"));
+    assert!(s.contains("/Subtype /CIDFontType2") && s.contains("/FontFile2") && s.contains("/ToUnicode"));
+    assert!(s.contains("+NotoSansArabic-Regular") && s.contains("+NotoSansArabic-Bold"), "Arabic fallback faces");
+    // A subset, not the whole 140 KB face.
+    assert!(pdf.len() < 60_000, "{} bytes", pdf.len());
+    check_xref(&pdf);
+}
+
+#[test]
+fn standard_mode_is_upstream_behaviour() {
+    let mut d = PdfDoc::new();
+    let pg = d.add_page(300.0, 200.0);
+    assert!(!pg.embeds("مرحبا"));
+    pg.text(10.0, 20.0, 12.0, Font::Helvetica, [0, 0, 0], "مرحبا");
+    let s = String::from_utf8_lossy(&d.finish()).into_owned();
+    assert!(!s.contains("/Type0"));
+}
+
+#[test]
+fn embedded_text_is_extractable() {
+    // Proved with poppler's pdftotext when it is installed.
+    let Ok(dir) = std::env::var("CARGO_TARGET_TMPDIR").map(std::path::PathBuf::from).or_else(|_| Ok::<_, ()>(std::env::temp_dir())) else { return };
+    let mut d = PdfDoc::new();
+    d.text_mode = TextMode::Embedded;
+    let pg = d.add_page(400.0, 200.0);
+    pg.text(10.0, 30.0, 14.0, Font::Helvetica, [0, 0, 0], "Invoice total");
+    pg.text(10.0, 70.0, 14.0, Font::Helvetica, [0, 0, 0], "الإجمالي");
+    let path = dir.join(format!("gc-embedded-{}.pdf", std::process::id()));
+    std::fs::write(&path, d.finish()).unwrap();
+    let Ok(out) = std::process::Command::new("pdftotext").arg(&path).arg("-").output() else {
+        eprintln!("skipped: pdftotext not installed");
+        return;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Invoice total"), "{text}");
+    let letters: String = text.chars().filter(|c| !c.is_whitespace() && !matches!(*c, '\u{202A}'..='\u{202E}' | '\u{200E}' | '\u{200F}')).collect();
+    assert!(letters.contains("الإجمالي"), "Arabic text is extractable in order: {text}");
+    let _ = std::fs::remove_file(path);
+}

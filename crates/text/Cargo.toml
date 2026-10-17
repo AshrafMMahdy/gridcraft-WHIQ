@@ -1,0 +1,15 @@
+[package]
+name = "gridcraft-text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WHIQ: GridCraft text layout for exports: bundled fonts with an Arabic fallback, bidi, HarfRust shaping, glyph outlines"
+
+[lints]
+workspace = true
+
+[dependencies]
+harfrust = "0.13"
+skrifa = { version = "0.46", default-features = false, features = ["std"] }
+unicode-bidi = "0.3"
+unicode-script = "0.5"

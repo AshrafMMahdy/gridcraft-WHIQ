@@ -24,6 +24,9 @@ gridcraft-engine = { path = "crates/engine" }
 gridcraft-ui-egui = { path = "crates/ui-egui" }
 gridcraft-mcp = { path = "crates/mcp" }
 gridcraft-pdf = { path = "crates/pdf" }
+# WHIQ: shaping, bidi and bundled fonts for exports; the raster canvas for PNG renders.
+gridcraft-text = { path = "crates/text" }
+gridcraft-raster = { path = "crates/raster" }
 
 # foundation
 thiserror = "2"

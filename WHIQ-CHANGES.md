@@ -92,3 +92,57 @@ pipeline every `tools/call` goes through, `server_status`, `job_status`, error c
 - Contract-test hooks `debug_sleep` / `debug_panic` exist only with `GRIDCRAFT_MCP_TEST_HOOKS=1`.
 - Upstream unit tests in `crates/mcp/src/tests.rs` that expected JSON-RPC `-32602` for bad
   arguments now expect an `invalid_argument` tool result (the contract's choice).
+
+## 3. Arabic and complex text: shaping, bidi, embedded subset fonts, RTL sheets
+
+- **`crates/text` (`gridcraft-text`, layer 0, new).** Noto Sans and Noto Sans Arabic (regular,
+  bold; SIL OFL 1.1, `assets/fonts/whiq/`, ATTRIBUTION rows) are compiled into native builds, so
+  an Arabic fallback face is always in the binary (web builds carry none and keep the standard
+  PDF fonts). Lines are ordered with the Unicode Bidirectional Algorithm (`unicode-bidi`); the
+  paragraph direction is the one given, else the first strong character's (an Arabic cell is
+  RTL). Runs are shaped with HarfRust (Arabic joining, ligatures, marks, mirrored brackets);
+  characters pick a face by script, neutrals stay with their run, a face lacking a character
+  hands it to the other. Glyph outlines come from skrifa. *Deviation from upstream policy:*
+  upstream keeps fonts out of the repository (craft-fonts); the WHIQ contract requires an Arabic
+  fallback always present, so these four OFL faces are vendored, documented in ATTRIBUTION.md.
+- **PDF (`crates/pdf`).** New `TextMode`: `Standard` (upstream), `Auto` (standard fonts for
+  plain left-to-right WinAnsi text, embedded shaped text for everything else — the engine's new
+  default) and `Embedded` (every string; the MCP `export_pdf` default). Embedded text is a Type0 /
+  CIDFontType2 font per face with a **subset** FontFile2 (`subsetter`, Flate-compressed),
+  `CIDToGIDMap`, `/W` widths and a `ToUnicode` map. Every (glyph, text) pair has its own CID, because
+  shaped Arabic draws different letters with one glyph plus dots; marks follow their base in the
+  content stream; glyphs are placed with one `Tm` per line and `TJ` adjustments, so text
+  extraction (pdftotext) reads `البند`, `الإجمالي` in order and copy/paste works.
+- **Cells.** `Alignment::reading_order` (model, xlsx `readingOrder` read/write, new command
+  `home.textDirection {range, direction: context|ltr|rtl}`, MCP `format_range direction`).
+  General-aligned text starts at its reading start (Arabic right-aligned), numbers stay right.
+- **RTL sheets** (`view.rightToLeft`, `sheet.right_to_left`): PDF and PNG draw the sheet mirrored
+  (column A on the right, row headings on the right, overflow to the left), text and pictures
+  not flipped; charts, pictures and shapes are anchored from the right.
+- The sheet painter (`crates/engine/src/cmd/print.rs`) now draws on a `Canvas` trait (PDF page or
+  raster canvas) and measures text with the surface's own metrics (shaped widths for wrapping,
+  alignment, shrink-to-fit, `####`, chart labels).
+- Tests: `gridcraft-text` (bundled faces, joining, visual order, mixed lines, outlines),
+  `gridcraft-pdf` (`embedded_fonts_carry_arabic_as_subset_type0_fonts`,
+  `embedded_text_is_extractable` with pdftotext), engine `print::tests::arabic_cells_are_right_aligned_…`,
+  `right_to_left_sheets_put_column_a_on_the_right`, `pdf_embeds_subset_fonts_for_arabic_only_where_needed`,
+  xlsx round trip of `readingOrder`, contract `render::arabic_pdf_export_embeds_subset_fonts`.
+
+## 4. Headless renders and PDF export with page setup
+
+- **`crates/raster` (`gridcraft-raster`, layer 0, new):** a tiny-skia canvas with the PDF page's
+  drawing calls (fills, strokes, dashes, polygons, circles, clips, images) and shaped text filled
+  from glyph outlines; PNG output. Sizes are capped (16 384 px a side, 100 Mpx).
+- **`file.renderPng`** (engine command): `{range?, sheet?, scale?: 0.1–8, gridlines?, headings?,
+  maxPixels?, path?}` draws a range (default the print range) with the PDF painter — fills,
+  borders, number formats, fonts, merged cells, conditional formats, charts, pictures, shapes,
+  sparklines — to PNG (file or base64). Whole columns/rows mean their used part.
+- **MCP tools:** `render_range` (a range; inline MCP `image` content when no `path`, ≤ 2 MB),
+  `render_sheet` (the whole sheet scaled to `max_pixels`), `export_pdf` (`path`, `sheets`, `range`,
+  `paper`, `orientation`, `fit_width`, `fit_to_page`, `repeat_header_rows`, `margins`,
+  `gridlines`, `headings`, `header`, `footer`, `fonts`), which applies the page setup to the
+  sheet(s) and exports with embedded subset fonts. `file.exportPdf` takes `fonts`.
+- Tests: engine `png_renders_refuse_hostile_sizes`, raster unit tests, contract
+  `render::arabic_png_render` (Arabic right-aligned in A1, numbers right, inline image block,
+  fitted sheet, RTL sheet with A on the right) and `render::pdf_page_setup` (A4 landscape,
+  fit to width over several pages, header row repeated on every page, footer page numbers).

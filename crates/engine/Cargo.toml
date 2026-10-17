@@ -22,6 +22,9 @@ log = { workspace = true }
 gridcraft-xlsx = { workspace = true }
 gridcraft-chart = { workspace = true }
 gridcraft-pdf = { workspace = true }
+# WHIQ: shaped text and the raster canvas (PNG renders).
+gridcraft-text = { workspace = true }
+gridcraft-raster = { workspace = true }
 image = { workspace = true }
 
 [dev-dependencies]

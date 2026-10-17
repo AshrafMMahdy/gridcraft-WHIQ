@@ -6,11 +6,16 @@
 //! - RGBA images as RGB image XObjects with a soft mask for alpha (run-length encoded).
 //! - Coordinates are points with a **top-left origin** (y grows down); text `y` is the baseline.
 //!
-//! Streams are written uncompressed (images use the trivial RunLengthDecode filter) so the crate
-//! needs no dependencies.
+//! Streams are written uncompressed (images use the trivial RunLengthDecode filter).
+//!
+//! WHIQ: with [`TextMode::Auto`] or [`TextMode::Embedded`] text is laid out by `gridcraft-text`
+//! (bidi, HarfRust shaping, Arabic fallback) and drawn with embedded **subset** TrueType fonts
+//! (Type0 / CIDFontType2, Identity-H, a `ToUnicode` map so the text stays selectable and
+//! searchable). `Auto` keeps the standard fonts for plain left-to-right WinAnsi text.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+mod embed;
 mod metrics;
 
 use std::fmt::Write as _;
@@ -35,6 +40,22 @@ pub enum Font {
     CourierOblique,
     CourierBoldOblique,
 }
+
+/// How a document draws text (WHIQ).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextMode {
+    /// The standard 14 fonts only (upstream behaviour): characters outside WinAnsi show as `?`.
+    #[default]
+    Standard,
+    /// Standard fonts for plain left-to-right WinAnsi text, embedded shaped fonts for the rest
+    /// (Arabic, Hebrew, CJK, symbols…).
+    Auto,
+    /// Every string in embedded subset fonts.
+    Embedded,
+}
+
+/// Paragraph direction for [`Page::text_dir`] (re-exported from `gridcraft-text`).
+pub use gridcraft_text::Dir;
 
 /// A font family for [`Font::styled`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -81,6 +102,25 @@ impl Font {
 
     fn index(self) -> usize {
         Font::ALL.iter().position(|f| *f == self).unwrap_or(0)
+    }
+
+    pub fn is_bold(self) -> bool {
+        matches!(
+            self,
+            Font::HelveticaBold | Font::HelveticaBoldOblique | Font::TimesBold | Font::TimesBoldItalic | Font::CourierBold | Font::CourierBoldOblique
+        )
+    }
+
+    pub fn is_italic(self) -> bool {
+        matches!(
+            self,
+            Font::HelveticaOblique
+                | Font::HelveticaBoldOblique
+                | Font::TimesItalic
+                | Font::TimesBoldItalic
+                | Font::CourierOblique
+                | Font::CourierBoldOblique
+        )
     }
 
     /// The face of `family` with the given weight and slant.
@@ -148,6 +188,11 @@ pub fn text_width(font: Font, size: f32, text: &str) -> f32 {
     // u64: a u32 sum overflows for ~8 million characters.
     let units: u64 = text.chars().map(|c| u64::from(font.char_width(c))).sum();
     units as f32 * size / 1000.0
+}
+
+/// Can every character of `text` be written in WinAnsiEncoding (CP1252)?
+pub fn win_ansi_text(text: &str) -> bool {
+    text.chars().all(|c| c == '?' || c == '\t' || win_ansi(c) != b'?')
 }
 
 /// Unicode → WinAnsiEncoding (CP1252) byte; unmappable characters become `?`.
@@ -268,6 +313,9 @@ pub struct Page {
     fonts: [bool; 12],
     images: Vec<ImageData>,
     depth: u32,
+    /// WHIQ: how text is drawn, and the document's table of embedded glyphs.
+    mode: TextMode,
+    cids: std::sync::Arc<std::sync::Mutex<embed::Cids>>,
 }
 
 /// Most bytes of content per page before further drawing is dropped (keeps hostile inputs from
@@ -456,7 +504,38 @@ impl Page {
     /// Text rotated by `angle` radians (clockwise on the page, like the y-down coordinate
     /// system) about its baseline origin.
     pub fn text_rotated(&mut self, x: f32, y: f32, size: f32, font: Font, color: Rgb, text: &str, angle: f32) {
+        self.text_dir(x, y, size, font, color, text, angle, None);
+    }
+
+    /// WHIQ: does `text` go into embedded fonts on this page?
+    pub fn embeds(&self, text: &str) -> bool {
+        gridcraft_text::available()
+            && match self.mode {
+                TextMode::Standard => false,
+                TextMode::Embedded => true,
+                TextMode::Auto => gridcraft_text::is_complex(text) || !win_ansi_text(text),
+            }
+    }
+
+    /// The text mode of this page.
+    pub fn text_mode(&self) -> TextMode {
+        self.mode
+    }
+
+    /// WHIQ: width of `text` as this page draws it (standard metrics or shaped embedded glyphs).
+    pub fn measure(&self, font: Font, size: f32, text: &str) -> f32 {
+        if self.embeds(text) { gridcraft_text::width(text, size, font.is_bold()) } else { text_width(font, size, text) }
+    }
+
+    /// WHIQ: text with a paragraph direction (`None`: from its first strong character). Shaped
+    /// and embedded when [`Page::embeds`] says so; the standard fonts otherwise.
+    pub fn text_dir(&mut self, x: f32, y: f32, size: f32, font: Font, color: Rgb, text: &str, angle: f32, base: Option<Dir>) {
         if text.is_empty() || !extent(size) || !finite(&[x, y]) {
+            return;
+        }
+        if self.embeds(text) {
+            let line = gridcraft_text::shape(text, size, font.is_bold(), base);
+            self.glyph_run(x, y, size, color, &line, angle, font.is_italic());
             return;
         }
         let fi = font.index();
@@ -478,6 +557,74 @@ impl Page {
             n(self.y(y)),
             pdf_string(text)
         );
+        self.op(&s);
+    }
+
+    /// WHIQ: a shaped line in embedded fonts. One text object: the line's matrix once, then
+    /// `TJ` arrays whose adjustments put every glyph exactly where the shaper placed it (text
+    /// stays one run for extraction); vertical offsets (marks) use the text rise.
+    pub fn glyph_run(&mut self, x: f32, y: f32, size: f32, color: Rgb, line: &gridcraft_text::Line, angle: f32, italic: bool) {
+        if line.glyphs.is_empty() || !extent(size) || !finite(&[x, y]) {
+            return;
+        }
+        let size = size.min(10_000.0);
+        let (sn, cs) = if angle.is_finite() { angle.sin_cos() } else { (0.0, 1.0) };
+        // Synthetic oblique for italics (the bundled faces are upright).
+        let k = if italic { 0.2 } else { 0.0 };
+        let (a, b, c, d) = (cs, -sn, k * cs + sn, -k * sn + cs);
+        let mut s = format!("BT\n{}\n{} {} {} {} {} {} Tm\n", rgb_op(color, false), n(a), n(b), n(c), n(d), n(x), n(self.y(y)));
+        let mut face: Option<u8> = None;
+        let mut rise = 0.0f32;
+        // Pen position (text space, points) after the last glyph shown.
+        let mut cur = 0.0f32;
+        let mut tj = String::new();
+        let flush = |s: &mut String, tj: &mut String| {
+            if !tj.is_empty() {
+                let _ = writeln!(s, "[{}] TJ", tj.trim_end());
+                tj.clear();
+            }
+        };
+        // Content order: in each cluster the glyph that carries the text (the base letter) comes
+        // before its marks, so text extraction reads the letters in order.
+        let mut order: Vec<&gridcraft_text::Glyph> = Vec::with_capacity(line.glyphs.len());
+        for g in &line.glyphs {
+            match (g.text.is_some(), order.last()) {
+                (true, Some(prev)) if prev.text.is_none() && prev.advance == 0.0 && g.face == prev.face => {
+                    // A mark the shaper put first (right-to-left clusters come reversed).
+                    let k = order.len() - 1;
+                    order.insert(k, g);
+                }
+                _ => order.push(g),
+            }
+        }
+        let mut cids = self.cids.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for g in order {
+            if !finite(&[g.x, g.dy]) {
+                continue;
+            }
+            let Some(fc) = gridcraft_text::face(g.face) else { continue };
+            if face != Some(g.face) {
+                flush(&mut s, &mut tj);
+                let _ = writeln!(s, "/G{} {} Tf", g.face, n(size));
+                face = Some(g.face);
+            }
+            let r = -g.dy;
+            if (r - rise).abs() > 0.001 {
+                flush(&mut s, &mut tj);
+                let _ = writeln!(s, "{} Ts", n(r));
+                rise = r;
+            }
+            let adj = (cur - g.x) * 1000.0 / size;
+            if adj.abs() > 0.05 {
+                let _ = write!(tj, "{} ", n(adj));
+            }
+            let cid = cids.cid(g.face, g.gid, g.text.as_deref().unwrap_or(""));
+            let _ = write!(tj, "<{cid:04X}> ");
+            cur = g.x + fc.advance(g.gid) * size / fc.upem;
+        }
+        drop(cids);
+        flush(&mut s, &mut tj);
+        s.push_str("ET");
         self.op(&s);
     }
 
@@ -516,6 +663,10 @@ pub struct Info {
 pub struct PdfDoc {
     pages: Vec<Page>,
     pub info: Info,
+    /// WHIQ: how pages added from now on draw text.
+    pub text_mode: TextMode,
+    /// WHIQ: the embedded glyphs every page shares (one CID per glyph and the text it shows).
+    cids: std::sync::Arc<std::sync::Mutex<embed::Cids>>,
 }
 
 /// PackBits-style run-length encoding (PDF `RunLengthDecode`).
@@ -583,7 +734,16 @@ impl PdfDoc {
     pub fn add_page(&mut self, width_pt: f32, height_pt: f32) -> &mut Page {
         let width = if width_pt.is_finite() { width_pt.clamp(3.0, 14_400.0) } else { 612.0 };
         let height = if height_pt.is_finite() { height_pt.clamp(3.0, 14_400.0) } else { 792.0 };
-        self.pages.push(Page { width, height, content: String::new(), fonts: [false; 12], images: Vec::new(), depth: 0 });
+        self.pages.push(Page {
+            width,
+            height,
+            content: String::new(),
+            fonts: [false; 12],
+            images: Vec::new(),
+            depth: 0,
+            mode: self.text_mode,
+            cids: self.cids.clone(),
+        });
         let i = self.pages.len() - 1;
         &mut self.pages[i]
     }
@@ -620,6 +780,15 @@ impl PdfDoc {
         let mut objects: Vec<(u32, Vec<u8>)> = Vec::new();
         let mut kids = Vec::new();
         let mut font_dict = String::new();
+        // WHIQ: embedded subset fonts used by any page.
+        let glyphs = std::mem::take(&mut *self.cids.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        for (f, used) in glyphs.faces() {
+            let Some(face) = gridcraft_text::face(*f) else { continue };
+            let id = next;
+            next += embed::OBJECTS;
+            objects.extend(embed::font_objects(face, used, id));
+            let _ = write!(font_dict, "/G{f} {id} 0 R ");
+        }
         for (i, id) in font_ids.iter().enumerate() {
             if *id != 0 {
                 let _ = write!(font_dict, "/F{} {} 0 R ", i + 1, id);

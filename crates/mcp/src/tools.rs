@@ -283,6 +283,7 @@ fn base_definitions() -> Vec<Value> {
                     "numberFormat": string("Number format name or code"),
                     "horizontalAlign": enumeration("Horizontal alignment", &["left", "center", "right", "justify"]),
                     "wrapText": boolean("Wrap text on/off"),
+                    "direction": enumeration("Text direction (reading order): rtl for Arabic, ltr, or context (from the text)", &["context", "ltr", "rtl"]),
                     "borders": {
                         "description": "A border preset name, or {preset, style?, color?}",
                         "oneOf": [
@@ -561,6 +562,9 @@ fn format_range(b: &mut dyn Backend, a: &Args) -> Result<Value, String> {
     if let Some(v) = a.get("wrapText").and_then(Value::as_bool) {
         steps.push(("home.wrapText", json!({"range": r, "on": v})));
     }
+    if let Some(v) = a.get("direction").and_then(Value::as_str) {
+        steps.push(("home.textDirection", json!({"range": r, "direction": v})));
+    }
     match a.get("borders") {
         None | Some(Value::Null) => {}
         Some(Value::String(preset)) => steps.push(("home.borders", json!({"range": r, "preset": preset}))),
@@ -572,7 +576,7 @@ fn format_range(b: &mut dyn Backend, a: &Args) -> Result<Value, String> {
         Some(_) => return Err("`borders` must be a preset name or {preset, style?, color?}".into()),
     }
     if steps.is_empty() {
-        return Err("nothing to apply: give at least one of bold, italic, underline, fontName, fontSize, fontColor, fillColor, numberFormat, horizontalAlign, wrapText, borders".into());
+        return Err("nothing to apply: give at least one of bold, italic, underline, fontName, fontSize, fontColor, fillColor, numberFormat, horizontalAlign, wrapText, direction, borders".into());
     }
     let mut applied = Vec::new();
     for (id, p) in steps {

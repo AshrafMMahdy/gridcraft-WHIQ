@@ -11,3 +11,4 @@
 mod harness;
 
 mod contract;
+mod render;

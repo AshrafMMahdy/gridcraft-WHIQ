@@ -106,6 +106,15 @@ pub fn specs() -> Vec<CommandSpec> {
             |st| st.align.shrink,
             |st, v| st.align.shrink = v
         )),
+        cmd!(
+            "home.textDirection",
+            "Text Direction",
+            ["Home", "Alignment"],
+            None,
+            "{range?, direction: context|ltr|rtl} — reading order of the cells (context: from the text's first strong character)",
+            has_doc,
+            text_direction
+        ),
         cmd!("home.increaseIndent", "Increase Indent", ["Home", "Alignment"], Some("Ctrl+Alt+Tab"), "{range?}", has_doc, |s, p| indent(s, p, 1)),
         cmd!("home.decreaseIndent", "Decrease Indent", ["Home", "Alignment"], Some("Ctrl+Alt+Shift+Tab"), "{range?}", has_doc, |s, p| indent(
             s, p, -1
@@ -529,6 +538,17 @@ fn halign(s: &mut Session, p: &Json, a: HAlign) -> Result<Json> {
 
 fn valign(s: &mut Session, p: &Json, a: VAlign) -> Result<Json> {
     apply_style(s, p, |st| st.align.v = a)
+}
+
+/// WHIQ: Format Cells › Alignment › Text direction.
+fn text_direction(s: &mut Session, p: &Json) -> Result<Json> {
+    let order = match str_param(p, "direction").map(str::to_ascii_lowercase).as_deref() {
+        Some("context") | None => 0,
+        Some("ltr" | "lefttoright" | "left-to-right") => 1,
+        Some("rtl" | "righttoleft" | "right-to-left") => 2,
+        Some(other) => return Err(bad("home.textDirection", format!("direction must be context, ltr or rtl, not `{other}`"))),
+    };
+    apply_style(s, p, |st| st.align.reading_order = order)
 }
 
 fn indent(s: &mut Session, p: &Json, d: i32) -> Result<Json> {

@@ -23,9 +23,18 @@ pub fn specs() -> Vec<CommandSpec> {
             "Export as PDF",
             ["File", "Export"],
             None,
-            "{path?, sheets?: active|all, range?: \"A1:F40\" (active sheet), fitToPage?: bool} → {pages, bytes, path} or {pages, bytes, base64} when no path. Honours each sheet's Page Setup.",
+            "{path?, sheets?: active|all, range?: \"A1:F40\" (active sheet), fitToPage?: bool, fonts?: auto|embedded|standard (auto: embedded subset fonts for Arabic and other non-Latin text)} → {pages, bytes, path} or {pages, bytes, base64} when no path. Honours each sheet's Page Setup.",
             has_doc,
             export_pdf
+        ),
+        cmd!(
+            noundo "file.renderPng",
+            "Render as Picture",
+            ["File", "Export"],
+            None,
+            "{range?: \"A1:F20\" (default: the print range), sheet?, scale?: 0.1..8 (2), gridlines?: bool (true), headings?: bool, maxPixels?: n (shrink to fit), path?} → {width, height, bytes, range, path} or {…, base64} — a PNG of the cells, charts and pictures (shaped Arabic, right-to-left sheets mirrored)",
+            has_doc,
+            render_png_cmd
         ),
         cmd!(
             noundo "file.print",
@@ -600,6 +609,182 @@ pub fn expand_header_footer(spec: &str, cx: &HfContext) -> [HfSection; 3] {
 
 // ---------------------------------------------------------------- drawing
 
+/// WHIQ: what the sheet painter draws on — a PDF page or a raster canvas (PNG renders). Units
+/// are the surface's own (points or pixels), top-left origin, y down.
+pub(crate) trait Canvas {
+    fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: Rgb);
+    fn rect_stroke(&mut self, x: f32, y: f32, w: f32, h: f32, width: f32, color: Rgb);
+    fn stroke_line_dashed(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, color: Rgb, dash: &[f32]);
+    fn polyline(&mut self, pts: &[[f32; 2]], width: f32, color: Rgb, dash: &[f32]);
+    fn polygon(&mut self, pts: &[[f32; 2]], fill: Option<Rgb>, stroke: Option<(Rgb, f32)>);
+    fn circle(&mut self, cx: f32, cy: f32, r: f32, fill: Option<Rgb>, stroke: Option<(Rgb, f32)>);
+    /// Text with its baseline origin at `(x, y)`, rotated clockwise by `angle`, in paragraph
+    /// direction `base` (`None`: from its first strong character).
+    fn text_dir(&mut self, x: f32, y: f32, size: f32, font: Font, color: Rgb, text: &str, angle: f32, base: Option<gridcraft_text::Dir>);
+    /// Width of `text` as this surface draws it.
+    fn measure(&self, font: Font, size: f32, text: &str) -> f32;
+    fn image_rgba(&mut self, x: f32, y: f32, w: f32, h: f32, rgba: &[u8], pw: u32, ph: u32);
+    fn save(&mut self);
+    fn restore(&mut self);
+    fn clip_rect(&mut self, x: f32, y: f32, w: f32, h: f32);
+
+    fn stroke_line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, color: Rgb) {
+        self.stroke_line_dashed(x0, y0, x1, y1, width, color, &[]);
+    }
+    fn text(&mut self, x: f32, y: f32, size: f32, font: Font, color: Rgb, text: &str) {
+        self.text_dir(x, y, size, font, color, text, 0.0, None);
+    }
+    fn text_rotated(&mut self, x: f32, y: f32, size: f32, font: Font, color: Rgb, text: &str, angle: f32) {
+        self.text_dir(x, y, size, font, color, text, angle, None);
+    }
+}
+
+impl Canvas for Page {
+    fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: Rgb) {
+        Page::fill_rect(self, x, y, w, h, color);
+    }
+    fn rect_stroke(&mut self, x: f32, y: f32, w: f32, h: f32, width: f32, color: Rgb) {
+        Page::rect_stroke(self, x, y, w, h, width, color);
+    }
+    fn stroke_line_dashed(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, color: Rgb, dash: &[f32]) {
+        Page::stroke_line_dashed(self, x0, y0, x1, y1, width, color, dash);
+    }
+    fn polyline(&mut self, pts: &[[f32; 2]], width: f32, color: Rgb, dash: &[f32]) {
+        Page::polyline(self, pts, width, color, dash);
+    }
+    fn polygon(&mut self, pts: &[[f32; 2]], fill: Option<Rgb>, stroke: Option<(Rgb, f32)>) {
+        Page::polygon(self, pts, fill, stroke);
+    }
+    fn circle(&mut self, cx: f32, cy: f32, r: f32, fill: Option<Rgb>, stroke: Option<(Rgb, f32)>) {
+        Page::circle(self, cx, cy, r, fill, stroke);
+    }
+    fn text_dir(&mut self, x: f32, y: f32, size: f32, font: Font, color: Rgb, text: &str, angle: f32, base: Option<gridcraft_text::Dir>) {
+        Page::text_dir(self, x, y, size, font, color, text, angle, base);
+    }
+    fn measure(&self, font: Font, size: f32, text: &str) -> f32 {
+        Page::measure(self, font, size, text)
+    }
+    fn image_rgba(&mut self, x: f32, y: f32, w: f32, h: f32, rgba: &[u8], pw: u32, ph: u32) {
+        Page::image_rgba(self, x, y, w, h, rgba, pw, ph);
+    }
+    fn save(&mut self) {
+        Page::save(self);
+    }
+    fn restore(&mut self) {
+        Page::restore(self);
+    }
+    fn clip_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        Page::clip_rect(self, x, y, w, h);
+    }
+}
+
+impl Canvas for gridcraft_raster::Canvas {
+    fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: Rgb) {
+        gridcraft_raster::Canvas::fill_rect(self, x, y, w, h, color);
+    }
+    fn rect_stroke(&mut self, x: f32, y: f32, w: f32, h: f32, width: f32, color: Rgb) {
+        gridcraft_raster::Canvas::rect_stroke(self, x, y, w, h, width, color);
+    }
+    fn stroke_line_dashed(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, color: Rgb, dash: &[f32]) {
+        gridcraft_raster::Canvas::stroke_line_dashed(self, x0, y0, x1, y1, width, color, dash);
+    }
+    fn polyline(&mut self, pts: &[[f32; 2]], width: f32, color: Rgb, dash: &[f32]) {
+        gridcraft_raster::Canvas::polyline(self, pts, width, color, dash);
+    }
+    fn polygon(&mut self, pts: &[[f32; 2]], fill: Option<Rgb>, stroke: Option<(Rgb, f32)>) {
+        gridcraft_raster::Canvas::polygon(self, pts, fill, stroke);
+    }
+    fn circle(&mut self, cx: f32, cy: f32, r: f32, fill: Option<Rgb>, stroke: Option<(Rgb, f32)>) {
+        gridcraft_raster::Canvas::circle(self, cx, cy, r, fill, stroke);
+    }
+    fn text_dir(&mut self, x: f32, y: f32, size: f32, font: Font, color: Rgb, text: &str, angle: f32, base: Option<gridcraft_text::Dir>) {
+        gridcraft_raster::Canvas::text(self, x, y, size, font.is_bold(), font.is_italic(), color, text, angle, base);
+    }
+    fn measure(&self, font: Font, size: f32, text: &str) -> f32 {
+        if gridcraft_text::available() { gridcraft_text::width(text, size, font.is_bold()) } else { gridcraft_pdf::text_width(font, size, text) }
+    }
+    fn image_rgba(&mut self, x: f32, y: f32, w: f32, h: f32, rgba: &[u8], pw: u32, ph: u32) {
+        gridcraft_raster::Canvas::image_rgba(self, x, y, w, h, rgba, pw, ph);
+    }
+    fn save(&mut self) {
+        gridcraft_raster::Canvas::save(self);
+    }
+    fn restore(&mut self) {
+        gridcraft_raster::Canvas::restore(self);
+    }
+    fn clip_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        gridcraft_raster::Canvas::clip_rect(self, x, y, w, h);
+    }
+}
+
+/// WHIQ: a right-to-left sheet: everything the cell painter draws is reflected about the
+/// vertical line `x = axis / 2` (column A on the right, overflow and General alignment mirrored),
+/// except that text and pictures keep their own orientation.
+struct Mirror<'a> {
+    inner: &'a mut dyn Canvas,
+    axis: f32,
+}
+
+impl Mirror<'_> {
+    fn x(&self, x: f32) -> f32 {
+        self.axis - x
+    }
+    fn pts(&self, pts: &[[f32; 2]]) -> Vec<[f32; 2]> {
+        pts.iter().map(|p| [self.axis - p[0], p[1]]).collect()
+    }
+}
+
+impl Canvas for Mirror<'_> {
+    fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: Rgb) {
+        let x = self.x(x + w);
+        self.inner.fill_rect(x, y, w, h, color);
+    }
+    fn rect_stroke(&mut self, x: f32, y: f32, w: f32, h: f32, width: f32, color: Rgb) {
+        let x = self.x(x + w);
+        self.inner.rect_stroke(x, y, w, h, width, color);
+    }
+    fn stroke_line_dashed(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, width: f32, color: Rgb, dash: &[f32]) {
+        let (x0, x1) = (self.x(x0), self.x(x1));
+        self.inner.stroke_line_dashed(x0, y0, x1, y1, width, color, dash);
+    }
+    fn polyline(&mut self, pts: &[[f32; 2]], width: f32, color: Rgb, dash: &[f32]) {
+        let pts = self.pts(pts);
+        self.inner.polyline(&pts, width, color, dash);
+    }
+    fn polygon(&mut self, pts: &[[f32; 2]], fill: Option<Rgb>, stroke: Option<(Rgb, f32)>) {
+        let pts = self.pts(pts);
+        self.inner.polygon(&pts, fill, stroke);
+    }
+    fn circle(&mut self, cx: f32, cy: f32, r: f32, fill: Option<Rgb>, stroke: Option<(Rgb, f32)>) {
+        let cx = self.x(cx);
+        self.inner.circle(cx, cy, r, fill, stroke);
+    }
+    fn text_dir(&mut self, x: f32, y: f32, size: f32, font: Font, color: Rgb, text: &str, angle: f32, base: Option<gridcraft_text::Dir>) {
+        // The text's box is reflected; its glyphs are not.
+        let w = self.inner.measure(font, size, text);
+        let cos = if angle.is_finite() { angle.cos() } else { 1.0 };
+        let x = self.x(x) - w * cos;
+        self.inner.text_dir(x, y, size, font, color, text, angle, base);
+    }
+    fn measure(&self, font: Font, size: f32, text: &str) -> f32 {
+        self.inner.measure(font, size, text)
+    }
+    fn image_rgba(&mut self, x: f32, y: f32, w: f32, h: f32, rgba: &[u8], pw: u32, ph: u32) {
+        let x = self.x(x + w);
+        self.inner.image_rgba(x, y, w, h, rgba, pw, ph);
+    }
+    fn save(&mut self) {
+        self.inner.save();
+    }
+    fn restore(&mut self) {
+        self.inner.restore();
+    }
+    fn clip_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
+        let x = self.x(x + w);
+        self.inner.clip_rect(x, y, w, h);
+    }
+}
+
 fn rgb_of(c: Color, wb: &Workbook) -> Option<Rgb> {
     c.resolve(&wb.theme)
 }
@@ -676,12 +861,14 @@ fn cell_look(wb: &Workbook, si: usize, sh: &Sheet, c: CellRef, cf: &mut Option<c
     Look { style, fill, cf: cfl }
 }
 
-/// PDF measurement for chart layout.
-struct PdfMeasure;
+/// Chart text measured as the canvas draws it. Charts lay out in sheet pixels; the canvas
+/// measures in its own units (`k` per sheet pixel).
+struct CanvasMeasure<'a>(&'a dyn Canvas, f32);
 
-impl gridcraft_chart::Measure for PdfMeasure {
+impl gridcraft_chart::Measure for CanvasMeasure<'_> {
     fn text_width(&self, text: &str, size: f32, bold: bool) -> f32 {
-        gridcraft_pdf::text_width(if bold { Font::HelveticaBold } else { Font::Helvetica }, size, text)
+        let k = if self.1 > 0.0 { self.1 } else { 1.0 };
+        self.0.measure(if bold { Font::HelveticaBold } else { Font::Helvetica }, size * k, text) / k
     }
 }
 
@@ -703,7 +890,7 @@ impl Xf {
 }
 
 /// Draws chart primitives onto a page.
-fn draw_prims(pg: &mut Page, prims: &[gridcraft_chart::Prim], xf: Xf) {
+fn draw_prims(pg: &mut dyn Canvas, prims: &[gridcraft_chart::Prim], xf: Xf) {
     use gridcraft_chart::{HAlign as H, Prim, VAlign as V};
     let k = xf.k;
     for p in prims {
@@ -743,7 +930,7 @@ fn draw_prims(pg: &mut Page, prims: &[gridcraft_chart::Prim], xf: Xf) {
             Prim::Text { x, y, text, size, color, bold, align, valign, rotation } => {
                 let font = if *bold { Font::HelveticaBold } else { Font::Helvetica };
                 let size = size * k;
-                let w = gridcraft_pdf::text_width(font, size, text);
+                let w = pg.measure(font, size, text);
                 let dx = match align {
                     H::Left => 0.0,
                     H::Center => -w / 2.0,
@@ -765,24 +952,30 @@ fn draw_prims(pg: &mut Page, prims: &[gridcraft_chart::Prim], xf: Xf) {
 const PAD_PX: f32 = 2.0;
 
 /// Word-wraps `text` to `width` points.
+#[cfg(test)]
 fn wrap_lines(text: &str, font: Font, size: f32, width: f32) -> Vec<String> {
+    wrap_lines_by(text, width, &|t| gridcraft_pdf::text_width(font, size, t))
+}
+
+/// WHIQ: [`wrap_lines`] with the canvas's own measure (shaped text in embedded fonts).
+fn wrap_lines_by(text: &str, width: f32, measure: &dyn Fn(&str) -> f32) -> Vec<String> {
     let mut out = Vec::new();
     for para in text.split('\n') {
         let mut line = String::new();
         for word in para.split(' ') {
             let cand = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
-            if line.is_empty() || gridcraft_pdf::text_width(font, size, &cand) <= width {
+            if line.is_empty() || measure(&cand) <= width {
                 line = cand;
             } else {
                 out.push(std::mem::take(&mut line));
                 line = word.to_string();
             }
             // Break a single over-long word by characters.
-            while gridcraft_pdf::text_width(font, size, &line) > width && line.chars().count() > 1 {
+            while measure(&line) > width && line.chars().count() > 1 {
                 let mut cut = String::new();
                 let mut rest = String::new();
                 for ch in line.chars() {
-                    if rest.is_empty() && gridcraft_pdf::text_width(font, size, &format!("{cut}{ch}")) <= width || cut.is_empty() {
+                    if rest.is_empty() && measure(&format!("{cut}{ch}")) <= width || cut.is_empty() {
                         cut.push(ch);
                     } else {
                         rest.push(ch);
@@ -853,7 +1046,7 @@ fn border_dash(style: BorderStyle, k: f32) -> Vec<f32> {
     }
 }
 
-fn draw_border(pg: &mut Page, b: &BorderLine, wb: &Workbook, x0: f32, y0: f32, x1: f32, y1: f32, k: f32) {
+fn draw_border(pg: &mut dyn Canvas, b: &BorderLine, wb: &Workbook, x0: f32, y0: f32, x1: f32, y1: f32, k: f32) {
     if b.is_none() {
         return;
     }
@@ -875,7 +1068,7 @@ fn font_for(style: &Style) -> Font {
 }
 
 /// Draws the cells of a block: fills, gridlines, data bars, borders and text.
-fn draw_block(pg: &mut Page, b: &Block, gridlines: bool, cf: &mut Option<crate::cf::CfCache>) {
+fn draw_block(pg: &mut dyn Canvas, b: &Block, gridlines: bool, cf: &mut Option<crate::cf::CfCache>) {
     let (bx, by) = (b.xs.first().copied().unwrap_or(0.0), b.ys.first().copied().unwrap_or(0.0));
     let (bw, bh) = (b.xs.last().copied().unwrap_or(bx) - bx, b.ys.last().copied().unwrap_or(by) - by);
     if bw <= 0.0 || bh <= 0.0 {
@@ -997,7 +1190,7 @@ fn draw_block(pg: &mut Page, b: &Block, gridlines: bool, cf: &mut Option<crate::
 }
 
 /// Cell pictures fit the current cell (or merged-cell) rectangle without changing aspect ratio.
-fn draw_cell_picture(pg: &mut Page, data: &[u8], rect: (f32, f32, f32, f32), k: f32) {
+fn draw_cell_picture(pg: &mut dyn Canvas, data: &[u8], rect: (f32, f32, f32, f32), k: f32) {
     let (x, y, w, h) = rect;
     let pad = 2.0 * k;
     let (w, h) = ((w - 2.0 * pad).max(0.0), (h - 2.0 * pad).max(0.0));
@@ -1042,7 +1235,16 @@ fn center_across_width(styles: &StyleTable, sh: &Sheet, c: CellRef, merges: &[Ra
     ext
 }
 
-fn draw_text(pg: &mut Page, b: &Block, c: CellRef, l: &Look, rect: (f32, f32, f32, f32), merged: bool, merges: &[RangeRef], limits: (f32, f32)) {
+fn draw_text(
+    pg: &mut dyn Canvas,
+    b: &Block,
+    c: CellRef,
+    l: &Look,
+    rect: (f32, f32, f32, f32),
+    merged: bool,
+    merges: &[RangeRef],
+    limits: (f32, f32),
+) {
     let (x, y, w, h) = rect;
     let sh = b.sh;
     let wb = b.wb;
@@ -1072,7 +1274,7 @@ fn draw_text(pg: &mut Page, b: &Block, c: CellRef, l: &Look, rect: (f32, f32, f3
     } else if code == "General"
         && let Value::Number(n) = v
     {
-        let digit = gridcraft_pdf::text_width(font, size, "0").max(0.1);
+        let digit = pg.measure(font, size, "0").max(0.1);
         let max_chars = (avail / digit).floor().max(1.0) as usize;
         gridcraft_numfmt::format_general_fit(n, max_chars.min(11)).unwrap_or_else(|| "#".repeat(max_chars.min(255)))
     } else {
@@ -1084,22 +1286,34 @@ fn draw_text(pg: &mut Page, b: &Block, c: CellRef, l: &Look, rect: (f32, f32, f3
     if text.is_empty() {
         return;
     }
-    let mut tw = gridcraft_pdf::text_width(font, size, &text);
+    let mut tw = pg.measure(font, size, &text);
     if st.align.shrink && !wrap && tw > avail && tw > 0.0 {
         size = (size * avail / tw).max(1.0);
-        tw = gridcraft_pdf::text_width(font, size, &text);
+        tw = pg.measure(font, size, &text);
     }
     if is_num && !wrap && tw > avail + 0.01 && !sh.show_formulas {
-        let hash = gridcraft_pdf::text_width(font, size, "#").max(0.1);
+        let hash = pg.measure(font, size, "#").max(0.1);
         text = "#".repeat(((avail / hash).floor().max(1.0) as usize).min(255));
-        tw = gridcraft_pdf::text_width(font, size, &text);
+        tw = pg.measure(font, size, &text);
     }
+    // WHIQ: the text's direction (reading order, else its first strong character, else the
+    // sheet's). General-aligned text starts at its reading start: an Arabic cell is right
+    // aligned. On a right-to-left sheet (drawn mirrored) the start is the logical left.
+    let dir = match st.align.reading_order {
+        1 => Some(gridcraft_text::Dir::Ltr),
+        2 => Some(gridcraft_text::Dir::Rtl),
+        _ => gridcraft_text::base_direction(&text),
+    };
+    let sheet_dir = if sh.right_to_left { gridcraft_text::Dir::Rtl } else { gridcraft_text::Dir::Ltr };
+    let text_start_right = !is_num && dir.unwrap_or(sheet_dir) != sheet_dir;
     let h_align = match st.align.h {
         HAlign::General => {
             if is_num {
                 HAlign::Right
             } else if matches!(v, Value::Bool(_) | Value::Error(_)) {
                 HAlign::Center
+            } else if text_start_right {
+                HAlign::Right
             } else {
                 HAlign::Left
             }
@@ -1112,8 +1326,8 @@ fn draw_text(pg: &mut Page, b: &Block, c: CellRef, l: &Look, rect: (f32, f32, f3
     let rotated = rot != 0 && rot != 255;
     // Rotated text wraps along its own direction: upright (±90°) text to the row height.
     let lines: Vec<String> = match (wrap, rotated) {
-        (true, false) => wrap_lines(&text, font, size, avail.max(size)),
-        (true, true) if rot.abs() == 90 => wrap_lines(&text, font, size, (h - 2.0 * pad).max(size)),
+        (true, false) => wrap_lines_by(&text, avail.max(size), &|t| pg.measure(font, size, t)),
+        (true, true) if rot.abs() == 90 => wrap_lines_by(&text, (h - 2.0 * pad).max(size), &|t| pg.measure(font, size, t)),
         (true, true) => vec![text.lines().next().unwrap_or_default().to_string()],
         (false, _) => vec![text],
     };
@@ -1176,7 +1390,7 @@ fn draw_text(pg: &mut Page, b: &Block, c: CellRef, l: &Look, rect: (f32, f32, f3
             } else {
                 (x + pad + (last - i) * line_h, y + pad + size * 0.8)
             };
-            pg.text_rotated(ox, oy, size, font, color, t, angle);
+            pg.text_dir(ox, oy, size, font, color, t, angle, dir);
         }
         pg.restore();
         return;
@@ -1187,7 +1401,7 @@ fn draw_text(pg: &mut Page, b: &Block, c: CellRef, l: &Look, rect: (f32, f32, f3
         let mut yy = y + pad + size * 0.8;
         for ch in chars {
             let s = ch.to_string();
-            let cw = gridcraft_pdf::text_width(font, size, &s);
+            let cw = pg.measure(font, size, &s);
             pg.text(x + (w - cw) / 2.0, yy, size, font, color, &s);
             yy += line_h;
             if yy > y + h + line_h {
@@ -1198,7 +1412,7 @@ fn draw_text(pg: &mut Page, b: &Block, c: CellRef, l: &Look, rect: (f32, f32, f3
         return;
     }
     for (i, line) in lines.iter().enumerate() {
-        let lw = gridcraft_pdf::text_width(font, size, line);
+        let lw = pg.measure(font, size, line);
         let lx = match h_align {
             HAlign::Right => x + w - pad - lw - indent,
             HAlign::Center => x + (w + across - lw) / 2.0,
@@ -1208,7 +1422,7 @@ fn draw_text(pg: &mut Page, b: &Block, c: CellRef, l: &Look, rect: (f32, f32, f3
         if ly - size > y + h || ly < y - line_h {
             continue;
         }
-        pg.text(lx, ly, size, font, color, line);
+        pg.text_dir(lx, ly, size, font, color, line, 0.0, dir);
         if st.font.underline != Underline::None {
             let uw = (size * 0.06).max(0.2);
             pg.stroke_line(lx, ly + size * 0.12, lx + lw, ly + size * 0.12, uw, color);
@@ -1242,14 +1456,29 @@ fn decode_image(data: &[u8], max_w: u32, max_h: u32) -> Option<(Vec<u8>, u32, u3
 }
 
 /// Draws charts, pictures, shapes and sparklines overlapping the body block of a page.
-fn draw_objects(pg: &mut Page, wb: &Workbook, si: usize, sh: &Sheet, b: &Block) {
+fn draw_objects(pg: &mut dyn Canvas, wb: &Workbook, si: usize, sh: &Sheet, b: &Block, mirror: Option<f32>) {
     let block = b.range();
     let (sx0, sy0) = (sh.col_left(block.start.col), sh.row_top(block.start.row));
     let (sx1, sy1) = (sh.col_left(block.end.col.saturating_add(1)), sh.row_top(block.end.row.saturating_add(1)));
     let (bx, by) = (b.xs.first().copied().unwrap_or(0.0), b.ys.first().copied().unwrap_or(0.0));
     let (bw, bh) = (b.xs.last().copied().unwrap_or(bx) - bx, b.ys.last().copied().unwrap_or(by) - by);
     let visible = |r: (f64, f64, f64, f64)| r.2 > 0.0 && r.3 > 0.0 && r.0 < sx1 && r.0 + r.2 > sx0 && r.1 < sy1 && r.1 + r.3 > sy0;
-    let place = |r: (f64, f64, f64, f64)| (bx + ((r.0 - sx0) as f32) * b.k, by + ((r.1 - sy0) as f32) * b.k, r.2 as f32 * b.k, r.3 as f32 * b.k);
+    // WHIQ: on a right-to-left sheet objects sit mirrored (anchored from the right), unflipped.
+    let place = |r: (f64, f64, f64, f64)| {
+        let (x, y, w, h) = (bx + ((r.0 - sx0) as f32) * b.k, by + ((r.1 - sy0) as f32) * b.k, r.2 as f32 * b.k, r.3 as f32 * b.k);
+        match mirror {
+            Some(axis) => (axis - x - w, y, w, h),
+            None => (x, y, w, h),
+        }
+    };
+    let flip = |(x, y, w, h): (f32, f32, f32, f32)| match mirror {
+        Some(axis) => (axis - x - w, y, w, h),
+        None => (x, y, w, h),
+    };
+    let (bx, bw) = match mirror {
+        Some(axis) => (axis - bx - bw, bw),
+        None => (bx, bw),
+    };
     pg.save();
     pg.clip_rect(bx, by, bw, bh);
     for sp in &sh.sparklines {
@@ -1261,7 +1490,7 @@ fn draw_objects(pg: &mut Page, wb: &Workbook, si: usize, sh: &Sheet, b: &Block) 
             v => vec![v.as_f64()],
         };
         let color = rgb_of(sp.color, wb).unwrap_or([0x15, 0x60, 0x82]);
-        let (x, y, w, h) = b.rect(RangeRef::cell(sp.cell));
+        let (x, y, w, h) = flip(b.rect(RangeRef::cell(sp.cell)));
         let (wpx, hpx) = (w / b.k, h / b.k);
         let prims = gridcraft_chart::render_sparkline(sp.kind, &vals, [color[0], color[1], color[2], 255], sp.markers, wpx, hpx);
         draw_prims(pg, &prims, Xf { ox: x, oy: y, k: b.k });
@@ -1320,7 +1549,7 @@ fn draw_objects(pg: &mut Page, wb: &Workbook, si: usize, sh: &Sheet, b: &Block) 
             let color = fm.text_color.and_then(|c| rgb_of(c, wb)).unwrap_or([0, 0, 0]);
             let align = fm.align.unwrap_or(if text_box { ShapeTextAlign::Left } else { ShapeTextAlign::Center });
             let anchor = fm.anchor.unwrap_or(if text_box { ShapeTextAnchor::Top } else { ShapeTextAnchor::Middle });
-            let lines = wrap_lines(&shp.text, font, size, (w - 4.0 * b.k).max(size));
+            let lines = wrap_lines_by(&shp.text, (w - 4.0 * b.k).max(size), &|t| pg.measure(font, size, t));
             let block_h = lines.len().min(500) as f32 * size * 1.2;
             let mut yy = match anchor {
                 ShapeTextAnchor::Top => y + 2.0 * b.k,
@@ -1328,7 +1557,7 @@ fn draw_objects(pg: &mut Page, wb: &Workbook, si: usize, sh: &Sheet, b: &Block) 
                 ShapeTextAnchor::Bottom => y + h - 2.0 * b.k - block_h,
             } + size * 0.8;
             for l in lines.iter().take(500) {
-                let lw = gridcraft_pdf::text_width(font, size, l);
+                let lw = pg.measure(font, size, l);
                 let lx = match align {
                     ShapeTextAlign::Left => x + 2.0 * b.k,
                     ShapeTextAlign::Center => x + (w - lw) / 2.0,
@@ -1346,13 +1575,13 @@ fn draw_objects(pg: &mut Page, wb: &Workbook, si: usize, sh: &Sheet, b: &Block) 
         }
         let (x, y, _, _) = place(r);
         let data = gridcraft_chart::resolve(wb, si, ch);
-        let prims = gridcraft_chart::render(ch, &data, r.2 as f32, r.3 as f32, &PdfMeasure);
+        let prims = gridcraft_chart::render(ch, &data, r.2 as f32, r.3 as f32, &CanvasMeasure(&*pg, b.k));
         draw_prims(pg, &prims, Xf { ox: x, oy: y, k: b.k });
     }
     pg.restore();
 }
 
-fn draw_headings(pg: &mut Page, b: &Block, col_heads: bool, row_heads: bool, at: (f32, f32), size: (f32, f32)) {
+fn draw_headings(pg: &mut dyn Canvas, b: &Block, col_heads: bool, row_heads: bool, at: (f32, f32), size: (f32, f32)) {
     let fill = [0xF2, 0xF2, 0xF2];
     let line = [0xA0, 0xA0, 0xA0];
     let fsize = 9.0 * b.scale.max(0.1);
@@ -1367,7 +1596,7 @@ fn draw_headings(pg: &mut Page, b: &Block, col_heads: bool, row_heads: bool, at:
             pg.fill_rect(x0, y, x1 - x0, size.1, fill);
             pg.rect_stroke(x0, y, x1 - x0, size.1, lw, line);
             let t = gridcraft_core::col_to_letters(col);
-            let tw = gridcraft_pdf::text_width(Font::Helvetica, fsize, &t);
+            let tw = pg.measure(Font::Helvetica, fsize, &t);
             pg.text(x0 + (x1 - x0 - tw) / 2.0, y + size.1 / 2.0 + fsize * 0.35, fsize, Font::Helvetica, [0x40, 0x40, 0x40], &t);
         }
     }
@@ -1381,13 +1610,13 @@ fn draw_headings(pg: &mut Page, b: &Block, col_heads: bool, row_heads: bool, at:
             pg.fill_rect(x, y0, size.0, y1 - y0, fill);
             pg.rect_stroke(x, y0, size.0, y1 - y0, lw, line);
             let t = (row + 1).to_string();
-            let tw = gridcraft_pdf::text_width(Font::Helvetica, fsize, &t);
+            let tw = pg.measure(Font::Helvetica, fsize, &t);
             pg.text(x + (size.0 - tw) / 2.0, y0 + (y1 - y0) / 2.0 + fsize * 0.35, fsize, Font::Helvetica, [0x40, 0x40, 0x40], &t);
         }
     }
 }
 
-fn draw_header_footer(pg: &mut Page, lay: &SheetLayout, which: gridcraft_model::HfPage, cx: &HfContext) {
+fn draw_header_footer(pg: &mut dyn Canvas, lay: &SheetLayout, which: gridcraft_model::HfPage, cx: &HfContext) {
     let [l, r, _, _, hm, fm] = lay.margins;
     let pw = lay.page_w;
     let ph = lay.page_h;
@@ -1405,7 +1634,7 @@ fn draw_header_footer(pg: &mut Page, lay: &SheetLayout, which: gridcraft_model::
             let lines: Vec<&str> = sec.text.split('\n').take(20).collect();
             let n = lines.len() as f32;
             for (j, line) in lines.iter().enumerate() {
-                let lw = gridcraft_pdf::text_width(font, size, line);
+                let lw = pg.measure(font, size, line);
                 let x = match i {
                     0 => l,
                     1 => (pw - lw) / 2.0,
@@ -1454,9 +1683,55 @@ fn seg_size(sh: &Sheet, seg: (u32, u32), rows: bool) -> f32 {
     if rows { (seg.0..=seg.1).map(|r| sh.row_height(r)).sum() } else { (seg.0..=seg.1).map(|c| sh.col_width(c)).sum() }
 }
 
+/// The cells, headings and corner box of one page (the part a right-to-left sheet mirrors);
+/// returns the body block, where the drawing objects go.
+fn paint_page_cells<'a>(
+    pg: &mut dyn Canvas,
+    wb: &'a Workbook,
+    sh: &'a Sheet,
+    lay: &SheetLayout,
+    rsegs: &[(u32, u32)],
+    csegs: &[(u32, u32)],
+    (ox, oy): (f32, f32),
+    cf: &mut Option<crate::cf::CfCache>,
+) -> Option<Block<'a>> {
+    let k = lay.k();
+    let mut y = oy + lay.heading_h * k;
+    let mut body: Option<Block> = None;
+    for (rsi, rs) in rsegs.iter().enumerate() {
+        let mut x = ox + lay.heading_w * k;
+        for (csi, cs) in csegs.iter().enumerate() {
+            let b = make_block(wb, lay.sheet, sh, *rs, *cs, x, y, lay);
+            draw_block(pg, &b, lay.settings.gridlines, cf);
+            if lay.settings.headings {
+                draw_headings(pg, &b, rsi == 0, csi == 0, (ox, oy), (lay.heading_w * k, lay.heading_h * k));
+            }
+            x += seg_size(sh, *cs, false) * k;
+            if rsi + 1 == rsegs.len() && csi + 1 == csegs.len() {
+                body = Some(b);
+            }
+        }
+        y += seg_size(sh, *rs, true) * k;
+    }
+    if lay.settings.headings {
+        let fill = [0xF2, 0xF2, 0xF2];
+        pg.fill_rect(ox, oy, lay.heading_w * k, lay.heading_h * k, fill);
+        pg.rect_stroke(ox, oy, lay.heading_w * k, lay.heading_h * k, 0.3, [0xA0, 0xA0, 0xA0]);
+    }
+    body
+}
+
 /// Renders laid-out sheets to a PDF.
 pub fn render_pdf(wb: &Workbook, layouts: &[SheetLayout], file: &str, path: &str) -> (Vec<u8>, usize) {
+    render_pdf_with(wb, layouts, file, path, gridcraft_pdf::TextMode::Auto)
+}
+
+/// WHIQ: [`render_pdf`] with a text mode: `Auto` (standard fonts for plain text, embedded
+/// shaped subsets for Arabic and anything else), `Embedded` (every string embedded) or
+/// `Standard` (upstream).
+pub fn render_pdf_with(wb: &Workbook, layouts: &[SheetLayout], file: &str, path: &str, mode: gridcraft_pdf::TextMode) -> (Vec<u8>, usize) {
     let mut doc = PdfDoc::new();
+    doc.text_mode = mode;
     doc.info.title = if wb.props.title.is_empty() { file.to_string() } else { wb.props.title.clone() };
     doc.info.author = wb.props.author.clone();
     let total: usize = layouts.iter().map(|l| l.pages.len()).sum();
@@ -1476,31 +1751,17 @@ pub fn render_pdf(wb: &Workbook, layouts: &[SheetLayout], file: &str, path: &str
             let content_h = (lay.heading_h + rsegs.iter().map(|s| seg_size(sh, *s, true)).sum::<f32>()) * k;
             let ox = lay.margins[0] + if lay.settings.center_h { ((aw - content_w) / 2.0).max(0.0) } else { 0.0 };
             let oy = lay.margins[2] + if lay.settings.center_v { ((ah - content_h) / 2.0).max(0.0) } else { 0.0 };
-            let pg = doc.add_page(lay.page_w, lay.page_h);
-            let mut y = oy + lay.heading_h * k;
-            let mut body: Option<Block> = None;
-            for (rsi, rs) in rsegs.iter().enumerate() {
-                let mut x = ox + lay.heading_w * k;
-                for (csi, cs) in csegs.iter().enumerate() {
-                    let b = make_block(wb, lay.sheet, sh, *rs, *cs, x, y, lay);
-                    draw_block(pg, &b, lay.settings.gridlines, &mut cf);
-                    if lay.settings.headings {
-                        draw_headings(pg, &b, rsi == 0, csi == 0, (ox, oy), (lay.heading_w * k, lay.heading_h * k));
-                    }
-                    x += seg_size(sh, *cs, false) * k;
-                    if rsi + 1 == rsegs.len() && csi + 1 == csegs.len() {
-                        body = Some(b);
-                    }
-                }
-                y += seg_size(sh, *rs, true) * k;
-            }
+            let page = doc.add_page(lay.page_w, lay.page_h);
+            // WHIQ: a right-to-left sheet is drawn mirrored across its content box.
+            let axis = 2.0 * ox + content_w;
+            let body = if sh.right_to_left {
+                paint_page_cells(&mut Mirror { inner: &mut *page, axis }, wb, sh, lay, &rsegs, &csegs, (ox, oy), &mut cf)
+            } else {
+                paint_page_cells(&mut *page, wb, sh, lay, &rsegs, &csegs, (ox, oy), &mut cf)
+            };
+            let pg: &mut dyn Canvas = page;
             if let Some(b) = &body {
-                draw_objects(pg, wb, lay.sheet, sh, b);
-            }
-            if lay.settings.headings {
-                let fill = [0xF2, 0xF2, 0xF2];
-                pg.fill_rect(ox, oy, lay.heading_w * k, lay.heading_h * k, fill);
-                pg.rect_stroke(ox, oy, lay.heading_w * k, lay.heading_h * k, 0.3, [0xA0, 0xA0, 0xA0]);
+                draw_objects(pg, wb, lay.sheet, sh, b, sh.right_to_left.then_some(axis));
             }
             let cx = HfContext {
                 page: page_no,
@@ -1522,10 +1783,149 @@ pub fn render_pdf(wb: &Workbook, layouts: &[SheetLayout], file: &str, path: &str
 
 fn build_pdf(s: &Session, p: &Json, cmd: &str) -> Result<(Vec<u8>, usize)> {
     let opts = PrintOptions::from_params(p, cmd)?;
+    let mode = match str_param(p, "fonts").map(str::to_ascii_lowercase).as_deref() {
+        None | Some("auto") => gridcraft_pdf::TextMode::Auto,
+        Some("embedded" | "embed") => gridcraft_pdf::TextMode::Embedded,
+        Some("standard") => gridcraft_pdf::TextMode::Standard,
+        Some(other) => return Err(bad(cmd, format!("`fonts` must be auto, embedded or standard, not `{other}`"))),
+    };
     let d = s.doc()?;
     let lays = layouts(&d.wb, &opts);
     let path = d.path.clone().unwrap_or_default();
-    Ok(render_pdf(&d.wb, &lays, &d.display_title(), &path))
+    Ok(render_pdf_with(&d.wb, &lays, &d.display_title(), &path, mode))
+}
+
+// ---------------------------------------------------------------- PNG renders (WHIQ)
+
+/// Options for [`render_png`].
+#[derive(Clone, Copy, Debug)]
+pub struct PngOptions {
+    /// Canvas pixels per sheet pixel (1 = 96 dpi).
+    pub scale: f32,
+    pub gridlines: bool,
+    pub headings: bool,
+}
+
+impl Default for PngOptions {
+    fn default() -> Self {
+        Self { scale: 2.0, gridlines: true, headings: false }
+    }
+}
+
+/// Size in pixels of `range` rendered at `scale` (with headings).
+pub fn png_size(sh: &Sheet, range: RangeRef, o: &PngOptions) -> (f64, f64) {
+    let (hw, hh) = if o.headings { (40.0, 20.0) } else { (0.0, 0.0) };
+    let w = (sh.col_left(range.end.col.saturating_add(1)) - sh.col_left(range.start.col) + hw) * f64::from(o.scale);
+    let h = (sh.row_top(range.end.row.saturating_add(1)) - sh.row_top(range.start.row) + hh) * f64::from(o.scale);
+    (w, h)
+}
+
+/// WHIQ: a PNG of `range` of sheet `si` (default: its print range), drawn with the same painter
+/// as the PDF: fills, borders, number formats, shaped text (Arabic joined and right-to-left),
+/// merged cells, conditional formats, charts, pictures and shapes. A right-to-left sheet is
+/// mirrored. Returns (PNG, width, height, the range drawn).
+pub fn render_png(wb: &Workbook, si: usize, range: Option<RangeRef>, o: &PngOptions) -> Result<(Vec<u8>, u32, u32, RangeRef)> {
+    let sh = wb.sheet(si).ok_or_else(|| EngineError::Other(format!("there is no sheet {si}")))?;
+    let range = range.or_else(|| print_range(sh)).unwrap_or(RangeRef::new(CellRef::new(0, 0), CellRef::new(19, 9)));
+    if !(o.scale.is_finite() && o.scale > 0.0) {
+        return Err(EngineError::Other("scale must be a positive number".into()));
+    }
+    let (w, h) = png_size(sh, range, o);
+    let (w, h) = (w.ceil().max(1.0), h.ceil().max(1.0));
+    if w > f64::from(gridcraft_raster::MAX_SIDE) || h > f64::from(gridcraft_raster::MAX_SIDE) || w * h > gridcraft_raster::MAX_PIXELS as f64 {
+        return Err(EngineError::Other(format!(
+            "the picture would be too large ({w:.0}×{h:.0} pixels, at most {} per side): render a smaller range or a lower scale",
+            gridcraft_raster::MAX_SIDE
+        )));
+    }
+    let mut canvas = gridcraft_raster::Canvas::new(w as u32, h as u32, [255, 255, 255])
+        .ok_or_else(|| EngineError::Other("the picture can't be allocated: render a smaller range".into()))?;
+    let k = o.scale;
+    let (hw, hh) = if o.headings { (40.0 * k, 20.0 * k) } else { (0.0, 0.0) };
+    // A block positioned like a page body: sheet pixels × k, fonts in points × 96/72 × k.
+    let mut xs = Vec::with_capacity(range.width() as usize + 1);
+    let mut acc = hw;
+    xs.push(acc);
+    for c in range.start.col..=range.end.col {
+        acc += sh.col_width(c) * k;
+        xs.push(acc);
+    }
+    let mut ys = Vec::with_capacity(range.height() as usize + 1);
+    let mut acc = hh;
+    ys.push(acc);
+    for r in range.start.row..=range.end.row {
+        acc += sh.row_height(r) * k;
+        ys.push(acc);
+    }
+    let b = Block { wb, si, sh, rows: (range.start.row, range.end.row), cols: (range.start.col, range.end.col), xs, ys, k, scale: k * 96.0 / 72.0 };
+    let mut cf = if sh.cond_formats.is_empty() { None } else { Some(crate::cf::CfCache::new()) };
+    let axis = w as f32;
+    {
+        let mut paint = |pg: &mut dyn Canvas| {
+            draw_block(pg, &b, o.gridlines, &mut cf);
+            if o.headings {
+                draw_headings(pg, &b, true, true, (0.0, 0.0), (hw, hh));
+                pg.fill_rect(0.0, 0.0, hw, hh, [0xF2, 0xF2, 0xF2]);
+                pg.rect_stroke(0.0, 0.0, hw, hh, 0.5, [0xA0, 0xA0, 0xA0]);
+            }
+        };
+        if sh.right_to_left {
+            paint(&mut Mirror { inner: &mut canvas, axis });
+        } else {
+            paint(&mut canvas);
+        }
+    }
+    draw_objects(&mut canvas, wb, si, sh, &b, sh.right_to_left.then_some(axis));
+    let png = canvas.png();
+    if png.is_empty() {
+        return Err(EngineError::Other("the PNG could not be encoded".into()));
+    }
+    Ok((png, canvas.width(), canvas.height(), range))
+}
+
+/// `file.renderPng`.
+fn render_png_cmd(s: &mut Session, p: &Json) -> Result<Json> {
+    const CMD: &str = "file.renderPng";
+    let si = target_sheet(s, p)?;
+    let d = s.doc()?;
+    let range = match str_param(p, "range").map(str::trim).filter(|r| !r.is_empty()) {
+        Some(r) => Some(RangeRef::parse(split_sheet(r).1).ok_or_else(|| bad(CMD, format!("not a range: `{r}`")))?),
+        None => None,
+    };
+    let sh = d.wb.sheet(si).ok_or(EngineError::NoDocument)?;
+    // Whole columns or rows mean their used part.
+    let range = match (range, sh.used_range()) {
+        (Some(r), Some(u)) if r.is_full_cols() || r.is_full_rows() => Some(r.intersection(&u).unwrap_or(RangeRef::cell(r.start))),
+        (r, _) => r,
+    };
+    let mut o = PngOptions::default();
+    if let Some(v) = f64_param(p, "scale") {
+        if !(v.is_finite() && (0.1..=8.0).contains(&v)) {
+            return Err(bad(CMD, "`scale` must be between 0.1 and 8"));
+        }
+        o.scale = v as f32;
+    }
+    o.gridlines = bool_param(p, "gridlines").unwrap_or(true);
+    o.headings = bool_param(p, "headings").unwrap_or(false);
+    // `fit`: shrink the scale so the picture's longer side stays within this many pixels.
+    if let Some(fit) = f64_param(p, "maxPixels").filter(|v| v.is_finite() && *v >= 16.0) {
+        let r = range.or_else(|| print_range(sh)).unwrap_or(RangeRef::new(CellRef::new(0, 0), CellRef::new(19, 9)));
+        let (w, h) = png_size(sh, r, &o);
+        let long = w.max(h);
+        if long > fit {
+            o.scale = ((f64::from(o.scale) * fit / long) as f32).max(0.05);
+        }
+    }
+    let (png, w, h, drawn) = render_png(&d.wb, si, range, &o)?;
+    let mut out = json!({"width": w, "height": h, "bytes": png.len(), "range": drawn.a1(), "sheet": sh.name, "scale": o.scale});
+    match str_param(p, "path").filter(|x| !x.is_empty()) {
+        Some(path) => {
+            crate::io::write_file(path, &png)?;
+            out["path"] = json!(path);
+        }
+        None => out["base64"] = json!(crate::io::base64_encode(&png)),
+    }
+    Ok(out)
 }
 
 pub(crate) fn export_pdf(s: &mut Session, p: &Json) -> Result<Json> {
@@ -1757,6 +2157,95 @@ mod tests {
     }
     fn contains(hay: &[u8], needle: &str) -> bool {
         hay.windows(needle.len()).any(|w| w == needle.as_bytes())
+    }
+
+    // ---------- WHIQ: shaped text, embedded fonts, PNG renders, right-to-left sheets ----------
+
+    /// Dark pixels per column band of a PNG: (left half, right half).
+    fn ink(png: &[u8], x0: u32, x1: u32, y0: u32, y1: u32) -> (usize, usize) {
+        let img = image::load_from_memory(png).unwrap().to_rgba8();
+        let mid = (x0 + x1) / 2;
+        let (mut l, mut r) = (0, 0);
+        for y in y0..y1.min(img.height()) {
+            for x in x0..x1.min(img.width()) {
+                if img.get_pixel(x, y).0[0] < 110 {
+                    if x < mid {
+                        l += 1;
+                    } else {
+                        r += 1;
+                    }
+                }
+            }
+        }
+        (l, r)
+    }
+
+    #[test]
+    fn arabic_cells_are_right_aligned_and_latin_left_aligned_in_png() {
+        let mut s = s();
+        s.execute("home.columnWidth", json!({"cols": "A:A", "chars": 30})).unwrap();
+        s.execute("cell.set", json!({"cell": "A1", "input": "مرحبا"})).unwrap();
+        s.execute("cell.set", json!({"cell": "A2", "input": "Hello"})).unwrap();
+        let r = s.execute("file.renderPng", json!({"range": "A1:A2", "scale": 1, "gridlines": false})).unwrap();
+        let png = crate::io::base64_decode(r["base64"].as_str().unwrap()).unwrap();
+        let w = r["width"].as_u64().unwrap() as u32;
+        let (l, rr) = ink(&png, 0, w, 0, 20);
+        assert!(rr > 20 && l == 0, "Arabic text sits on the right: {l} / {rr}");
+        let (l, rr) = ink(&png, 0, w, 20, 40);
+        assert!(l > 20 && rr == 0, "Latin text sits on the left: {l} / {rr}");
+        // An explicit reading order wins.
+        s.execute("home.textDirection", json!({"range": "A2", "direction": "rtl"})).unwrap();
+        let r = s.execute("file.renderPng", json!({"range": "A1:A2", "scale": 1, "gridlines": false})).unwrap();
+        let png = crate::io::base64_decode(r["base64"].as_str().unwrap()).unwrap();
+        let (l, rr) = ink(&png, 0, w, 20, 40);
+        assert!(rr > 20 && l == 0, "rtl reading order: {l} / {rr}");
+    }
+
+    #[test]
+    fn right_to_left_sheets_put_column_a_on_the_right() {
+        let mut s = s();
+        s.execute("cell.set", json!({"cell": "A1", "input": "1"})).unwrap();
+        s.execute("cell.set", json!({"cell": "C1", "input": "x"})).unwrap();
+        s.execute("view.rightToLeft", json!({"on": true})).unwrap();
+        let r = s.execute("file.renderPng", json!({"range": "A1:C1", "scale": 1, "gridlines": false})).unwrap();
+        let png = crate::io::base64_decode(r["base64"].as_str().unwrap()).unwrap();
+        let w = r["width"].as_u64().unwrap() as u32;
+        // Column A is the rightmost third, C the leftmost.
+        let (a_l, a_r) = ink(&png, 2 * w / 3, w, 0, 20);
+        let (c_l, c_r) = ink(&png, 0, w / 3, 0, 20);
+        assert!(a_l + a_r > 5, "A1 drawn on the right");
+        assert!(c_l + c_r > 5, "C1 drawn on the left");
+        // A PDF of the sheet mirrors too (and still exports).
+        let (pdf, pages) = pdf_of(&mut s, json!({}));
+        assert_eq!(pages, 1);
+        assert!(contains(&pdf, "(x) Tj"));
+    }
+
+    #[test]
+    fn pdf_embeds_subset_fonts_for_arabic_only_where_needed() {
+        let mut s = s();
+        s.execute("cell.set", json!({"cell": "A1", "input": "hello"})).unwrap();
+        s.execute("cell.set", json!({"cell": "A2", "input": "الإجمالي"})).unwrap();
+        let (pdf, _) = pdf_of(&mut s, json!({}));
+        assert!(contains(&pdf, "(hello) Tj"), "plain text keeps the standard font");
+        assert!(contains(&pdf, "/Type0") && contains(&pdf, "+NotoSansArabic-Regular") && contains(&pdf, "/FontFile2"));
+        let (pdf, _) = pdf_of(&mut s, json!({"fonts": "embedded"}));
+        assert!(!contains(&pdf, "(hello) Tj") && contains(&pdf, "+NotoSans-Regular"), "every string embedded");
+        let (pdf, _) = pdf_of(&mut s, json!({"fonts": "standard"}));
+        assert!(!contains(&pdf, "/Type0"));
+        assert!(s.execute("file.exportPdf", json!({"fonts": "bogus"})).is_err());
+    }
+
+    #[test]
+    fn png_renders_refuse_hostile_sizes() {
+        let mut s = s();
+        s.execute("cell.set", json!({"cell": "A1", "input": "x"})).unwrap();
+        assert!(s.execute("file.renderPng", json!({"range": "A1:ZZ50000"})).is_err());
+        assert!(s.execute("file.renderPng", json!({"range": "A1", "scale": 1000})).is_err());
+        let r = s.execute("file.renderPng", json!({"range": "A:A", "scale": 1})).unwrap();
+        assert_eq!(r["range"], "A1", "whole columns mean their used part");
+        let r = s.execute("file.renderPng", json!({"range": "A1:Z200", "maxPixels": 500})).unwrap();
+        assert!(r["width"].as_u64().unwrap() <= 501 && r["height"].as_u64().unwrap() <= 501, "{r}");
     }
 
     #[test]
