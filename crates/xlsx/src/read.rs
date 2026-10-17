@@ -30,6 +30,11 @@ pub struct Ctx<'a> {
     pub cell_pictures: Vec<Option<Arc<CellPicture>>>,
     /// x14 conditional-format ids of the current sheet's data bars, with the index of the rule in `cond_formats`.
     pub cf_ext_ids: Vec<(String, usize)>,
+    /// WHIQ: slicers read from the sheets, their drawing frames (sheet, name, anchor) and the
+    /// tables' ids in the file (id, table name), tied together after the sheets ([`crate::slicers`]).
+    pub slicers: Vec<crate::slicers::Pending>,
+    pub slicer_frames: Vec<(String, String, gridcraft_model::Anchor)>,
+    pub table_file_ids: Vec<(u32, String)>,
 }
 
 impl Ctx<'_> {
@@ -82,6 +87,9 @@ pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
         num_fmts: Default::default(),
         cell_pictures: vec![],
         cf_ext_ids: vec![],
+        slicers: vec![],
+        slicer_frames: vec![],
+        table_file_ids: vec![],
     };
     let root_rels = cx.pkg.rels("")?;
     let wb_part = find_rel(&root_rels, "officeDocument").map(|r| r.target.clone()).unwrap_or_else(|| "xl/workbook.xml".into());
@@ -246,6 +254,8 @@ pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
         wb.sheets.push(Arc::new(Sheet::new("Sheet1")));
     }
     wb.active_sheet = file_to_model.get(active_tab).copied().flatten().unwrap_or(0);
+    // WHIQ: table slicers; their caches' `#N/A` names are the writer's to make.
+    let slicer_caches = crate::slicers::resolve(&mut cx, &wb_xml, &wb_rels, &mut wb);
 
     // Defined names. Chartex parts refer to their data through hidden `_xlchart.*` names.
     let mut chart_names: Vec<(String, String)> = vec![];
@@ -261,7 +271,7 @@ pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
             };
             let text = d.text.trim();
             let lname = name.to_ascii_lowercase();
-            if lname == "_xlnm._filterdatabase" {
+            if lname == "_xlnm._filterdatabase" || slicer_caches.iter().any(|c| c.eq_ignore_ascii_case(name)) {
                 continue;
             }
             if lname.starts_with("_xlchart.") {

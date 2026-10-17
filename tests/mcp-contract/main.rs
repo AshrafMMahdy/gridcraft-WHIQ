@@ -10,5 +10,6 @@
 
 mod harness;
 
+mod authoring;
 mod contract;
 mod render;

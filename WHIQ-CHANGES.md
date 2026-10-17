@@ -146,3 +146,52 @@ pipeline every `tools/call` goes through, `server_status`, `job_status`, error c
   `render::arabic_png_render` (Arabic right-aligned in A1, numbers right, inline image block,
   fitted sheet, RTL sheet with A on the right) and `render::pdf_page_setup` (A4 landscape,
   fit to width over several pages, header row repeated on every page, footer page numbers).
+
+## 5. Workbook authoring: `build_workbook`, native charts, recalculated formulas
+
+- **`file.build`** (engine command, `crates/engine/src/cmd/build.rs`; MCP `build_workbook`; CLI
+  `gridcraft-cli build spec.json --out book.xlsx`): one JSON spec makes a whole workbook — sheets
+  with a header row and rows (strings starting with `=` are formulas, other strings parsed as typed
+  input), `start`, `columns: [{header, width, format}]`, `number_formats` by column or range,
+  `column_widths` (map, list or `"auto"`), `header_style`, `freeze_header`, `autofilter`, `table`
+  (style / name), `merges`, `conditional_formats`, `validations`, `rtl`, document properties, and
+  native **charts**: `bar` (horizontal), `column`, `line`, `pie`, `doughnut`, `area`, `scatter`,
+  `combo` (first series columns, the rest lines; `secondary: true` puts a series on a secondary
+  axis), with `title`, `x_title` / `y_title`, `legend`, `data_labels`, `stacked`, `colors`, `at`,
+  `width`, `height`, and `series: [{name, values, categories, type, secondary, color, smooth}]` by
+  range — or `data: "A1:C9"` like Insert › Chart. Everything is applied with the engine's own
+  commands, the workbook is recalculated before it is returned or saved (so every formula's cached
+  value is right when Excel opens it), and its undo history starts clean. A bad spec fails naming
+  the sheet and step ("sheet Sales, chart 2: …") and leaves no half-built workbook open. Over 5
+  million cells is refused with a next step.
+- **`formulas.recalculate`** (MCP `recalculate`; CLI `gridcraft-cli recalculate book.xlsx [--out]
+  [--json]`): a full recalculation, with the count of formulas and the cells that evaluate to errors.
+  `gridcraft-cli check` stays as the oracle (cached values vs recalculation, round-trip fidelity).
+- CLI `gridcraft-cli render book.xlsx out.png [--range] [--sheet] [--scale]`.
+- Tests: engine `build::tests::*` (sheets, formats, table, five chart kinds incl. combo with a
+  secondary axis, cached values after save, clean failure), contract
+  `authoring::build_workbook_with_native_charts` (chart parts and kinds, `barDir`, two value axes,
+  frozen header, `<f>…</f><v>…</v>`, table, autoFilter, number formats, author, `check` passes),
+  `authoring::recalculate_reports_formulas_and_errors`.
+
+## 6. In-place edits that keep charts, PivotTables, slicers and unmodelled parts
+
+- **Table slicers in XLSX** (`crates/xlsx/src/slicers.rs`, new): upstream modelled slicers but
+  neither wrote nor read them (a save dropped them). Now the slicer part, the slicer cache
+  (`x15:tableSlicerCache tableId column`), the workbook and sheet extensions, the `Slicer_<column>`
+  defined name and the drawing frame (`mc:AlternateContent` `sle:slicer`) are written, and read
+  back from Excel files; the selection is the table's filter. PivotTable slicers are still not
+  modelled: reading one warns and drops it (see "Not done").
+- **MCP editing tools**: `insert_rows`, `insert_columns`, `delete_rows`, `delete_columns`
+  (`"7"`, `"5:7"`, `"C"`, on any `sheet`), `rename_sheet`, `add_sheet`, `conditional_format`,
+  `data_validation`, plus the existing `write_range`, `set_cell`, `format_range`.
+- Charts, PivotTables (caches and tables) and the pass-through parts (custom document properties,
+  custom XML, external links, controls, OLE objects…) were already kept by upstream's model and
+  `passthrough.rs`; the contract test proves it end to end over MCP.
+- Test: contract `authoring::in_place_edits_keep_charts_pivots_slicers_and_unmodelled_parts` — a
+  customer workbook with a table, chart, slicer, PivotTable, custom document properties and a
+  custom XML part is opened, edited (cells, rows, columns, conditional format, validation, a new
+  sheet with an Arabic name, a formula across sheets) and saved in place: the original becomes
+  `OLD_customer.xlsx`, every part survives (custom parts byte for byte), the edits are there,
+  `lastModifiedBy` is the caller and `gridcraft-cli check` passes. Engine
+  `build::tests::table_slicers_round_trip_through_xlsx`.

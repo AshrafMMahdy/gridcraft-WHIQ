@@ -153,6 +153,7 @@ pub fn definitions() -> Vec<Value> {
         ),
     ];
     v.extend(more_definitions());
+    v.extend(editing_definitions());
     v
 }
 
@@ -221,6 +222,121 @@ fn more_definitions() -> Vec<Value> {
     ]
 }
 
+/// The authoring and in-place editing tools.
+fn editing_definitions() -> Vec<Value> {
+    let rows = || string("Rows, e.g. \"5\" or \"5:7\"");
+    let cols = || string("Columns, e.g. \"C\" or \"C:E\"");
+    let sheet = || string("Sheet name (default: the active sheet)");
+    vec![
+        tool(
+            "build_workbook",
+            "Build workbook",
+            "Create a complete workbook from JSON in one call and (with `path`) save it: sheets with a header row and rows of \
+             values (strings starting with = are formulas), per-column number formats and widths, a frozen header, an \
+             AutoFilter or a formatted table, merges, conditional formats, validation, right-to-left sheets, and native charts \
+             (bar, column, line, pie, doughnut, area, scatter, combo with a secondary axis; title, axis titles, series by \
+             range). Formulas are recalculated so the file opens with correct values. Example: {\"path\": \"report.xlsx\", \
+             \"sheets\": [{\"name\": \"Sales\", \"header\": [\"Region\", \"Units\"], \"rows\": [[\"North\", 10], [\"Total\", \"=SUM(B2:B2)\"]], \
+             \"columns\": [{\"width\": 20}, {\"format\": \"#,##0\"}], \"freeze_header\": true, \"table\": \"TableStyleMedium2\", \
+             \"charts\": [{\"type\": \"column\", \"title\": \"Units\", \"series\": [{\"name\": \"Units\", \"values\": \"B2:B2\", \"categories\": \"A2:A2\"}]}]}]}",
+            obj(
+                json!({
+                    "sheets": {"type": "array", "description": "Sheets: {name, header?, rows, start?, columns?: [{header?, width?, format?}], number_formats?, column_widths?, freeze_header?, autofilter?, table?, header_style?, merges?, rtl?, charts?, conditional_formats?, validations?}", "items": {"type": "object"}},
+                    "path": string("Save the workbook here (inside the write root); without it the workbook stays open unsaved"),
+                    "title": string("Document title"),
+                    "author": string("Document author (default: the caller)"),
+                    "company": string("Company"),
+                    "subject": string("Subject"),
+                }),
+                &["sheets"],
+            ),
+            crate::tools::OVERWRITE,
+        ),
+        tool(
+            "recalculate",
+            "Recalculate",
+            "Recalculate every formula in the workbook now (the cached values a saved file carries) and list the cells that \
+             evaluate to errors (#DIV/0!, #REF!, #NAME?…).",
+            obj(json!({}), &[]),
+            crate::tools::SET,
+        ),
+        tool(
+            "insert_rows",
+            "Insert rows",
+            "Insert empty rows above `rows` (formulas, charts, tables and names adjust).",
+            obj(json!({"rows": rows(), "sheet": sheet()}), &["rows"]),
+            crate::tools::ADD,
+        ),
+        tool(
+            "insert_columns",
+            "Insert columns",
+            "Insert empty columns left of `cols` (formulas, charts, tables and names adjust).",
+            obj(json!({"cols": cols(), "sheet": sheet()}), &["cols"]),
+            crate::tools::ADD,
+        ),
+        tool(
+            "delete_rows",
+            "Delete rows",
+            "Delete whole rows (cells below move up; references to them become #REF!).",
+            obj(json!({"rows": rows(), "sheet": sheet()}), &["rows"]),
+            crate::tools::ANY,
+        ),
+        tool(
+            "delete_columns",
+            "Delete columns",
+            "Delete whole columns (cells to the right move left; references to them become #REF!).",
+            obj(json!({"cols": cols(), "sheet": sheet()}), &["cols"]),
+            crate::tools::ANY,
+        ),
+        tool(
+            "rename_sheet",
+            "Rename sheet",
+            "Rename a sheet; formulas, charts and names that refer to it follow.",
+            obj(json!({"sheet": string("The sheet to rename (default: the active sheet)"), "name": string("New name")}), &["name"]),
+            crate::tools::SET,
+        ),
+        tool(
+            "add_sheet",
+            "Add sheet",
+            "Add a worksheet (and make it active).",
+            obj(json!({"name": string("Name (default Sheet2, Sheet3…)"), "before": int("Position (0-based); default: after the last")}), &[]),
+            crate::tools::ADD,
+        ),
+        tool(
+            "conditional_format",
+            "Conditional format",
+            "Add a conditional format to a range: {range, rule: {type: cellIs|expression|containsText|duplicate|top10|aboveAverage|colorScale|dataBar|iconSet…, operator?, value?, formula?, preset?: lightRedFill|greenFill…}}.",
+            obj(
+                json!({"range": string("Range, e.g. \"B2:B50\""), "rule": {"type": "object", "description": "The rule (see home.conditionalFormat in list_commands)"}}),
+                &["range", "rule"],
+            ),
+            crate::tools::ADD,
+        ),
+        tool(
+            "data_validation",
+            "Data validation",
+            "Set data validation on a range: {range, type: list|whole|decimal|date|time|textLength|custom, formula1 (e.g. \"Yes,No\" or \"=$H$2:$H$9\"), operator?, formula2?, inputMessage?, errorMessage?} or clear: true.",
+            obj(
+                json!({
+                    "range": string("Range, e.g. \"C2:C100\""),
+                    "type": enumeration("Validation type", &["any", "whole", "decimal", "list", "date", "time", "textLength", "custom"]),
+                    "operator": string("between|notBetween|equal|notEqual|greater|less|greaterOrEqual|lessOrEqual"),
+                    "formula1": string("First value or formula; for a list, the items separated by commas"),
+                    "formula2": string("Second value (between / notBetween)"),
+                    "inputTitle": string("Input message title"),
+                    "inputMessage": string("Input message"),
+                    "errorTitle": string("Error alert title"),
+                    "errorMessage": string("Error alert message"),
+                    "errorStyle": enumeration("Error alert style", &["stop", "warning", "information"]),
+                    "clear": boolean("Remove validation from the range"),
+                }),
+                &["range"],
+            ),
+            crate::tools::SET,
+        ),
+    ]
+}
+
 fn enumeration(desc: &str, values: &[&str]) -> Value {
     json!({"type": "string", "enum": values, "description": desc})
 }
@@ -230,8 +346,80 @@ pub(crate) fn dispatch_extra(b: &mut dyn Backend, name: &str, a: &Args) -> Resul
     match name {
         "render_range" | "render_sheet" => render(b, name, a),
         "export_pdf" => export_pdf(b, a),
+        "build_workbook" => {
+            let mut p = Value::Object(a.clone());
+            // The caller (or --author) is the new workbook's author and last modifier.
+            let user = b.set_user("GridCraft User").inspect(|u| {
+                b.set_user(u);
+            });
+            if let Some(u) = user.filter(|u| !u.is_empty() && u != "GridCraft User") {
+                if p.get("author").is_none() {
+                    p["author"] = json!(u);
+                }
+                p["last_modified_by"] = json!(u);
+            }
+            let mut v = exec(b, "file.build", p)?;
+            v["next_step"] = json!(if a.get("path").is_some() {
+                "the workbook is saved and open: edit it further, or render_sheet to look at it"
+            } else {
+                "the workbook is open: save_workbook with a path to keep it"
+            });
+            Ok(v)
+        }
+        "recalculate" => exec(b, "formulas.recalculate", json!({})),
+        "insert_rows" => with_sheet(b, a, |b| exec(b, "home.insertRows", json!({"rows": span(a, "rows")}))),
+        "insert_columns" => with_sheet(b, a, |b| exec(b, "home.insertColumns", json!({"cols": span(a, "cols")}))),
+        "delete_rows" => with_sheet(b, a, |b| exec(b, "home.deleteRows", json!({"rows": span(a, "rows")}))),
+        "delete_columns" => with_sheet(b, a, |b| exec(b, "home.deleteColumns", json!({"cols": span(a, "cols")}))),
+        "rename_sheet" => exec(b, "sheet.rename", pick(a, &["sheet", "name"])),
+        "add_sheet" => exec(b, "home.insertSheet", pick(a, &["name", "before"])),
+        "conditional_format" => exec(b, "home.conditionalFormat", pick(a, &["range", "rule"])),
+        "data_validation" => exec(
+            b,
+            "data.validation",
+            pick(
+                a,
+                &[
+                    "range",
+                    "type",
+                    "operator",
+                    "formula1",
+                    "formula2",
+                    "inputTitle",
+                    "inputMessage",
+                    "errorTitle",
+                    "errorMessage",
+                    "errorStyle",
+                    "clear",
+                ],
+            ),
+        ),
         other => Err(format!("unknown tool `{other}`")),
     }
+}
+
+/// `"7"` → `"7:7"`, `"C"` → `"C:C"`, `"5-7"` → `"5:7"`; a sheet prefix is dropped (the
+/// `sheet` argument says which sheet).
+fn span(a: &Args, key: &str) -> String {
+    let raw = match a.get(key) {
+        Some(Value::String(t)) => t.clone(),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    };
+    let t = split_sheet(raw.trim()).1.trim().replace('-', ":").replace(' ', "");
+    if t.contains(':') { t } else { format!("{t}:{t}") }
+}
+
+/// Runs `f` with `sheet` (when given) active, then puts the previous active sheet back.
+fn with_sheet(b: &mut dyn Backend, a: &Args, f: impl FnOnce(&mut dyn Backend) -> Result<Value, String>) -> Result<Value, String> {
+    let Some(sheet) = a.get("sheet").and_then(Value::as_str) else { return f(b) };
+    let before = b.call("document.inspect", json!({}))?["activeSheet"].as_u64();
+    exec(b, "sheet.activate", json!({"sheet": sheet}))?;
+    let r = f(b);
+    if let Some(i) = before {
+        let _ = exec(b, "sheet.activate", json!({"sheet": i}));
+    }
+    r
 }
 
 /// Largest inline picture (bytes of PNG).

@@ -489,7 +489,9 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (
     }
 
     // Drawing: pictures, charts, shapes.
-    if !sheet.images.is_empty() || !sheet.charts.is_empty() || !sheet.shapes.is_empty() {
+    let slicer_frames: Vec<(&gridcraft_model::Slicer, String)> =
+        sheet.slicers.iter().filter_map(|sl| crate::slicers::frame_name(&out.slicer_plan, si, sl).map(|n| (sl, n.to_string()))).collect();
+    if !sheet.images.is_empty() || !sheet.charts.is_empty() || !sheet.shapes.is_empty() || !slicer_frames.is_empty() {
         out.drawings += 1;
         let dn = out.drawings;
         let mut drels = Rels::default();
@@ -530,6 +532,9 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (
         for sh in &sheet.shapes {
             objs.push(Obj::Shape(sh));
         }
+        for (sl, name) in &slicer_frames {
+            objs.push(Obj::Slicer(sl, name.clone()));
+        }
         out.part(&format!("xl/drawings/drawing{dn}.xml"), Some(CT_DRAWING), crate::drawing::write_drawing(sheet, &wb.theme, &objs).into_bytes());
         if !drels.is_empty() {
             out.part(&format!("xl/drawings/_rels/drawing{dn}.xml.rels"), None, drels.xml().into_bytes());
@@ -569,6 +574,7 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (
             out.table_id += 1;
             let n = out.tables;
             let name = table_name(&t.name, &mut used_names, out.table_id);
+            out.slicer_plan.table_ids.push((t.name.clone(), out.table_id));
             let xml = table_xml(t, cols, &name, out.table_id, out);
             out.part(&format!("xl/tables/table{n}.xml"), Some(CT_TABLE), xml.into_bytes());
             let rid = rels.add("table", &format!("../tables/table{n}.xml"));
@@ -584,7 +590,8 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (
         .filter(|(_, cf)| !cf.ranges.is_empty() && matches!(cf.rule, CfRule::DataBar { gradient: false, .. }))
         .map(|(i, cf)| (cf, prio.get(i).copied().unwrap_or(1)))
         .collect();
-    if !solid_bars.is_empty() || !sheet.sparklines.is_empty() {
+    let slicer_ext = crate::slicers::write_sheet(out, si, &mut rels);
+    if !solid_bars.is_empty() || !sheet.sparklines.is_empty() || slicer_ext.is_some() {
         s.push_str("<extLst>");
     }
     if !solid_bars.is_empty() {
@@ -622,7 +629,10 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (
         }
         s.push_str("</x14:sparklineGroups></ext>");
     }
-    if !solid_bars.is_empty() || !sheet.sparklines.is_empty() {
+    if let Some(x) = &slicer_ext {
+        s.push_str(x);
+    }
+    if !solid_bars.is_empty() || !sheet.sparklines.is_empty() || slicer_ext.is_some() {
         s.push_str("</extLst>");
     }
     s.push_str("</worksheet>");

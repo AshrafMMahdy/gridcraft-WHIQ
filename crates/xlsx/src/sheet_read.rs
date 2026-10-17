@@ -188,13 +188,19 @@ pub fn read_sheet(cx: &mut Ctx<'_>, part: &str, name: &str) -> Result<Sheet, IoE
                         if let Some(x) = cx.optional_xml(&target)?
                             && let Some(mut t) = read_table(cx, &x)
                         {
+                            if let Some(file_id) = x.attr_u32("id") {
+                                cx.table_file_ids.push((file_id, t.name.clone()));
+                            }
                             t.id = cx.next_object_id();
                             sheet.tables.push(t);
                         }
                     }
                 }
             }
-            "extLst" => read_ext(cx, e, &mut sheet),
+            "extLst" => {
+                read_ext(cx, e, &mut sheet);
+                crate::slicers::read_sheet_ext(cx, e, &rels, name);
+            }
             "protectedRanges" => read_protected_ranges(e, &mut sheet),
             _ => {}
         }

@@ -126,6 +126,8 @@ pub struct Out {
     pub cell_pictures: crate::richdata::PicturesOut,
     /// Kept (pass-through) parts written so far.
     pub kept: crate::passthrough::KeptOut,
+    /// WHIQ: the table slicers to write and the tables' ids.
+    pub slicer_plan: crate::slicers::Plan,
 }
 
 impl Out {
@@ -211,6 +213,7 @@ pub fn write_xlsx(wb: &Workbook, kind: XlsxKind) -> Result<Vec<u8>, IoError> {
         needs_calc: false,
         cell_pictures: Default::default(),
         kept: Default::default(),
+        slicer_plan: crate::slicers::plan(wb),
     };
     out.default_type("rels", "application/vnd.openxmlformats-package.relationships+xml");
     out.default_type("xml", "application/xml");
@@ -313,6 +316,9 @@ pub fn write_xlsx(wb: &Workbook, kind: XlsxKind) -> Result<Vec<u8>, IoError> {
         }
     }
 
+    // WHIQ: table slicer caches (the tables' ids are known now) and their names.
+    let (slicer_names, slicer_ext) = crate::slicers::write_workbook(&mut out, &mut wb_rels);
+    names.push_str(&slicer_names);
     let mut w = format!("{XML_DECL}<workbook xmlns=\"{NS_MAIN}\" xmlns:r=\"{NS_REL}\">");
     w.push_str(&crate::passthrough::workbook_elements(wb, "fileVersion"));
     w.push_str(if wb.date_system == gridcraft_core::DateSystem::D1904 { "<workbookPr date1904=\"1\"/>" } else { "<workbookPr/>" });
@@ -351,7 +357,7 @@ pub fn write_xlsx(wb: &Workbook, kind: XlsxKind) -> Result<Vec<u8>, IoError> {
     }
     w.push_str("/>");
     w.push_str(&pivots.workbook_xml(&mut wb_rels));
-    let exts = crate::passthrough::workbook_elements(wb, "ext");
+    let exts = crate::passthrough::workbook_elements(wb, "ext") + &slicer_ext;
     if !exts.is_empty() {
         let _ = write!(w, "<extLst>{exts}</extLst>");
     }

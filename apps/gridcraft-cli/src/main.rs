@@ -7,6 +7,9 @@
 //! gridcraft-cli cat <file> [--range A1:D20] [--sheet S] [--formulas] [--csv]
 //! gridcraft-cli check <file-or-dir>... [--json] [--tolerance 1e-9] [--max-report N]
 //! gridcraft-cli run [--in FILE | --sample NAME] [--cmd 'id={json}']... [--script FILE.jsonl] [--out FILE] [--print RANGE] [--quiet]
+//! gridcraft-cli build <spec.json> [--out FILE]
+//! gridcraft-cli recalculate <file> [--out FILE] [--json]
+//! gridcraft-cli render <file> <out.png> [--range A1:F20] [--sheet S] [--scale 2]
 //! gridcraft-cli commands [--json] [--search X]
 //! gridcraft-cli functions [--json] [--search X] [--category C]
 //! gridcraft-cli mcp [--connect PORT] [--in FILE | --sample NAME] [--automation-read-root DIR]
@@ -44,6 +47,11 @@ const USAGE: &str = "usage:
                      cached-value calc oracle + XLSX round-trip fidelity (exit 1 on any difference)
   gridcraft-cli run [--in FILE | --sample NAME] [--cmd 'id={json}']... [--script FILE.jsonl]
                      [--out FILE] [--print RANGE] [--quiet]
+  gridcraft-cli build <spec.json> [--out FILE]      a workbook from a JSON spec (file.build; see WHIQ-CHANGES.md)
+  gridcraft-cli recalculate <file> [--out FILE] [--json]
+                     recalculate every formula; list error cells; --out saves the recalculated workbook
+  gridcraft-cli render <file> <out.png> [--range A1:F20] [--sheet S] [--scale 2]
+                     a PNG of a range (shaped Arabic, charts, right-to-left sheets)
   gridcraft-cli commands [--json] [--search X]
   gridcraft-cli functions [--json] [--search X] [--category C]
   gridcraft-cli mcp [--connect PORT] [--in FILE | --sample NAME] [--author NAME]
@@ -84,6 +92,9 @@ fn main() -> ExitCode {
         Some("cat") => cat(rest),
         Some("run") => run(rest),
         Some("check") => return check::main(rest),
+        Some("build") => build(rest),
+        Some("recalculate" | "recalc") => recalculate(rest),
+        Some("render") => render(rest),
         Some("commands") => commands(rest),
         Some("functions") => functions(rest),
         Some("mcp") => mcp(rest),
@@ -436,6 +447,66 @@ fn run(args: &[String]) -> Result<(), String> {
             print_range(&mut s, range, a.opt("sheet"), a.has("formulas"), a.has("csv"))?;
         }
     }
+    Ok(())
+}
+
+/// WHIQ: `build SPEC.json [--out FILE]`.
+fn build(args: &[String]) -> Result<(), String> {
+    let a = Args::parse(args, &["out"], &[])?;
+    let spec_path = a.pos(0, "<spec.json>")?;
+    a.no_extra(1)?;
+    let text = std::fs::read_to_string(spec_path).map_err(|e| format!("{spec_path}: {e}"))?;
+    let mut spec: Value = serde_json::from_str(&text).map_err(|e| format!("{spec_path}: bad JSON: {e}"))?;
+    if let Some(out) = a.opt("out") {
+        spec["path"] = json!(out);
+    }
+    let mut s = Session::new();
+    let r = exec(&mut s, "file.build", spec)?;
+    outln!("{}", pretty(&r));
+    Ok(())
+}
+
+/// WHIQ: `recalculate FILE [--out FILE] [--json]`.
+fn recalculate(args: &[String]) -> Result<(), String> {
+    let a = Args::parse(args, &["out"], &["json"])?;
+    let path = a.pos(0, "<file>")?;
+    a.no_extra(1)?;
+    let mut s = open(path)?;
+    let r = exec(&mut s, "formulas.recalculate", json!({}))?;
+    if a.has("json") {
+        outln!("{}", serde_json::to_string(&r).unwrap_or_default());
+    } else {
+        outln!("{} formulas, {} errors", r["formulas"], r["errorCount"]);
+        for e in r["errors"].as_array().into_iter().flatten() {
+            outln!("  {} {}", e["cell"].as_str().unwrap_or("?"), e["error"].as_str().unwrap_or("?"));
+        }
+    }
+    if let Some(out) = a.opt("out") {
+        let w = exec(&mut s, "file.save", json!({"path": out}))?;
+        eprintln!("wrote {out} ({} bytes)", w["bytes"]);
+    }
+    Ok(())
+}
+
+/// WHIQ: `render FILE OUT.png [--range R] [--sheet S] [--scale K]`.
+fn render(args: &[String]) -> Result<(), String> {
+    let a = Args::parse(args, &["range", "sheet", "scale"], &["headings", "no-gridlines"])?;
+    let path = a.pos(0, "<file>")?;
+    let out = a.pos(1, "<out.png>")?;
+    a.no_extra(2)?;
+    let mut s = open(path)?;
+    let mut p = json!({"path": out, "headings": a.has("headings"), "gridlines": !a.has("no-gridlines")});
+    if let Some(r) = a.opt("range") {
+        p["range"] = json!(r);
+    }
+    if let Some(sh) = a.opt("sheet") {
+        p["sheet"] = json!(sh);
+    }
+    if let Some(k) = a.opt("scale") {
+        p["scale"] = json!(k.parse::<f64>().map_err(|_| format!("--scale needs a number, not `{k}`"))?);
+    }
+    let r = exec(&mut s, "file.renderPng", p)?;
+    eprintln!("wrote {out} ({}×{} pixels, {})", r["width"], r["height"], r["range"].as_str().unwrap_or(""));
     Ok(())
 }
 

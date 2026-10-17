@@ -175,6 +175,11 @@ pub fn read_drawing(cx: &mut Ctx<'_>, part: &str, sheet: &mut Sheet) -> Result<(
                                 None => cx.warn(format!("chart {target} has no supported plot and was skipped")),
                             }
                         }
+                    } else if uri.contains("slicer") {
+                        // WHIQ: a slicer's frame; the slicer itself comes from the sheet's slicer part.
+                        if let Some(name) = gd.child("slicer").and_then(|s| s.attr("name")) {
+                            cx.slicer_frames.push((sheet.name.clone(), name.to_string(), anchor));
+                        }
                     } else if uri.contains("chartex") || uri.contains("chartEx") {
                         cx.warn("a histogram, waterfall, treemap… chart without its chart part was skipped");
                     } else {
@@ -311,6 +316,8 @@ pub enum Obj<'a> {
     Image(&'a Image, String),
     Chart(&'a gridcraft_model::Chart, String),
     Shape(&'a Shape),
+    /// WHIQ: a table slicer's frame, by its slicer name.
+    Slicer(&'a gridcraft_model::Slicer, String),
 }
 
 /// The drawing part for a sheet's objects (relationship ids already assigned).
@@ -357,6 +364,17 @@ pub fn write_drawing(sheet: &Sheet, theme: &Theme, objs: &[Obj<'_>]) -> String {
                     "<xdr:graphicFrame macro=\"\"><xdr:nvGraphicFramePr><xdr:cNvPr id=\"{id}\" name=\"Chart {}\"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>{}<a:graphic><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart r:id=\"{rid}\"/></a:graphicData></a:graphic></xdr:graphicFrame>",
                     id - 1,
                     xfrm(&ch.anchor, "xdr:xfrm")
+                );
+            }
+            Obj::Slicer(sl, name) => {
+                let (open, close) = anchor_open(sheet, &sl.anchor);
+                close_tag = close;
+                s.push_str(&open);
+                let n = esc_attr(name);
+                let _ = write!(
+                    s,
+                    "<mc:AlternateContent xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\"><mc:Choice xmlns:sle15=\"http://schemas.microsoft.com/office/drawing/2012/slicer\" Requires=\"sle15\"><xdr:graphicFrame macro=\"\"><xdr:nvGraphicFramePr><xdr:cNvPr id=\"{id}\" name=\"{n}\"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/></xdr:xfrm><a:graphic><a:graphicData uri=\"http://schemas.microsoft.com/office/drawing/2010/slicer\"><sle:slicer xmlns:sle=\"http://schemas.microsoft.com/office/drawing/2010/slicer\" name=\"{n}\"/></a:graphicData></a:graphic></xdr:graphicFrame></mc:Choice><mc:Fallback><xdr:sp macro=\"\" textlink=\"\"><xdr:nvSpPr><xdr:cNvPr id=\"0\" name=\"\"/><xdr:cNvSpPr><a:spLocks noTextEdit=\"1\"/></xdr:cNvSpPr></xdr:nvSpPr><xdr:spPr>{}<a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom><a:solidFill><a:prstClr val=\"white\"/></a:solidFill><a:ln w=\"1\"><a:solidFill><a:prstClr val=\"green\"/></a:solidFill></a:ln></xdr:spPr><xdr:txBody><a:bodyPr vertOverflow=\"clip\" horzOverflow=\"clip\"/><a:lstStyle/><a:p><a:r><a:rPr lang=\"en-US\" sz=\"1100\"/><a:t>This shape represents a table slicer. Table slicers need Excel 2013 or later.</a:t></a:r></a:p></xdr:txBody></xdr:sp></mc:Fallback></mc:AlternateContent>",
+                    xfrm(&sl.anchor, "a:xfrm")
                 );
             }
             Obj::Shape(sh) => {
