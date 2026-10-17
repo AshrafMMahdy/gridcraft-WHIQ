@@ -6,6 +6,18 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
+/// WHIQ: the state of the open document, kept after every call so it can be auto-saved from
+/// another thread (SIGTERM, eviction) without asking the busy worker.
+#[derive(Clone, Debug)]
+pub struct DocSnapshot {
+    pub wb: std::sync::Arc<gridcraft_engine::model::Workbook>,
+    pub title: String,
+    pub path: Option<String>,
+    pub dirty: bool,
+    pub cells: u64,
+    pub sheets: Vec<String>,
+}
+
 /// Something that answers control-channel methods (`engine.execute`, `engine.commands`,
 /// `document.inspect`, `sheet.read`, `ui.screenshot`, …).
 pub trait Backend {
@@ -15,6 +27,23 @@ pub trait Backend {
     fn has_ui(&self) -> bool;
     /// Short human description ("headless", "connected to 127.0.0.1:7979").
     fn describe(&self) -> String;
+    /// WHIQ: the active document as it stands (`None` when the backend can't say).
+    fn snapshot(&self) -> Option<DocSnapshot> {
+        None
+    }
+    /// WHIQ: the user name comments, notes and saves carry from now on; returns the previous one.
+    fn set_user(&mut self, _name: &str) -> Option<String> {
+        None
+    }
+    /// WHIQ: record `name` as the workbook's last modifier (and author when it has none) before
+    /// a save.
+    fn stamp_author(&mut self, _name: &str) {}
+    /// WHIQ: close every document and start over with a blank one (eviction frees the memory).
+    fn reset(&mut self) {}
+    /// WHIQ: the automation read and write roots in force.
+    fn roots(&self) -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
+        (None, None)
+    }
 }
 
 /// Read/write timeout on the control connection.

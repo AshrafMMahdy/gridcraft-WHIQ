@@ -21,3 +21,9 @@ log = { workspace = true }
 # `check`: validating the packages GridCraft writes (content types, relationships).
 zip = { workspace = true }
 quick-xml = { workspace = true }
+
+# WHIQ: the MCP contract suite lives at the repository root, tests/mcp-contract/; it drives this
+# package's binary over stdio.
+[[test]]
+name = "mcp_contract"
+path = "../../tests/mcp-contract/main.rs"

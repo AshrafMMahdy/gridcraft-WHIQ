@@ -87,6 +87,48 @@ impl Backend for Headless {
     fn describe(&self) -> String {
         "headless (in-process engine, no window)".to_string()
     }
+
+    fn snapshot(&self) -> Option<crate::backend::DocSnapshot> {
+        let d = self.session.active()?;
+        Some(crate::backend::DocSnapshot {
+            wb: d.wb.clone(),
+            title: d.display_title(),
+            path: d.path.clone(),
+            dirty: d.is_dirty(),
+            cells: d.wb.sheets.iter().map(|s| s.cells.len() as u64).sum(),
+            sheets: d.wb.sheets.iter().map(|s| s.name.clone()).collect(),
+        })
+    }
+
+    fn set_user(&mut self, name: &str) -> Option<String> {
+        Some(std::mem::replace(&mut self.session.prefs.user_name, name.to_string()))
+    }
+
+    fn stamp_author(&mut self, name: &str) {
+        if let Ok(d) = self.session.doc_mut()
+            && (d.wb.props.last_modified_by != name || d.wb.props.author.is_empty())
+        {
+            let wb = std::sync::Arc::make_mut(&mut d.wb);
+            wb.props.last_modified_by = name.to_string();
+            if wb.props.author.is_empty() {
+                wb.props.author = name.to_string();
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        let prefs = self.session.prefs.clone();
+        self.session = Session::new();
+        self.session.prefs = prefs;
+        self.session.new_workbook();
+    }
+
+    fn roots(&self) -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
+        match &self.roots {
+            Some(r) => (r.read_root().map(Into::into), r.write_root().map(Into::into)),
+            None => (None, None),
+        }
+    }
 }
 
 impl Headless {

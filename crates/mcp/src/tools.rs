@@ -6,25 +6,40 @@ use serde_json::{Map, Value, json};
 use crate::backend::Backend;
 use crate::headless::NO_UI;
 
-/// The result of `tools/call`: MCP content blocks plus the `isError` flag.
+/// The result of `tools/call`: MCP content blocks, the `isError` flag and (WHIQ) the
+/// `structuredContent` object every result carries.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolResult {
     pub content: Vec<Value>,
     pub is_error: bool,
+    pub structured: Option<Value>,
 }
 
 impl ToolResult {
     pub fn text(t: impl Into<String>) -> Self {
-        Self { content: vec![json!({"type": "text", "text": t.into()})], is_error: false }
+        Self { content: vec![json!({"type": "text", "text": t.into()})], is_error: false, structured: None }
     }
+    /// A successful result: `v` as pretty JSON text and as `structuredContent` (an object:
+    /// anything else is wrapped as `{"result": v}`).
     pub fn json(v: &Value) -> Self {
-        Self::text(serde_json::to_string_pretty(v).unwrap_or_default())
+        let structured = if v.is_object() { v.clone() } else { json!({"result": v}) };
+        Self { structured: Some(structured), ..Self::text(serde_json::to_string_pretty(v).unwrap_or_default()) }
     }
     pub fn error(t: impl Into<String>) -> Self {
-        Self { content: vec![json!({"type": "text", "text": t.into()})], is_error: true }
+        let t = t.into();
+        let e = crate::contract::ToolError::new("failed", t.clone(), "check the arguments against the tool's input schema");
+        Self { content: vec![json!({"type": "text", "text": t})], is_error: true, structured: Some(json!({"error": e.to_value()})) }
+    }
+    /// WHIQ: a failure with its code, reason and next step.
+    pub fn failure(e: &crate::contract::ToolError) -> Self {
+        Self { content: vec![json!({"type": "text", "text": e.text()})], is_error: true, structured: Some(json!({"error": e.to_value()})) }
     }
     pub fn to_value(&self) -> Value {
-        json!({"content": self.content, "isError": self.is_error})
+        let mut v = json!({"content": self.content, "isError": self.is_error});
+        if let Some(s) = &self.structured {
+            v["structuredContent"] = s.clone();
+        }
+        v
     }
 }
 
@@ -133,8 +148,14 @@ const BORDER_PRESETS: &[&str] = &[
     "diagonalUp",
 ];
 
-/// All tools, in `tools/list` order.
+/// All tools, in `tools/list` order: upstream's, then the WHIQ ones, each with the global
+/// arguments (`caller`, `async`, and `overwrite` on tools that write files).
 pub fn tool_definitions() -> Vec<Value> {
+    crate::whiq::with_globals(base_definitions().into_iter().chain(crate::whiq::definitions()).collect())
+}
+
+/// Upstream's tools.
+fn base_definitions() -> Vec<Value> {
     let empty = || obj(json!({}), &[]);
     vec![
         // ----- generic -----
@@ -399,7 +420,7 @@ pub fn tool_definitions() -> Vec<Value> {
 
 // ---------- argument validation ----------
 
-fn type_matches(t: &str, v: &Value) -> bool {
+pub(crate) fn type_matches(t: &str, v: &Value) -> bool {
     match t {
         "string" => v.is_string(),
         "number" => v.is_number(),
@@ -448,7 +469,7 @@ fn schema_matches(schema: &Value, v: &Value) -> bool {
 /// Validates `args` against the tool's schema: unknown tool, missing required properties,
 /// top-level type mismatches and values matching none of a `oneOf` are JSON-RPC "invalid params" errors.
 pub(crate) fn check_arguments(name: &str, args: &Value) -> Result<(), String> {
-    let defs = tool_definitions();
+    let defs = crate::whiq::all_definitions();
     let def = defs.iter().find(|d| d["name"] == name).ok_or_else(|| format!("unknown tool `{name}`"))?;
     let schema = &def["inputSchema"];
     let Some(a) = args.as_object() else { return Err("tool arguments must be an object".into()) };
@@ -484,18 +505,18 @@ pub(crate) fn check_arguments(name: &str, args: &Value) -> Result<(), String> {
 
 // ---------- implementations ----------
 
-type Args = Map<String, Value>;
+pub(crate) type Args = Map<String, Value>;
 
-fn req_str<'a>(a: &'a Args, k: &str) -> Result<&'a str, String> {
+pub(crate) fn req_str<'a>(a: &'a Args, k: &str) -> Result<&'a str, String> {
     a.get(k).and_then(Value::as_str).ok_or_else(|| format!("missing string argument `{k}`"))
 }
 
-fn exec(b: &mut dyn Backend, cmd: &str, params: Value) -> Result<Value, String> {
+pub(crate) fn exec(b: &mut dyn Backend, cmd: &str, params: Value) -> Result<Value, String> {
     b.call("engine.execute", json!({"command": cmd, "params": params}))
 }
 
 /// Copies the listed keys (when present and non-null) into a params object.
-fn pick(a: &Args, keys: &[&str]) -> Value {
+pub(crate) fn pick(a: &Args, keys: &[&str]) -> Value {
     Value::Object(keys.iter().filter_map(|k| a.get(*k).filter(|v| !v.is_null()).map(|v| (k.to_string(), v.clone()))).collect())
 }
 
@@ -616,7 +637,7 @@ fn screenshot(b: &mut dyn Backend, a: &Args) -> Result<Value, String> {
     b.call("ui.screenshot", json!({"path": req_str(a, "path")?}))
 }
 
-fn dispatch(b: &mut dyn Backend, name: &str, a: &Args) -> Result<Value, String> {
+pub(crate) fn dispatch(b: &mut dyn Backend, name: &str, a: &Args) -> Result<Value, String> {
     match name {
         "execute_command" => {
             let cmd = req_str(a, "command")?;
@@ -654,20 +675,12 @@ fn dispatch(b: &mut dyn Backend, name: &str, a: &Args) -> Result<Value, String> 
         "redo" => exec(b, "edit.redo", pick(a, &["steps"])),
         "screenshot" => screenshot(b, a),
         "list_functions" => exec(b, "formulas.functions", pick(a, &["search", "category"])),
-        other => Err(format!("unknown tool `{other}`")),
+        other => crate::whiq::dispatch_extra(b, other, a),
     }
 }
 
-/// Runs one tool. Failures become `isError` results with a readable message.
+/// Runs one tool. Failures become `isError` results with a code, reason and next step (WHIQ:
+/// the whole contract pipeline, [`crate::whiq::run_tool`], with default settings).
 pub fn call_tool(b: &mut dyn Backend, name: &str, args: &Value) -> ToolResult {
-    let empty = Map::new();
-    let a = match args {
-        Value::Object(o) => o,
-        Value::Null => &empty,
-        _ => return ToolResult::error("tool arguments must be a JSON object"),
-    };
-    match dispatch(b, name, a) {
-        Ok(v) => ToolResult::json(&v),
-        Err(e) => ToolResult::error(format!("{name}: {e}")),
-    }
+    crate::whiq::run_tool(b, &mut crate::whiq::CallState::default(), name, args)
 }

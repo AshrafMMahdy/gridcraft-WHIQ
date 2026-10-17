@@ -12,3 +12,5 @@ workspace = true
 gridcraft-engine = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
+# WHIQ: auto-save on SIGTERM / SIGINT / SIGHUP (Ctrl-C, Ctrl-Break, console close on Windows).
+ctrlc = { version = "3.4", features = ["termination"] }

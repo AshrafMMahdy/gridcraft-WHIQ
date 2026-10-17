@@ -317,6 +317,7 @@ pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
         wb.props.title = get("title");
         wb.props.subject = get("subject");
         wb.props.author = get("creator");
+        wb.props.last_modified_by = get("lastModifiedBy");
         wb.props.keywords = get("keywords");
         wb.props.description = get("description");
     }

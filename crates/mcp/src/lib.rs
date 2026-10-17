@@ -15,11 +15,14 @@
 #![forbid(unsafe_code)]
 
 mod backend;
+pub mod contract;
 mod headless;
+pub mod runtime;
 mod server;
 mod tools;
+pub mod whiq;
 
-pub use backend::{Backend, Remote};
+pub use backend::{Backend, DocSnapshot, Remote};
 pub use headless::Headless;
 pub use server::{COMMANDS_URI, FUNCTIONS_URI, PROTOCOL_VERSION, SUPPORTED_VERSIONS, Server, WORKBOOK_URI};
 pub use tools::{ToolResult, call_tool, tool_definitions};

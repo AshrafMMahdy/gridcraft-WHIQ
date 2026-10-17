@@ -138,10 +138,20 @@ fn malformed_input_never_panics() {
     assert_eq!(err_code(&rpc(&mut s, 2, "tools/call", json!({}))), -32602);
     assert_eq!(err_code(&rpc(&mut s, 3, "tools/call", json!({"name": "no_such_tool"}))), -32602);
     assert_eq!(err_code(&rpc(&mut s, 4, "tools/call", json!({"name": "set_cell", "arguments": "x"}))), -32602);
-    assert_eq!(err_code(&rpc(&mut s, 5, "tools/call", json!({"name": "set_cell", "arguments": {"cell": "A1"}}))), -32602);
-    assert_eq!(err_code(&rpc(&mut s, 6, "tools/call", json!({"name": "set_cell", "arguments": {"cell": 5, "input": "x"}}))), -32602);
-    assert_eq!(err_code(&rpc(&mut s, 7, "tools/call", json!({"name": "insert_chart", "arguments": {"range": "A1", "type": "piechart"}}))), -32602);
-    assert_eq!(err_code(&rpc(&mut s, 8, "tools/call", json!({"name": "get_cell", "arguments": {"cell": "A1", "bogus": 1}}))), -32602);
+    // WHIQ: argument problems are tool results the model sees, with a code and a next step;
+    // unknown arguments are warnings on a successful call.
+    let invalid = |s: &mut Server, args: Value, name: &str| {
+        let r = call(s, name, args);
+        assert_eq!(r["isError"], true, "{r}");
+        assert!(r["structuredContent"]["error"]["next_step"].as_str().is_some_and(|n| !n.is_empty()), "{r}");
+        r["structuredContent"]["error"]["code"].as_str().unwrap_or("").to_string()
+    };
+    assert_eq!(invalid(&mut s, json!({"cell": "A1"}), "set_cell"), "invalid_argument");
+    invalid(&mut s, json!({"cell": 5, "input": "x"}), "set_cell");
+    assert_eq!(invalid(&mut s, json!({"range": "A1", "type": "piechart"}), "insert_chart"), "invalid_argument");
+    let r = call(&mut s, "get_cell", json!({"cell": "A1", "bogus": 1}));
+    assert_eq!(r["isError"], false, "{r}");
+    assert!(r["structuredContent"]["warnings"][0].as_str().unwrap().contains("bogus"), "{r}");
     assert_eq!(err_code(&rpc(&mut s, 9, "resources/read", json!({}))), -32602);
     assert_eq!(err_code(&rpc(&mut s, 10, "resources/read", json!({"uri": "gridcraft://nope"}))), -32002);
     // Responses and unknown notifications are ignored.
@@ -526,7 +536,7 @@ fn invalid_borders_are_invalid_params() {
     let mut s = server();
     let bad = |s: &mut Server, id: u64, borders: Value| {
         let v = rpc(s, id, "tools/call", json!({"name": "format_range", "arguments": {"range": "A1", "borders": borders}}));
-        assert_eq!(err_code(&v), -32602, "{v}");
+        assert_eq!(v["result"]["structuredContent"]["error"]["code"], "invalid_argument", "{v}");
     };
     bad(&mut s, 1, json!(123));
     bad(&mut s, 2, json!("bogus"));
@@ -542,7 +552,7 @@ fn invalid_sort_keys_are_invalid_params() {
     ok(&mut s, "write_range", json!({"range": "A1", "values": [["b"], ["c"], ["a"]]}));
     for (id, keys) in [(1, json!([123])), (2, json!([{"order": "desc"}])), (3, json!([{"column": "A", "order": "sideways"}]))] {
         let v = rpc(&mut s, id, "tools/call", json!({"name": "sort_range", "arguments": {"range": "A1:A3", "keys": keys}}));
-        assert_eq!(err_code(&v), -32602, "{v}");
+        assert_eq!(v["result"]["structuredContent"]["error"]["code"], "invalid_argument", "{v}");
     }
     ok(&mut s, "sort_range", json!({"range": "A1:A3", "keys": ["A", {"column": "A", "order": "desc"}]}));
 }

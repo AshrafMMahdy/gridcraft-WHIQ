@@ -417,6 +417,7 @@ pub fn write_xlsx(wb: &Workbook, kind: XlsxKind) -> Result<Vec<u8>, IoError> {
         ("dc:title", &p.title),
         ("dc:subject", &p.subject),
         ("dc:creator", &p.author),
+        ("cp:lastModifiedBy", &p.last_modified_by),
         ("cp:keywords", &p.keywords),
         ("dc:description", &p.description),
     ] {

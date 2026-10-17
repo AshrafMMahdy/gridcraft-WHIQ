@@ -5,7 +5,8 @@ use std::io::{BufRead, Write};
 use serde_json::{Value, json};
 
 use crate::backend::Backend;
-use crate::tools::{call_tool, check_arguments, tool_definitions};
+use crate::contract::{self, ToolError};
+use crate::whiq::{CallState, Settings, all_definitions, run_tool};
 
 /// The MCP revision we implement.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -39,6 +40,8 @@ pub const FUNCTIONS_URI: &str = "gridcraft://functions";
 pub struct Server {
     backend: Box<dyn Backend>,
     initialized: bool,
+    /// WHIQ: settings, eviction and notices kept between calls.
+    state: CallState,
 }
 
 fn response(id: Value, result: Value) -> Value {
@@ -46,12 +49,46 @@ fn response(id: Value, result: Value) -> Value {
 }
 
 fn error(id: Value, code: i64, message: impl Into<String>) -> Value {
-    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message.into()}})
+    let message = message.into();
+    // WHIQ: protocol errors carry the contract's code / reason / next step too.
+    let kind = match code {
+        PARSE_ERROR => "parse_error",
+        INVALID_REQUEST => "invalid_request",
+        METHOD_NOT_FOUND => "not_found",
+        RESOURCE_NOT_FOUND => "not_found",
+        INVALID_PARAMS => "invalid_argument",
+        _ => "internal_error",
+    };
+    let next = match code {
+        PARSE_ERROR | INVALID_REQUEST => {
+            "send one JSON-RPC 2.0 object per line: {\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{...}}"
+        }
+        METHOD_NOT_FOUND => "use initialize, tools/list, tools/call, resources/list, resources/read or ping",
+        RESOURCE_NOT_FOUND => "resources/list names the resources",
+        _ => "check the request and send it again",
+    };
+    let data = ToolError::new(kind, message.clone(), next).to_value();
+    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message, "data": data}})
+}
+
+/// A JSON-RPC error with a contract error as its data.
+pub(crate) fn error_with(id: Value, code: i64, e: &ToolError) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": e.reason, "data": e.to_value()}})
 }
 
 impl Server {
     pub fn new(backend: Box<dyn Backend>) -> Self {
-        Self { backend, initialized: false }
+        Self { backend, initialized: false, state: CallState::default() }
+    }
+
+    /// WHIQ: a server with its limits and author.
+    pub fn with_settings(backend: Box<dyn Backend>, settings: Settings) -> Self {
+        Self { backend, initialized: false, state: CallState { settings, ..CallState::default() } }
+    }
+
+    /// WHIQ: eviction state, notices and settings.
+    pub fn state_mut(&mut self) -> &mut CallState {
+        &mut self.state
     }
 
     pub fn backend(&mut self) -> &mut dyn Backend {
@@ -132,10 +169,38 @@ impl Server {
         if !(params.is_object() || params.is_null()) {
             return Some(error(id, INVALID_PARAMS, "`params` must be an object"));
         }
+        if method == "tools/call" {
+            return Some(self.tools_call(id, &params));
+        }
         Some(match self.request(method, &params) {
             Ok(r) => response(id, r),
             Err((code, m)) => error(id, code, m),
         })
+    }
+
+    /// WHIQ: `tools/call` through the contract: the tool name is matched in any spelling (an
+    /// unknown one is a JSON-RPC error naming the closest tools); everything else, argument
+    /// problems included, is a tool result the model sees.
+    fn tools_call(&mut self, id: Value, params: &Value) -> Value {
+        let Some(asked) = params.get("name").and_then(Value::as_str) else {
+            return error(id, INVALID_PARAMS, "missing tool `name`");
+        };
+        let args = match params.get("arguments") {
+            None | Some(Value::Null) => json!({}),
+            Some(v @ Value::Object(_)) => v.clone(),
+            Some(_) => return error(id, INVALID_PARAMS, "tool `arguments` must be an object"),
+        };
+        let names: Vec<String> = all_definitions().iter().filter_map(|d| d["name"].as_str().map(str::to_string)).collect();
+        let Some(name) = contract::normalize_tool_name(asked, &names) else {
+            let near = contract::closest(asked, names.iter().map(String::as_str), 3);
+            let e = ToolError::new("not_found", format!("unknown tool `{asked}`"), "call tools/list; the closest tools are in `closest`")
+                .with("closest", json!(near));
+            return error_with(id, INVALID_PARAMS, &e);
+        };
+        if name != asked {
+            self.state.call_warnings.push(format!("tool `{asked}` was read as `{name}`"));
+        }
+        response(id, run_tool(self.backend.as_mut(), &mut self.state, &name, &args).to_value())
     }
 
     fn notification(&mut self, method: &str) {
@@ -159,17 +224,7 @@ impl Server {
                 }))
             }
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({"tools": tool_definitions()})),
-            "tools/call" => {
-                let name = params.get("name").and_then(Value::as_str).ok_or((INVALID_PARAMS, "missing tool `name`".to_string()))?;
-                let args = match params.get("arguments") {
-                    None | Some(Value::Null) => json!({}),
-                    Some(v @ Value::Object(_)) => v.clone(),
-                    Some(_) => return Err((INVALID_PARAMS, "tool `arguments` must be an object".to_string())),
-                };
-                check_arguments(name, &args).map_err(|e| (INVALID_PARAMS, e))?;
-                Ok(call_tool(self.backend.as_mut(), name, &args).to_value())
-            }
+            "tools/list" => Ok(json!({"tools": all_definitions()})),
             "resources/list" => Ok(json!({"resources": [
                 {"uri": WORKBOOK_URI, "name": "workbook", "title": "Active workbook", "description": "Sheets, used ranges, tables, charts, names, selection and undo history of the active workbook (document.inspect)", "mimeType": "application/json"},
                 {"uri": COMMANDS_URI, "name": "commands", "title": "Commands", "description": "Every command: id, label, ribbon path, shortcut, params, enabled (engine.commands)", "mimeType": "application/json"},

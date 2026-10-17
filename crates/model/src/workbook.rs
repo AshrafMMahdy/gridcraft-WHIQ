@@ -83,6 +83,9 @@ pub struct DocProps {
     pub company: String,
     pub keywords: String,
     pub description: String,
+    /// WHIQ: who saved the workbook last (`cp:lastModifiedBy`): the MCP caller or `--author`.
+    #[serde(default)]
+    pub last_modified_by: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

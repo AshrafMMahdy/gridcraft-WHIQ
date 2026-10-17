@@ -48,8 +48,11 @@ const USAGE: &str = "usage:
   gridcraft-cli functions [--json] [--search X] [--category C]
   gridcraft-cli mcp [--connect PORT] [--in FILE | --sample NAME] [--author NAME]
                     [--automation-read-root DIR] [--automation-write-root DIR]
+                    [--call-timeout-ms N] [--max-memory-mb N] [--evict-idle-secs N]
+                    [--job-open-mb N] [--job-cells N] [--max-result-kb N] [--max-read-cells N]
                      --automation-*-root confine every file the headless server reads/writes;
-                     saves never replace an existing file silently (it becomes OLD_<name>)
+                     saves never replace an existing file silently (it becomes OLD_<name>);
+                     busy/jobs/auto-save: see WHIQ-CHANGES.md
   gridcraft-cli send <port> <method> [json]
   gridcraft-cli version";
 
@@ -499,16 +502,67 @@ fn functions(args: &[String]) -> Result<(), String> {
 /// `mcp` (headless, in-process engine) or `mcp --connect PORT|HOST:PORT` (drive a running app
 /// started with `gridcraft --control PORT`). JSON-RPC on stdin/stdout; logs on stderr.
 fn mcp(args: &[String]) -> Result<(), String> {
-    use gridcraft_mcp::{Backend, Headless, Remote, Server, control_addr};
-    let a = Args::parse(args, &["connect", "in", "sample", "automation-read-root", "automation-write-root", "author"], &[])?;
+    use gridcraft_mcp::{Backend, Headless, Remote, control_addr};
+    let a = Args::parse(
+        args,
+        &[
+            "connect",
+            "in",
+            "sample",
+            "automation-read-root",
+            "automation-write-root",
+            "author",
+            "call-timeout-ms",
+            "max-memory-mb",
+            "evict-idle-secs",
+            "job-open-mb",
+            "job-cells",
+            "max-result-kb",
+            "max-read-cells",
+        ],
+        &["no-signals"],
+    )?;
     a.no_extra(0)?;
+    let num = |name: &str| -> Result<Option<f64>, String> {
+        a.opt(name)
+            .map(|v| v.parse::<f64>().ok().filter(|n| n.is_finite() && *n >= 0.0).ok_or_else(|| format!("mcp: --{name} needs a number, not `{v}`")))
+            .transpose()
+    };
     // WHIQ: the folders the headless server may read and write.
     let roots = gridcraft_engine::file_access::AutomationRoots::new(
         a.opt("automation-read-root").map(std::path::Path::new),
         a.opt("automation-write-root").map(std::path::Path::new),
     )
     .map_err(|e| format!("mcp: {e}"))?;
-    let backend: Box<dyn Backend> = match a.opt("connect") {
+    let mut config = gridcraft_mcp::runtime::RuntimeConfig::default();
+    config.settings.author = a.opt("author").map(str::to_string);
+    if let Some(n) = num("call-timeout-ms")? {
+        config.call_timeout = std::time::Duration::from_millis(n.max(50.0) as u64);
+    }
+    if let Some(n) = num("max-memory-mb")? {
+        config.max_memory_bytes = Some((n * 1024.0 * 1024.0) as u64);
+    }
+    if let Some(n) = num("evict-idle-secs")? {
+        config.idle_evict = Some(std::time::Duration::from_secs_f64(n.max(0.05)));
+    }
+    if let Some(n) = num("job-open-mb")? {
+        config.job_open_bytes = (n * 1024.0 * 1024.0) as u64;
+    }
+    if let Some(n) = num("job-cells")? {
+        config.job_cells = n as u64;
+    }
+    if let Some(n) = num("max-result-kb")? {
+        config.settings.max_result_bytes = ((n * 1024.0) as usize).max(4096);
+    }
+    if let Some(n) = num("max-read-cells")? {
+        config.settings.max_read_cells = (n as u64).max(1);
+    }
+    config.handle_signals = !a.has("no-signals");
+    if let Some(r) = &roots {
+        config.read_root = r.read_root().map(Into::into);
+        config.write_root = r.write_root().map(Into::into);
+    }
+    let backend: Box<dyn Backend + Send> = match a.opt("connect") {
         Some(_) if roots.is_some() => {
             return Err(
                 "mcp: --automation-read-root and --automation-write-root confine the headless server; a running app is not confined by them".into()
@@ -534,7 +588,7 @@ fn mcp(args: &[String]) -> Result<(), String> {
             // Saves made by agents never replace a file silently: the previous one becomes OLD_<name>.
             gridcraft_engine::io::save_policy::keep_old_files(true);
             let mut session = match (a.opt("in"), a.opt("sample")) {
-                (Some(p), _) => gridcraft_engine::file_access::confine(roots.as_ref(), || open(p))?,
+                (Some(p), _) => open(p)?,
                 (None, Some(name)) => {
                     let mut s = Session::new();
                     exec(&mut s, "file.new", json!({"sample": name}))?;
@@ -548,10 +602,10 @@ fn mcp(args: &[String]) -> Result<(), String> {
             Box::new(Headless::with_session(session).with_automation_roots(roots))
         }
     };
-    eprintln!("gridcraft-cli: MCP server on stdio ({})", backend.describe());
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    Server::new(backend).serve(stdin.lock(), stdout.lock()).map_err(|e| e.to_string())
+    let describe = backend.describe();
+    eprintln!("gridcraft-cli: MCP server on stdio ({describe})");
+    let factory: gridcraft_mcp::runtime::BackendFactory = Box::new(move || backend as Box<dyn Backend>);
+    gridcraft_mcp::runtime::serve(factory, describe, config, std::io::BufReader::new(std::io::stdin()), std::io::stdout()).map_err(|e| e.to_string())
 }
 
 /// `send PORT METHOD [JSON]`: one control-channel request to a running app.

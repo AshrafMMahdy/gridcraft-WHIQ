@@ -15,7 +15,15 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!(noundo "file.close", "Close", ["File"], Some("Cmd+W"), "{force?: bool}", has_doc, close),
         cmd!(noundo "file.exportCsv", "Export as CSV", ["File", "Export"], None, "{path, sheet?}", has_doc, |s, p| export(s, p, "csv")),
         cmd!(noundo "file.exportHtml", "Save as Web Page", ["File", "Export"], None, "{path}", has_doc, |s, p| export(s, p, "html")),
-        cmd!("file.properties", "Properties", ["File"], None, "{title?, subject?, author?, company?, keywords?, description?}", has_doc, properties),
+        cmd!(
+            "file.properties",
+            "Properties",
+            ["File"],
+            None,
+            "{title?, subject?, author?, company?, keywords?, description?, lastModifiedBy?}",
+            has_doc,
+            properties
+        ),
         cmd!(
             query "file.options",
             "Options",
@@ -179,6 +187,7 @@ fn properties(s: &mut Session, p: &Json) -> Result<Json> {
             ("company", &mut pr.company),
             ("keywords", &mut pr.keywords),
             ("description", &mut pr.description),
+            ("lastModifiedBy", &mut pr.last_modified_by),
         ] {
             if let Some(v) = str_param(p, k) {
                 *slot = v.to_string();
