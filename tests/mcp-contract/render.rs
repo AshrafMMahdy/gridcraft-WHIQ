@@ -119,6 +119,11 @@ fn pdf_page_setup() {
         assert_eq!(t.matches("Item").count() as u64, pages, "the header row repeats on every page: {t}");
         assert!(t.contains(&format!("Page 1 of {pages}")));
     }
+    // A part of a long export.
+    let v = m.ok("export_pdf", json!({"path": "part.pdf", "pages": "2-2"}));
+    assert_eq!(v["pages"], 1, "{v}");
+    let e = m.err("export_pdf", json!({"pages": "99"}));
+    assert!(e["reason"].as_str().unwrap().contains(&format!("{pages} pages")), "{e}");
     // The page setup stays on the sheet.
     let p = m.ok("execute_command", json!({"command": "file.printPreview", "params": {}}));
     assert_eq!(p["pageList"][0]["orientation"], "landscape");

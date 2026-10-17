@@ -52,7 +52,8 @@ pipeline every `tools/call` goes through, `server_status`, `job_status`, error c
   `invalid_argument` (with an example of good arguments), `not_found` (with `closest`: files next
   to a missing path, command ids, sheet names, tool names), `outside_root` (with the roots and the
   path to use instead), `busy` (`retry_after_ms`, `job_id`), `evicted` (`recovered_path`),
-  `too_large`, `password_required`, `wrong_password`, `no_document`, `not_available`, `no_ui`,
+  `too_large`, `locked` (the file is open in another program; `retry_after_ms`), `disk_full`,
+  `password_required`, `wrong_password`, `no_document`, `not_available`, `no_ui`,
   `internal_error`, `failed`. Argument problems are tool results the model sees, not JSON-RPC
   errors; protocol errors (bad JSON, unknown tool) carry the same object as `error.data`.
 - **Nothing hangs.** One worker thread owns the document; the stdio loop reads requests on its own
@@ -140,8 +141,10 @@ pipeline every `tools/call` goes through, `server_status`, `job_status`, error c
 - **MCP tools:** `render_range` (a range; inline MCP `image` content when no `path`, ≤ 2 MB),
   `render_sheet` (the whole sheet scaled to `max_pixels`), `export_pdf` (`path`, `sheets`, `range`,
   `paper`, `orientation`, `fit_width`, `fit_to_page`, `repeat_header_rows`, `margins`,
-  `gridlines`, `headings`, `header`, `footer`, `fonts`), which applies the page setup to the
-  sheet(s) and exports with embedded subset fonts. `file.exportPdf` takes `fonts`.
+  `gridlines`, `headings`, `header`, `footer`, `fonts`, `pages: "2-5"`), which applies the page
+  setup to the sheet(s) and exports with embedded subset fonts. `file.exportPdf` takes `fonts` and
+  `pages` (a part of a long export, numbered as in the whole; an out-of-range part says how many
+  pages there are).
 - Tests: engine `png_renders_refuse_hostile_sizes`, raster unit tests, contract
   `render::arabic_png_render` (Arabic right-aligned in A1, numbers right, inline image block,
   fitted sheet, RTL sheet with A on the right) and `render::pdf_page_setup` (A4 landscape,
@@ -167,6 +170,13 @@ pipeline every `tools/call` goes through, `server_status`, `job_status`, error c
 - **`formulas.recalculate`** (MCP `recalculate`; CLI `gridcraft-cli recalculate book.xlsx [--out]
   [--json]`): a full recalculation, with the count of formulas and the cells that evaluate to errors.
   `gridcraft-cli check` stays as the oracle (cached values vs recalculation, round-trip fidelity).
+- **The platform's chart specs** (`shared/exports/chartXml.ts`: `kind: col|line|scatter|combo`,
+  `series[].valRange / catRange / xRange / color`, combo `lineSeries` on the same axes,
+  `hideLegend`, `xTitle` / `yTitle`, a cell-box `anchor {fromCol, fromRow, toCol, toRow}`, top-level
+  `charts` naming their `sheet`) are accepted as they are, so moving the platform to
+  `build_workbook` loses nothing its injector made; pie, doughnut, area, bar and a secondary axis
+  come on top. Columns given no width are auto-fitted (`autofit: false` turns it off), so numbers
+  never show as `####`.
 - CLI `gridcraft-cli render book.xlsx out.png [--range] [--sheet] [--scale]`.
 - Tests: engine `build::tests::*` (sheets, formats, table, five chart kinds incl. combo with a
   secondary axis, cached values after save, clean failure), contract
@@ -195,3 +205,41 @@ pipeline every `tools/call` goes through, `server_status`, `job_status`, error c
   `OLD_customer.xlsx`, every part survives (custom parts byte for byte), the edits are there,
   `lastModifiedBy` is the caller and `gridcraft-cli check` passes. Engine
   `build::tests::table_slicers_round_trip_through_xlsx`.
+
+## Tests
+
+- `cargo test` runs everything; the WHIQ-specific suites:
+  - `cargo test -p gridcraft-cli --test mcp_contract` — **the MCP contract suite**
+    (`tests/mcp-contract/`, registered as a test of `gridcraft-cli` so it drives that binary over
+    stdio). `contract.rs` proves sections 1–8 of the shared contract (error shape, busy, jobs,
+    large-open job, oversized results and byte budget, idle and memory eviction with recovery,
+    SIGTERM auto-save named by the next process, panic, hang-up, OLD_ rename, confinement with
+    symlink escapes, annotations, forgiving inputs, caller identity); `render.rs` the Arabic PNG and
+    PDF checks and page setup; `authoring.rs` build_workbook, recalculate and in-place edits. Set
+    `GRIDCRAFT_CLI=target/release/gridcraft-cli` to test a release build. The tests that read PDF
+    text use poppler's `pdftotext` when it is installed (and are skipped otherwise).
+  - unit tests in `gridcraft-text`, `gridcraft-raster`, `gridcraft-pdf`, `gridcraft-mcp`
+    (`contract.rs`, `runtime.rs`, `tests.rs`), engine (`file_access`, `io`, `print`, `build`).
+- **Smoke test**: `cargo build --release -p gridcraft-cli && tests/mcp-contract/smoke.sh`
+  (or `tests/mcp-contract/smoke.sh path/to/gridcraft-cli`): one JSON-RPC request at a time, the
+  way the platform's client talks — initialize, tools/list, server_status, build_workbook (Arabic
+  RTL sheet, table, chart, formulas), read_range, render_sheet, export_pdf with page setup, a save
+  over an existing file (OLD_), a refused path outside the root, forgiving names, recalculate —
+  and checks the files, the embedded Arabic font (`pdffonts`) and the extracted text
+  (`pdftotext`). It prints the folder with every output and exits non-zero on a failure.
+
+## Not done / known limits
+
+- **PivotTable slicers** (Excel `x14` slicer caches over a PivotCache) are not modelled: opening a
+  file with one warns, and saving drops it. Table slicers round-trip.
+- Bundled fonts are Noto Sans and Noto Sans Arabic only: in PNG renders and in `fonts: embedded`
+  PDFs every Latin family (Calibri, Times, Courier…) is drawn in Noto Sans, italics are slanted
+  synthetically; CJK, Hebrew-specific, Devanagari… glyphs have no face (the PDF's `Auto` mode keeps
+  the standard fonts for plain Latin text). System fonts are not looked up.
+- Rotated text on right-to-left sheets is placed approximately (the box is mirrored, not the
+  glyph run).
+- Memory is measured on Linux (`/proc/self/statm`); elsewhere `server_status` gives an estimate
+  from the cell count and `--max-memory-mb` has nothing to compare with.
+- A job can't be cancelled; a call that never ends keeps the worker busy (the server keeps
+  answering `busy`, `server_status` and `job_status`, and SIGTERM still auto-saves).
+- Upstream's docs (`docs/*.md`, ROADMAP) are not edited by the fork; this file is the record.

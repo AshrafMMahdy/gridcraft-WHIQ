@@ -23,7 +23,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Export as PDF",
             ["File", "Export"],
             None,
-            "{path?, sheets?: active|all, range?: \"A1:F40\" (active sheet), fitToPage?: bool, fonts?: auto|embedded|standard (auto: embedded subset fonts for Arabic and other non-Latin text)} → {pages, bytes, path} or {pages, bytes, base64} when no path. Honours each sheet's Page Setup.",
+            "{path?, sheets?: active|all, range?: \"A1:F40\" (active sheet), fitToPage?: bool, fonts?: auto|embedded|standard (auto: embedded subset fonts for Arabic and other non-Latin text), pages?: \"2-5\"} → {pages, bytes, path} or {pages, bytes, base64} when no path. Honours each sheet's Page Setup.",
             has_doc,
             export_pdf
         ),
@@ -1723,13 +1723,21 @@ fn paint_page_cells<'a>(
 
 /// Renders laid-out sheets to a PDF.
 pub fn render_pdf(wb: &Workbook, layouts: &[SheetLayout], file: &str, path: &str) -> (Vec<u8>, usize) {
-    render_pdf_with(wb, layouts, file, path, gridcraft_pdf::TextMode::Auto)
+    render_pdf_with(wb, layouts, file, path, gridcraft_pdf::TextMode::Auto, None)
 }
 
 /// WHIQ: [`render_pdf`] with a text mode: `Auto` (standard fonts for plain text, embedded
 /// shaped subsets for Arabic and anything else), `Embedded` (every string embedded) or
 /// `Standard` (upstream).
-pub fn render_pdf_with(wb: &Workbook, layouts: &[SheetLayout], file: &str, path: &str, mode: gridcraft_pdf::TextMode) -> (Vec<u8>, usize) {
+/// `pages` keeps only pages first..=last (1-based, numbered as in the whole export).
+pub fn render_pdf_with(
+    wb: &Workbook,
+    layouts: &[SheetLayout],
+    file: &str,
+    path: &str,
+    mode: gridcraft_pdf::TextMode,
+    pages: Option<(usize, usize)>,
+) -> (Vec<u8>, usize) {
     let mut doc = PdfDoc::new();
     doc.text_mode = mode;
     doc.info.title = if wb.props.title.is_empty() { file.to_string() } else { wb.props.title.clone() };
@@ -1744,6 +1752,9 @@ pub fn render_pdf_with(wb: &Workbook, layouts: &[SheetLayout], file: &str, path:
         let (aw, ah) = lay.avail();
         for (pi, (ri, ci)) in lay.pages.iter().enumerate() {
             page_no += 1;
+            if pages.is_some_and(|(a, b)| page_no < a || page_no > b) {
+                continue;
+            }
             let (Some(rband), Some(cband)) = (lay.row_bands.get(*ri).copied(), lay.col_bands.get(*ci).copied()) else { continue };
             let rsegs = segments(lay.title_rows, rband);
             let csegs = segments(lay.title_cols, cband);
@@ -1791,8 +1802,33 @@ fn build_pdf(s: &Session, p: &Json, cmd: &str) -> Result<(Vec<u8>, usize)> {
     };
     let d = s.doc()?;
     let lays = layouts(&d.wb, &opts);
+    let total: usize = lays.iter().map(|l| l.pages.len()).sum();
+    // `pages`: "3", "2-5", [2, 5] — a part of a long export.
+    let pages = match p.get("pages") {
+        None | Some(Json::Null) => None,
+        Some(Json::Number(n)) => n.as_u64().map(|n| (n as usize, n as usize)),
+        Some(Json::String(t)) => {
+            let t = t.trim();
+            let (a, b) = t.split_once(['-', ':', '–']).unwrap_or((t, t));
+            match (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
+                (Ok(a), Ok(b)) => Some((a.min(b), a.max(b))),
+                _ => return Err(bad(cmd, format!("`pages` must look like \"3\" or \"2-5\", not `{t}`"))),
+            }
+        }
+        Some(Json::Array(v)) => match (v.first().and_then(Json::as_u64), v.get(1).and_then(Json::as_u64)) {
+            (Some(a), Some(b)) => Some((a.min(b) as usize, a.max(b) as usize)),
+            (Some(a), None) => Some((a as usize, a as usize)),
+            _ => return Err(bad(cmd, "`pages` must be [first, last]")),
+        },
+        Some(_) => return Err(bad(cmd, "`pages` must be \"2-5\" or [2, 5]")),
+    };
+    if let Some((a, _)) = pages
+        && (a == 0 || a > total)
+    {
+        return Err(bad(cmd, format!("the export has {total} pages: ask for pages 1-{total}")));
+    }
     let path = d.path.clone().unwrap_or_default();
-    Ok(render_pdf_with(&d.wb, &lays, &d.display_title(), &path, mode))
+    Ok(render_pdf_with(&d.wb, &lays, &d.display_title(), &path, mode, pages))
 }
 
 // ---------------------------------------------------------------- PNG renders (WHIQ)

@@ -21,7 +21,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Build Workbook",
             [],
             None,
-            "{sheets: [{name, header?: [..], rows: [[..]], start?: \"A1\", columns?: [{header?, width?, format?}], number_formats?: {\"B\": \"#,##0\", \"C2:D9\": \"0%\"}, column_widths?: {\"A\": 30} | [30, 12], freeze_header?: bool, autofilter?: bool, table?: bool | \"TableStyleMedium2\" | {name?, style?}, header_style?: {bold?, fill?, font_color?}, merges?: [\"A1:D1\"], rtl?: bool, charts?: [{type: bar|column|line|pie|doughnut|area|scatter|combo, title?, data?: \"A1:C9\", series?: [{name?, values, categories?, type?, secondary?, color?}], x_title?, y_title?, legend?, data_labels?, stacked?, at?, width?, height?}], conditional_formats?: [{range, rule}], validations?: [{range, type, …}]}], title?, author?, company?, path?} → {sheets, charts, path?}",
+            "{sheets: [{name, header?: [..], rows: [[..]], start?: \"A1\", columns?: [{header?, width?, format?}], number_formats?: {\"B\": \"#,##0\", \"C2:D9\": \"0%\"}, column_widths?: {\"A\": 30} | [30, 12] | \"auto\", autofit?: bool (default true: columns without a width fit their contents), freeze_header?: bool, autofilter?: bool, table?: bool | \"TableStyleMedium2\" | {name?, style?}, header_style?: {bold?, fill?, font_color?}, merges?: [\"A1:D1\"], rtl?: bool, charts?: [{type: bar|column|line|pie|doughnut|area|scatter|combo, title?, data?: \"A1:C9\", series?: [{name?, values, categories?, type?, secondary?, color?}], x_title?, y_title?, legend?, data_labels?, stacked?, at?, width?, height?}], conditional_formats?: [{range, rule}], validations?: [{range, type, …}]}], title?, author?, company?, path?} → {sheets, charts, path?}",
             always,
             build
         ),
@@ -120,6 +120,16 @@ fn fill(s: &mut Session, p: &Json, sheets: &[Json], names: &[String]) -> Result<
         }
         run(s, &format!("sheet {name}"), "sheet.activate", json!({"sheet": name}))?;
         out_sheets.push(fill_sheet(s, spec, name, &mut charts)?);
+    }
+    // Charts listed at the top level name their sheet (the platform's chart specs).
+    for (k, c) in p.get("charts").and_then(Json::as_array).into_iter().flatten().enumerate() {
+        let sheet = str_param(c, "sheet").map(str::to_string).or_else(|| names.first().cloned()).unwrap_or_default();
+        let Some(i) = names.iter().position(|n| n.eq_ignore_ascii_case(&sheet)) else {
+            return Err(bad(CMD, format!("chart {}: there is no sheet `{sheet}` (sheets: {})", k + 1, names.join(", "))));
+        };
+        let name = names.get(i).cloned().unwrap_or_default();
+        add_chart(s, c, &name, None, false).map_err(|e| fail(&format!("chart {}", k + 1), e))?;
+        charts += 1;
     }
     run(s, "activate the first sheet", "sheet.activate", json!({"sheet": 0}))?;
     let mut props = Map::new();
@@ -248,6 +258,35 @@ fn fill_sheet(s: &mut Session, spec: &Json, name: &str, charts: &mut usize) -> R
         }
         _ => {}
     }
+    // Columns given no width fit their contents (numbers never show as ####), unless
+    // `autofit: false`.
+    if spec.get("autofit").and_then(Json::as_bool) != Some(false)
+        && let Some(b) = block
+    {
+        let explicit = |col: u32| -> bool {
+            let i = (col - start.col) as usize;
+            let letter = col_to_letters(col);
+            columns.get(i).is_some_and(|c| c.get("width").is_some())
+                || match spec.get("column_widths") {
+                    Some(Json::Object(m)) => m.keys().any(|k| {
+                        let (a, z) = k.split_once(':').unwrap_or((k, k));
+                        match (gridcraft_core::letters_to_col(a.trim()), gridcraft_core::letters_to_col(z.trim())) {
+                            (Some(a), Some(z)) => (a.min(z)..=a.max(z)).contains(&col),
+                            _ => k.eq_ignore_ascii_case(&letter),
+                        }
+                    }),
+                    Some(Json::Array(l)) => l.get(i).is_some_and(|w| w.is_number()),
+                    Some(Json::String(_)) => true,
+                    _ => false,
+                }
+        };
+        for col in b.start.col..=b.end.col {
+            if !explicit(col) {
+                let l = col_to_letters(col);
+                run(s, &step(&format!("autofit column {l}")), "home.autofitColumnWidth", json!({"cols": format!("{l}:{l}")}))?;
+            }
+        }
+    }
     for m in spec.get("merges").and_then(Json::as_array).into_iter().flatten().filter_map(Json::as_str) {
         run(s, &step(&format!("merge {m}")), "home.mergeCells", json!({"range": format!("{q}{m}")}))?;
     }
@@ -335,7 +374,74 @@ fn abs_ref(r: &str, sheet: &str) -> Result<String> {
     Ok(format!("{}{body}", q(&sh)))
 }
 
+/// The platform's chart spec (`kind: col|line|scatter|combo`, `valRange` / `catRange` / `xRange`,
+/// `lineSeries`, `hideLegend`, a cell-box `anchor`) read as this module's.
+fn platform_chart(s: &Session, c: &Json, sheet: &str) -> Json {
+    let mut c = c.clone();
+    if c.get("type").is_none()
+        && let Some(k) = c.get("kind").cloned()
+    {
+        c["type"] = match k.as_str() {
+            Some("col") => json!("column"),
+            _ => k,
+        };
+    }
+    let conv = |sp: &Json, line: bool| -> Json {
+        let mut o = sp.clone();
+        if o.get("values").is_none()
+            && let Some(v) = sp.get("valRange")
+        {
+            o["values"] = v.clone();
+        }
+        if o.get("categories").is_none()
+            && let Some(v) = sp.get("xRange").or(sp.get("catRange"))
+        {
+            o["categories"] = v.clone();
+        }
+        if line && o.get("type").is_none() {
+            o["type"] = json!("line");
+        }
+        o
+    };
+    if let Some(list) = c.get("series").and_then(Json::as_array).cloned() {
+        let mut all: Vec<Json> = list.iter().map(|x| conv(x, false)).collect();
+        if let Some(lines) = c.get("lineSeries").and_then(Json::as_array) {
+            if c["type"] == "combo" {
+                for x in all.iter_mut() {
+                    if x.get("type").is_none() {
+                        x["type"] = json!("column");
+                    }
+                }
+            }
+            all.extend(lines.iter().map(|x| conv(x, true)));
+        }
+        c["series"] = Json::Array(all);
+    }
+    if c.get("legend").is_none() && c.get("hideLegend").and_then(Json::as_bool) == Some(true) {
+        c["legend"] = json!("none");
+    }
+    // anchor {fromCol, fromRow, toCol, toRow} (0-based cells) → at + size.
+    if let Some(a) = c.get("anchor").filter(|a| a.is_object()).cloned() {
+        let num = |k: &str| a.get(k).and_then(Json::as_u64).map(|v| v.min(u64::from(gridcraft_core::MAX_COLS.max(gridcraft_core::MAX_ROWS))) as u32);
+        if let (Some(fc), Some(fr)) = (num("fromCol"), num("fromRow")) {
+            c["at"] = json!(CellRef::new(fr.min(gridcraft_core::MAX_ROWS - 1), fc.min(gridcraft_core::MAX_COLS - 1)).a1());
+            if let (Some(tc), Some(tr), Some(sh)) =
+                (num("toCol"), num("toRow"), s.doc().ok().and_then(|d| d.wb.sheet_index(sheet).and_then(|i| d.wb.sheet(i).cloned())))
+            {
+                let w = sh.col_left(tc.min(gridcraft_core::MAX_COLS - 1)) - sh.col_left(fc.min(gridcraft_core::MAX_COLS - 1));
+                let h = sh.row_top(tr.min(gridcraft_core::MAX_ROWS - 1)) - sh.row_top(fr.min(gridcraft_core::MAX_ROWS - 1));
+                if w > 20.0 && h > 20.0 {
+                    c["width"] = json!(w);
+                    c["height"] = json!(h);
+                }
+            }
+        }
+    }
+    c
+}
+
 fn add_chart(s: &mut Session, c: &Json, sheet: &str, block: Option<RangeRef>, has_header: bool) -> Result<()> {
+    let c = &platform_chart(s, c, sheet);
     let t = str_param(c, "type").unwrap_or("column");
     let stacked = bool_param(c, "stacked").unwrap_or(false);
     let kind = chart_type(t, stacked)
@@ -448,7 +554,12 @@ fn add_chart(s: &mut Session, c: &Json, sheet: &str, block: Option<RangeRef>, ha
 
 /// `formulas.recalculate`: everything recomputed, the errors listed.
 fn recalculate(s: &mut Session, _: &Json) -> Result<Json> {
+    let was_clean = !s.doc()?.is_dirty();
     let r = s.execute("formulas.calculateNow", json!({}))?;
+    // Recomputing changes no input: a saved workbook stays saved.
+    if was_clean && let Ok(d) = s.doc_mut() {
+        d.saved = d.wb.clone();
+    }
     let d = s.doc()?;
     let mut formulas = 0u64;
     let mut errors = Vec::new();
@@ -541,6 +652,50 @@ mod tests {
         assert!(s.execute("file.build", json!({"sheets": [{"name": "A", "rows": [1, 2]}]})).is_err());
     }
 
+    /// The platform's chart specs (`kind`, `valRange`, `lineSeries`, cell-box anchors) build the
+    /// same native charts its injector made.
+    #[test]
+    fn platform_chart_specs_are_understood() {
+        let mut s = s();
+        s.execute(
+            "file.build",
+            json!({
+                "sheets": [{"name": "Cash Flow", "header": ["Month", "In", "Cum"], "rows": [["Jan", 5, 5], ["Feb", 7, "=C2+B3"], ["Mar", 4, "=C3+B4"]]}],
+                "charts": [
+                    {"sheet": "Cash Flow", "kind": "combo", "title": "S-curve", "xTitle": "Month", "yTitle": "SAR",
+                     "anchor": {"fromCol": 5, "fromRow": 1, "toCol": 12, "toRow": 18},
+                     "series": [{"name": "Monthly", "catRange": "$A$2:$A$4", "catText": true, "valRange": "$B$2:$B$4", "color": "3B82F6"}],
+                     "lineSeries": [{"name": "Cumulative", "catRange": "$A$2:$A$4", "valRange": "$C$2:$C$4", "color": "E11D48"}],
+                     "hideLegend": true},
+                    {"sheet": "Cash Flow", "kind": "scatter", "title": "XY", "anchor": {"fromCol": 5, "fromRow": 20, "toCol": 12, "toRow": 36},
+                     "series": [{"name": "Pts", "xRange": "$B$2:$B$4", "valRange": "$C$2:$C$4"}]},
+                    {"sheet": "Cash Flow", "kind": "col", "title": "Bars", "series": [{"name": "In", "catRange": "$A$2:$A$4", "valRange": "$B$2:$B$4"}]}
+                ]
+            }),
+        )
+        .unwrap();
+        let d = s.doc().unwrap();
+        let sh = d.wb.sheet(0).unwrap();
+        assert_eq!(sh.charts.len(), 3);
+        let combo = &sh.charts[0];
+        assert_eq!(combo.kind, ChartKind::Combo);
+        assert_eq!(combo.series.len(), 2);
+        assert_eq!(combo.series[0].kind, Some(ChartKind::ColumnClustered));
+        assert_eq!(combo.series[1].kind, Some(ChartKind::Line));
+        assert!(!combo.series[1].secondary, "the platform's combo shares one value axis");
+        assert_eq!(combo.series[0].values, "'Cash Flow'!$B$2:$B$4");
+        assert_eq!(combo.series[0].categories.as_deref(), Some("'Cash Flow'!$A$2:$A$4"));
+        assert_eq!(combo.series[0].color, gridcraft_model::Color::from_hex("3B82F6"));
+        assert_eq!(combo.legend, LegendPos::None);
+        assert_eq!(combo.anchor.cell, CellRef::new(1, 5));
+        assert!(combo.anchor.width > 300.0, "{:?}", combo.anchor);
+        assert_eq!(combo.x_title.as_deref(), Some("Month"));
+        assert_eq!(sh.charts[1].kind, ChartKind::Scatter);
+        assert_eq!(sh.charts[1].series[0].categories.as_deref(), Some("'Cash Flow'!$B$2:$B$4"), "scatter X values");
+        assert_eq!(sh.charts[2].kind, ChartKind::ColumnClustered);
+        assert!(s.execute("file.build", json!({"sheets": [{"name": "A"}], "charts": [{"sheet": "B", "kind": "col", "series": []}]})).is_err());
+    }
+
     /// WHIQ: table slicers are written (slicer, cache, frame, name) and read back.
     #[test]
     fn table_slicers_round_trip_through_xlsx() {
@@ -584,6 +739,9 @@ mod tests {
         s.execute("cell.set", json!({"cell": "A2", "input": "=2+2"})).unwrap();
         let r = s.execute("formulas.recalculate", json!({})).unwrap();
         assert_eq!(r["formulas"], 2);
+        s.doc_mut().unwrap().saved = s.doc().unwrap().wb.clone();
+        s.execute("formulas.recalculate", json!({})).unwrap();
+        assert!(!s.doc().unwrap().is_dirty(), "recalculating a saved workbook leaves it saved");
         assert_eq!(r["errorCount"], 1);
         assert_eq!(r["errors"][0]["error"], "#DIV/0!");
     }

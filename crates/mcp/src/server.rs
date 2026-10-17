@@ -29,7 +29,12 @@ execute_command. Convenience tools cover the common flow: write_range / set_cell
 starting with = are formulas), read_range / get_cell to read computed values back, format_range, create_table, \
 insert_chart, sort_range, filter, evaluate_formula (try a formula without changing the sheet), undo / redo, \
 open_workbook / save_workbook. inspect_workbook summarizes sheets, used ranges, tables, charts and names. \
-list_functions lists the worksheet functions.";
+list_functions lists the worksheet functions. WHIQ: build_workbook makes a whole workbook (sheets, formats, tables, native \
+charts) from JSON; render_range / render_sheet give PNG pictures and export_pdf a PDF with page setup (Arabic shaped, \
+fonts embedded); recalculate recomputes every formula; insert_rows, delete_columns, rename_sheet, conditional_format, \
+data_validation edit in place. Every failure says what to do next (`next_step`); `busy` means retry after \
+`retry_after_ms`; long calls answer with a `job_id` to poll with job_status; server_status always answers. Saves never \
+replace an existing file silently (it becomes OLD_<name>; pass overwrite: true to replace it).";
 
 /// Resource URIs.
 pub const WORKBOOK_URI: &str = "gridcraft://workbook";

@@ -214,6 +214,7 @@ fn more_definitions() -> Vec<Value> {
                     "header": string("Page header, e.g. \"&CQuarterly report\""),
                     "footer": string("Page footer, e.g. \"&CPage &P of &N\""),
                     "fonts": enumeration("embedded (default): every font embedded as a subset; auto: only non-Latin text; standard: PDF base fonts", &["embedded", "auto", "standard"]),
+                    "pages": string("Only these pages of the export, e.g. \"3\" or \"2-5\" (numbered as in the whole export)"),
                 }),
                 &[],
             ),
@@ -242,6 +243,7 @@ fn editing_definitions() -> Vec<Value> {
             obj(
                 json!({
                     "sheets": {"type": "array", "description": "Sheets: {name, header?, rows, start?, columns?: [{header?, width?, format?}], number_formats?, column_widths?, freeze_header?, autofilter?, table?, header_style?, merges?, rtl?, charts?, conditional_formats?, validations?}", "items": {"type": "object"}},
+                    "charts": {"type": "array", "description": "Charts naming their sheet: {sheet, type|kind: bar|column|col|line|pie|doughnut|area|scatter|combo, title?, x_title|xTitle?, y_title|yTitle?, series: [{name, values|valRange, categories|catRange|xRange, type?, secondary?, color?}], lineSeries? (combo lines), data?: \"A1:C9\", at?: \"H2\" | anchor?: {fromCol, fromRow, toCol, toRow}, legend?, hideLegend?, data_labels?, stacked?, width?, height?} (also accepted per sheet)", "items": {"type": "object"}},
                     "path": string("Save the workbook here (inside the write root); without it the workbook stays open unsaved"),
                     "title": string("Document title"),
                     "author": string("Document author (default: the caller)"),
@@ -500,7 +502,7 @@ fn export_pdf(b: &mut dyn Backend, a: &Args) -> Result<Value, String> {
             exec(b, "pageLayout.pageSetup", Value::Object(p))?;
         }
     }
-    let mut p = pick(a, &["path", "sheets", "range", "fit_to_page"]);
+    let mut p = pick(a, &["path", "sheets", "range", "fit_to_page", "pages"]);
     if let Some(o) = p.as_object_mut()
         && let Some(f) = o.remove("fit_to_page")
     {
@@ -603,8 +605,10 @@ pub fn run_tool(b: &mut dyn Backend, st: &mut CallState, name: &str, args: &Valu
     let caller = raw.get("caller").and_then(Value::as_str).map(str::to_string).or_else(|| st.settings.author.clone());
     let overwrite = raw.get("overwrite").is_some_and(|v| v.as_bool() == Some(true) || v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("true")));
     let previous_user = caller.as_deref().and_then(|c| b.set_user(c));
+    // Saves carry who saved; exports and renders change nothing in the workbook.
     if let Some(c) = &caller
-        && WRITES_FILES.contains(&name)
+        && (name == "save_workbook"
+            || (name == "execute_command" && matches!(a.get("command").and_then(Value::as_str), Some("file.save" | "file.saveAs"))))
     {
         b.stamp_author(c);
     }
@@ -934,6 +938,28 @@ pub fn classify(b: &mut dyn Backend, tool: &str, a: &Args, msg: &str) -> ToolErr
             },
         )
         .with("closest", json!(near));
+    }
+    if m.contains("os error 32")
+        || m.contains("os error 33")
+        || m.contains("being used by another process")
+        || m.contains("os error 5)")
+        || m.contains("permission denied")
+        || m.contains("access is denied")
+    {
+        let name = Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "the file".into());
+        return ToolError::new(
+            "locked",
+            msg,
+            format!("{name} is open in another program or read-only: close it there and retry, or save under another name"),
+        )
+        .with("retry_after_ms", json!(5000));
+    }
+    if m.contains("no space left") || m.contains("os error 28") || m.contains("os error 112") || m.contains("disk full") {
+        return ToolError::new(
+            "disk_full",
+            msg,
+            "free space on the disk (or save to another drive inside the write root) and save again; the workbook is still open",
+        );
     }
     if m.contains("no workbook open") {
         return ToolError::new("no_document", msg, "call new_workbook, open_workbook or build_workbook first");
