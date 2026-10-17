@@ -55,13 +55,40 @@ fn obj(props: Value, required: &[&str]) -> Value {
     }
     o
 }
-fn tool(name: &str, title: &str, desc: &str, schema: Value, read_only: bool) -> Value {
+/// WHIQ: what a tool does to its environment, for the MCP annotations. `readOnlyHint` only on
+/// reads, `destructiveHint` on tools that delete or overwrite (cells, files), `idempotentHint`
+/// where calling twice with the same arguments changes nothing more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Hints {
+    pub read_only: bool,
+    pub destructive: bool,
+    pub idempotent: bool,
+}
+
+/// Reads the workbook or the catalogue; changes nothing.
+pub(crate) const READ: Hints = Hints { read_only: true, destructive: false, idempotent: true };
+/// Adds to the workbook (a chart, a table, a sheet) without destroying anything.
+pub(crate) const ADD: Hints = Hints { read_only: false, destructive: false, idempotent: false };
+/// Changes state in a way that repeating changes nothing more (formats, selection, filters).
+pub(crate) const SET: Hints = Hints { read_only: false, destructive: false, idempotent: true };
+/// Overwrites or deletes (cell contents, rows, files), the same result when repeated.
+pub(crate) const OVERWRITE: Hints = Hints { read_only: false, destructive: true, idempotent: true };
+/// May delete or overwrite anything (`execute_command`).
+pub(crate) const ANY: Hints = Hints { read_only: false, destructive: true, idempotent: false };
+
+fn tool(name: &str, title: &str, desc: &str, schema: Value, hints: Hints) -> Value {
     json!({
         "name": name,
         "title": title,
         "description": desc,
         "inputSchema": schema,
-        "annotations": {"title": title, "readOnlyHint": read_only, "destructiveHint": false, "openWorldHint": false},
+        "annotations": {
+            "title": title,
+            "readOnlyHint": hints.read_only,
+            "destructiveHint": hints.destructive,
+            "idempotentHint": hints.idempotent,
+            "openWorldHint": false,
+        },
     })
 }
 
@@ -123,7 +150,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 json!({"command": string("Command id, e.g. \"cell.set\", \"home.fillColor\", \"insert.chart\""), "params": params_schema()}),
                 &["command"],
             ),
-            false,
+            ANY,
         ),
         tool(
             "list_commands",
@@ -131,7 +158,7 @@ pub fn tool_definitions() -> Vec<Value> {
             "List GridCraft commands: id, label, ribbon path, shortcut, a parameter description (`params`) and whether it can run \
              right now. Use it to discover what execute_command can do (e.g. search \"sort\", \"border\", \"chart\", \"sheet\").",
             obj(json!({"search": string("Case-insensitive substring matched against id, label and ribbon path")}), &[]),
-            true,
+            READ,
         ),
         // ----- workbook -----
         tool(
@@ -140,7 +167,7 @@ pub fn tool_definitions() -> Vec<Value> {
             "Summary of the active workbook: title, path, dirty flag, sheets (name, used range, cell count, tables, charts, merges, \
              filters, freeze panes), defined names, current selection and active cell, calculation mode and undo/redo history.",
             empty(),
-            true,
+            READ,
         ),
         tool(
             "read_range",
@@ -157,7 +184,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 }),
                 &[],
             ),
-            true,
+            READ,
         ),
         tool(
             "write_range",
@@ -172,7 +199,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 }),
                 &["range", "values"],
             ),
-            false,
+            OVERWRITE,
         ),
         tool(
             "set_cell",
@@ -183,14 +210,14 @@ pub fn tool_definitions() -> Vec<Value> {
                 json!({"cell": string("Cell, e.g. \"B7\" or \"Sheet2!C3\""), "input": {"type": ["string", "number", "boolean"], "description": "Typed input: number, text or =formula"}}),
                 &["cell", "input"],
             ),
-            false,
+            OVERWRITE,
         ),
         tool(
             "get_cell",
             "Get cell",
             "Details of one cell: computed value and type, formula, display text, raw input, spill range, style, merge, comment and hyperlink.",
             obj(json!({"cell": string("Cell, e.g. \"B7\" or \"Sheet2!C3\"")}), &["cell"]),
-            true,
+            READ,
         ),
         tool(
             "evaluate_formula",
@@ -201,7 +228,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 json!({"formula": string("Formula text, with or without the leading ="), "cell": string("Evaluate as if in this cell (default: active cell)")}),
                 &["formula"],
             ),
-            true,
+            READ,
         ),
         tool(
             "select",
@@ -212,7 +239,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 json!({"range": string(RANGE), "active": string("Active cell inside the selection (default: top-left of the last area)")}),
                 &["range"],
             ),
-            false,
+            SET,
         ),
         tool(
             "format_range",
@@ -249,7 +276,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 }),
                 &["range"],
             ),
-            false,
+            SET,
         ),
         tool(
             "insert_chart",
@@ -265,7 +292,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 }),
                 &["range", "type"],
             ),
-            false,
+            ADD,
         ),
         tool(
             "create_table",
@@ -280,7 +307,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 }),
                 &["range"],
             ),
-            false,
+            ADD,
         ),
         tool(
             "sort_range",
@@ -303,7 +330,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 }),
                 &["keys"],
             ),
-            false,
+            SET,
         ),
         tool(
             "filter",
@@ -323,7 +350,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 }),
                 &["column"],
             ),
-            false,
+            SET,
         ),
         // ----- files -----
         tool(
@@ -331,7 +358,7 @@ pub fn tool_definitions() -> Vec<Value> {
             "Open workbook",
             "Open a workbook file (.xlsx, .xlsm, .xls, .xlsb, .ods, .csv, .tsv, .txt, .json) and make it active. Excel 97-2003 .xls imports values, formulas and number formats; XLSB and ODS import worksheet data and cached formula values only; check the returned warnings.",
             obj(json!({"path": string("File path")}), &["path"]),
-            false,
+            SET,
         ),
         tool(
             "save_workbook",
@@ -339,29 +366,23 @@ pub fn tool_definitions() -> Vec<Value> {
             "Save the active workbook. The format follows the extension (.xlsx default; .csv/.tsv save the active sheet; .json; .html). \
              Without `path` saves to the workbook's current file.",
             obj(json!({"path": string("Destination path")}), &[]),
-            false,
+            OVERWRITE,
         ),
         tool(
             "new_workbook",
             "New workbook",
             "Create a new workbook and make it active: blank, or a built-in sample (\"budget\", \"sales\", \"grades\").",
             obj(json!({"sample": enumeration("Sample workbook", &["budget", "sales", "grades"])}), &[]),
-            false,
+            ADD,
         ),
-        tool(
-            "undo",
-            "Undo",
-            "Undo the last change(s) to the active workbook.",
-            obj(json!({"steps": int("Number of steps (default 1)")}), &[]),
-            false,
-        ),
-        tool("redo", "Redo", "Redo the last undone change(s).", obj(json!({"steps": int("Number of steps (default 1)")}), &[]), false),
+        tool("undo", "Undo", "Undo the last change(s) to the active workbook.", obj(json!({"steps": int("Number of steps (default 1)")}), &[]), ADD),
+        tool("redo", "Redo", "Redo the last undone change(s).", obj(json!({"steps": int("Number of steps (default 1)")}), &[]), ADD),
         tool(
             "screenshot",
             "Screenshot",
             "Save a PNG screenshot of the GridCraft window to `path`. Desktop app only (`gridcraft-cli mcp --connect 7979`).",
             obj(json!({"path": string("Output PNG path")}), &["path"]),
-            true,
+            OVERWRITE,
         ),
         tool(
             "list_functions",
@@ -371,7 +392,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 json!({"search": string("Substring of the name or description"), "category": string("Category, e.g. \"Math & Trig\", \"Lookup & Reference\"")}),
                 &[],
             ),
-            true,
+            READ,
         ),
     ]
 }

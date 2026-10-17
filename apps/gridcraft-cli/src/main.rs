@@ -9,7 +9,8 @@
 //! gridcraft-cli run [--in FILE | --sample NAME] [--cmd 'id={json}']... [--script FILE.jsonl] [--out FILE] [--print RANGE] [--quiet]
 //! gridcraft-cli commands [--json] [--search X]
 //! gridcraft-cli functions [--json] [--search X] [--category C]
-//! gridcraft-cli mcp [--connect PORT] [--in FILE | --sample NAME]
+//! gridcraft-cli mcp [--connect PORT] [--in FILE | --sample NAME] [--automation-read-root DIR]
+//!                   [--automation-write-root DIR] [--author NAME]
 //! gridcraft-cli send <port> <method> [json]
 //! gridcraft-cli version | --version
 //! ```
@@ -45,7 +46,10 @@ const USAGE: &str = "usage:
                      [--out FILE] [--print RANGE] [--quiet]
   gridcraft-cli commands [--json] [--search X]
   gridcraft-cli functions [--json] [--search X] [--category C]
-  gridcraft-cli mcp [--connect PORT] [--in FILE | --sample NAME]
+  gridcraft-cli mcp [--connect PORT] [--in FILE | --sample NAME] [--author NAME]
+                    [--automation-read-root DIR] [--automation-write-root DIR]
+                     --automation-*-root confine every file the headless server reads/writes;
+                     saves never replace an existing file silently (it becomes OLD_<name>)
   gridcraft-cli send <port> <method> [json]
   gridcraft-cli version";
 
@@ -496,9 +500,23 @@ fn functions(args: &[String]) -> Result<(), String> {
 /// started with `gridcraft --control PORT`). JSON-RPC on stdin/stdout; logs on stderr.
 fn mcp(args: &[String]) -> Result<(), String> {
     use gridcraft_mcp::{Backend, Headless, Remote, Server, control_addr};
-    let a = Args::parse(args, &["connect", "in", "sample"], &[])?;
+    let a = Args::parse(args, &["connect", "in", "sample", "automation-read-root", "automation-write-root", "author"], &[])?;
     a.no_extra(0)?;
+    // WHIQ: the folders the headless server may read and write.
+    let roots = gridcraft_engine::file_access::AutomationRoots::new(
+        a.opt("automation-read-root").map(std::path::Path::new),
+        a.opt("automation-write-root").map(std::path::Path::new),
+    )
+    .map_err(|e| format!("mcp: {e}"))?;
     let backend: Box<dyn Backend> = match a.opt("connect") {
+        Some(_) if roots.is_some() => {
+            return Err(
+                "mcp: --automation-read-root and --automation-write-root confine the headless server; a running app is not confined by them".into()
+            );
+        }
+        Some(_) if a.opt("author").is_some() => {
+            return Err("mcp: --author applies to the headless server; the app's user name is its own setting".into());
+        }
         Some(c) => {
             let addr = control_addr(c);
             Box::new(
@@ -507,8 +525,16 @@ fn mcp(args: &[String]) -> Result<(), String> {
             )
         }
         None => {
-            let session = match (a.opt("in"), a.opt("sample")) {
-                (Some(p), _) => open(p)?,
+            if let Some(r) = &roots {
+                // Every thread of this process, not only the server's: nothing reaches past the roots.
+                gridcraft_engine::file_access::confine_process(r.clone());
+                let show = |root: Option<&std::path::Path>| root.map_or_else(|| "none".to_string(), |r| r.display().to_string());
+                eprintln!("gridcraft-cli: files confined: read root {}, write root {}", show(r.read_root()), show(r.write_root()));
+            }
+            // Saves made by agents never replace a file silently: the previous one becomes OLD_<name>.
+            gridcraft_engine::io::save_policy::keep_old_files(true);
+            let mut session = match (a.opt("in"), a.opt("sample")) {
+                (Some(p), _) => gridcraft_engine::file_access::confine(roots.as_ref(), || open(p))?,
                 (None, Some(name)) => {
                     let mut s = Session::new();
                     exec(&mut s, "file.new", json!({"sample": name}))?;
@@ -516,7 +542,10 @@ fn mcp(args: &[String]) -> Result<(), String> {
                 }
                 (None, None) => blank(),
             };
-            Box::new(Headless::with_session(session))
+            if let Some(name) = a.opt("author") {
+                session.prefs.user_name = name.to_string();
+            }
+            Box::new(Headless::with_session(session).with_automation_roots(roots))
         }
     };
     eprintln!("gridcraft-cli: MCP server on stdio ({})", backend.describe());

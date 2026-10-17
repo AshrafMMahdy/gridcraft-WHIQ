@@ -401,6 +401,10 @@ pub fn to_html(wb: &Workbook, sheet: usize) -> Result<String> {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn read_file(path: &str) -> Result<Vec<u8>> {
+    // WHIQ: the automation read root applies to every file a command reads; a relative path
+    // lies inside it.
+    let path = &crate::file_access::resolve_relative(path, crate::file_access::Access::Read);
+    crate::file_access::check_read(path).map_err(EngineError::Other)?;
     let meta = std::fs::metadata(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     if meta.len() > 2 * 1024 * 1024 * 1024 {
         return Err(EngineError::Other("files larger than 2 GB aren't supported".into()));
@@ -415,14 +419,145 @@ pub fn read_file(path: &str) -> Result<Vec<u8>> {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn write_file(path: &str, bytes: &[u8]) -> Result<()> {
-    // Write to a temporary file, then rename: a crash never leaves a half-written workbook.
+    // WHIQ: the automation write root applies to every file a command writes; a relative path
+    // lies inside it.
+    let path = &crate::file_access::resolve_relative(path, crate::file_access::Access::Write);
+    crate::file_access::check_write(path).map_err(EngineError::Other)?;
+    // Write to a temporary file, flush it to disk, then rename: a crash never leaves a
+    // half-written workbook.
     let tmp = format!("{path}.sctmp");
-    std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path)).map_err(|e| {
+    let cleanup = |e: std::io::Error| {
         // A write or rename that fails (full disk, the workbook locked by another app) leaves
         // no temporary file beside the user's workbook.
         let _ = std::fs::remove_file(&tmp);
         EngineError::Other(format!("{path}: {e}"))
-    })
+    };
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&tmp).map_err(cleanup)?;
+        f.write_all(bytes).and_then(|()| f.sync_all()).map_err(cleanup)?;
+    }
+    let target = std::path::Path::new(path);
+    // WHIQ: an existing file is never replaced silently while the keep-old policy is on
+    // (`gridcraft-cli mcp`): it is renamed `OLD_<name>` first, unless the call allowed
+    // overwriting or this process wrote that file itself.
+    let kept = match save_policy::keep_old_for(target) {
+        Some(old) => {
+            std::fs::rename(target, &old).map_err(cleanup)?;
+            Some(old)
+        }
+        None => None,
+    };
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        if let Some(old) = &kept {
+            let _ = std::fs::rename(old, target);
+        }
+        return Err(cleanup(e));
+    }
+    // The rename itself reaches the disk once the folder is flushed (best effort: not every
+    // platform lets a folder be opened).
+    if let Some(dir) = target.parent().filter(|d| !d.as_os_str().is_empty())
+        && let Ok(d) = std::fs::File::open(dir)
+    {
+        let _ = d.sync_all();
+    }
+    save_policy::wrote(target, kept);
+    Ok(())
+}
+
+/// WHIQ: what a save does with a file already at its destination, and the report of what it did.
+///
+/// Off by default (upstream behaviour: a save replaces the file). `gridcraft-cli mcp` turns the
+/// keep-old policy on for the whole process ([`save_policy::keep_old_files`]): an existing file is
+/// renamed `OLD_<name>` (`OLD_<stem>-2.<ext>`… when that name is taken too) before the new one is
+/// put in its place, unless the call runs inside [`save_policy::allow_overwrite`] or the file is
+/// one this process saved itself earlier. Every rename is reported ([`save_policy::take_reports`]).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod save_policy {
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static KEEP_OLD: AtomicBool = AtomicBool::new(false);
+    static OWN: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+
+    thread_local! {
+        static OVERWRITE: Cell<bool> = const { Cell::new(false) };
+        static REPORTS: RefCell<Vec<Report>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// One file a save put in place.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Report {
+        pub path: PathBuf,
+        /// Where the file that was there before went (`OLD_<name>`), if there was one.
+        pub previous_renamed_to: Option<PathBuf>,
+    }
+
+    /// Turn the keep-old policy on (or off) for the whole process.
+    pub fn keep_old_files(on: bool) {
+        KEEP_OLD.store(on, Ordering::SeqCst);
+    }
+
+    pub fn keeps_old_files() -> bool {
+        KEEP_OLD.load(Ordering::SeqCst)
+    }
+
+    /// Run `f` with overwriting allowed on this thread (`overwrite: true` on a call).
+    pub fn allow_overwrite<T>(on: bool, f: impl FnOnce() -> T) -> T {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                OVERWRITE.with(|o| o.set(self.0));
+            }
+        }
+        let _restore = Restore(OVERWRITE.with(|o| o.replace(on)));
+        f()
+    }
+
+    /// The saves made on this thread since the last call.
+    pub fn take_reports() -> Vec<Report> {
+        REPORTS.with(|r| std::mem::take(&mut *r.borrow_mut()))
+    }
+
+    fn key(path: &Path) -> PathBuf {
+        std::fs::canonicalize(path).unwrap_or_else(|_| std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()))
+    }
+
+    fn own(path: &Path) -> bool {
+        let k = key(path);
+        OWN.lock().map(|g| g.as_ref().is_some_and(|s| s.contains(&k))).unwrap_or(false)
+    }
+
+    /// The name the file at `target` must be moved to before it is replaced, if it must be.
+    pub(crate) fn keep_old_for(target: &Path) -> Option<PathBuf> {
+        if !keeps_old_files() || OVERWRITE.with(Cell::get) || !target.is_file() || own(target) {
+            return None;
+        }
+        Some(old_name(target))
+    }
+
+    /// `dir/OLD_<name>`, or the first free `dir/OLD_<stem>-N.<ext>`.
+    pub fn old_name(target: &Path) -> PathBuf {
+        let dir = target.parent().map(Path::to_path_buf).unwrap_or_default();
+        let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let first = dir.join(format!("OLD_{name}"));
+        if !first.exists() {
+            return first;
+        }
+        let stem = target.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let ext = target.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+        (2..10_000u32).map(|n| dir.join(format!("OLD_{stem}-{n}{ext}"))).find(|p| !p.exists()).unwrap_or(first)
+    }
+
+    pub(crate) fn wrote(target: &Path, previous: Option<PathBuf>) {
+        if let Ok(mut g) = OWN.lock() {
+            g.get_or_insert_with(HashSet::new).insert(key(target));
+        }
+        REPORTS.with(|r| r.borrow_mut().push(Report { path: target.to_path_buf(), previous_renamed_to: previous }));
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -558,6 +693,45 @@ mod tests {
         write_file(ok.to_str().unwrap(), b"workbook").unwrap();
         assert_eq!(std::fs::read(&ok).unwrap(), b"workbook");
         assert!(!dir.join("Book2.xlsx.sctmp").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WHIQ: with the keep-old policy on, a save never replaces a file silently: the previous
+    /// file becomes `OLD_<name>` (then `OLD_<stem>-2.<ext>`), overwriting needs
+    /// `allow_overwrite`, and the process's own earlier save is replaced in place.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn keep_old_policy_renames_the_previous_file() {
+        let dir = std::env::temp_dir().join(format!("gridcraft-keep-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = dir.join("Book.xlsx");
+        std::fs::write(&book, b"customer").unwrap();
+        save_policy::keep_old_files(true);
+        let _ = save_policy::take_reports();
+        write_file(book.to_str().unwrap(), b"v1").unwrap();
+        assert_eq!(std::fs::read(dir.join("OLD_Book.xlsx")).unwrap(), b"customer");
+        assert_eq!(std::fs::read(&book).unwrap(), b"v1");
+        let r = save_policy::take_reports();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].previous_renamed_to.as_deref(), Some(dir.join("OLD_Book.xlsx").as_path()));
+        // Our own save is replaced in place.
+        write_file(book.to_str().unwrap(), b"v2").unwrap();
+        assert_eq!(save_policy::take_reports()[0].previous_renamed_to, None);
+        assert!(!dir.join("OLD_Book-2.xlsx").exists());
+        // Another file already there, with OLD_ taken: OLD_<stem>-2.
+        let other = dir.join("Other.xlsx");
+        std::fs::write(&other, b"a").unwrap();
+        std::fs::write(dir.join("OLD_Other.xlsx"), b"older").unwrap();
+        write_file(other.to_str().unwrap(), b"b").unwrap();
+        assert_eq!(std::fs::read(dir.join("OLD_Other-2.xlsx")).unwrap(), b"a");
+        assert_eq!(std::fs::read(dir.join("OLD_Other.xlsx")).unwrap(), b"older");
+        // overwrite: true replaces without a copy.
+        let third = dir.join("Third.csv");
+        std::fs::write(&third, b"a").unwrap();
+        save_policy::allow_overwrite(true, || write_file(third.to_str().unwrap(), b"b")).unwrap();
+        assert!(!dir.join("OLD_Third.csv").exists());
+        save_policy::keep_old_files(false);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

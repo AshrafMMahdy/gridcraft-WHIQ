@@ -1,6 +1,9 @@
 //! An in-process engine session that answers the engine-level control-channel methods itself.
 
+use std::sync::Arc;
+
 use gridcraft_engine::Session;
+use gridcraft_engine::file_access::{self, AutomationRoots};
 use serde_json::{Value, json};
 
 use crate::backend::Backend;
@@ -12,6 +15,9 @@ with `gridcraft-cli mcp --connect 7979`";
 /// Headless backend: a [`Session`] with one blank workbook to start with.
 pub struct Headless {
     pub session: Session,
+    /// WHIQ: the folders this session's commands may read and write (`--automation-read-root`,
+    /// `--automation-write-root`); `None` confines nothing.
+    roots: Option<Arc<AutomationRoots>>,
 }
 
 impl Default for Headless {
@@ -25,12 +31,23 @@ impl Headless {
     pub fn new() -> Self {
         let mut session = Session::new();
         session.new_workbook();
-        Self { session }
+        Self { session, roots: None }
     }
 
     /// A session wrapping an existing one (e.g. with a file already open).
     pub fn with_session(session: Session) -> Self {
-        Self { session }
+        Self { session, roots: None }
+    }
+
+    /// Confine every file the session's commands read and write to `roots`.
+    pub fn with_automation_roots(mut self, roots: Option<Arc<AutomationRoots>>) -> Self {
+        self.roots = roots;
+        self
+    }
+
+    /// The roots in force, if any.
+    pub fn roots(&self) -> Option<&Arc<AutomationRoots>> {
+        self.roots.as_ref()
     }
 
     fn execute(&mut self, id: &str, params: Value) -> Result<Value, String> {
@@ -59,6 +76,21 @@ impl Headless {
 
 impl Backend for Headless {
     fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let roots = self.roots.clone();
+        file_access::confine(roots.as_ref(), || self.answer(method, params))
+    }
+
+    fn has_ui(&self) -> bool {
+        false
+    }
+
+    fn describe(&self) -> String {
+        "headless (in-process engine, no window)".to_string()
+    }
+}
+
+impl Headless {
+    fn answer(&mut self, method: &str, params: Value) -> Result<Value, String> {
         let params = if params.is_null() { json!({}) } else { params };
         match method {
             "ping" => Ok(json!("pong")),
@@ -78,13 +110,5 @@ impl Backend for Headless {
             m if gridcraft_engine::find_command(m).is_some() => self.execute(m, params),
             other => Err(format!("unknown method `{other}`")),
         }
-    }
-
-    fn has_ui(&self) -> bool {
-        false
-    }
-
-    fn describe(&self) -> String {
-        "headless (in-process engine, no window)".to_string()
     }
 }

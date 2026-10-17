@@ -546,3 +546,53 @@ fn invalid_sort_keys_are_invalid_params() {
     }
     ok(&mut s, "sort_range", json!({"range": "A1:A3", "keys": ["A", {"column": "A", "order": "desc"}]}));
 }
+
+// ---------- WHIQ ----------
+
+#[test]
+fn annotations_say_what_each_tool_does() {
+    let tools = tool_definitions();
+    let hint = |name: &str, h: &str| {
+        let t = tools.iter().find(|t| t["name"] == name).unwrap_or_else(|| panic!("{name}"));
+        t["annotations"][h].as_bool().unwrap_or_else(|| panic!("{name}: {h}"))
+    };
+    for t in &tools {
+        let name = t["name"].as_str().unwrap();
+        let a = &t["annotations"];
+        for h in ["readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"] {
+            assert!(a[h].is_boolean(), "{name}: {h}");
+        }
+        assert!(!(hint(name, "readOnlyHint") && hint(name, "destructiveHint")), "{name}: a read can't destroy");
+    }
+    for read in ["read_range", "get_cell", "inspect_workbook", "list_commands", "list_functions", "evaluate_formula"] {
+        assert!(hint(read, "readOnlyHint"), "{read}");
+    }
+    for writes in ["write_range", "set_cell", "save_workbook", "execute_command", "format_range", "open_workbook", "screenshot"] {
+        assert!(!hint(writes, "readOnlyHint"), "{writes} is not read-only");
+    }
+    for destructive in ["save_workbook", "write_range", "set_cell", "execute_command"] {
+        assert!(hint(destructive, "destructiveHint"), "{destructive}");
+    }
+    assert!(!hint("insert_chart", "destructiveHint"));
+}
+
+#[test]
+fn automation_roots_confine_the_headless_server() {
+    let base = std::env::temp_dir().join(format!("gridcraft-mcp-roots-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("chat")).unwrap();
+    std::fs::create_dir_all(base.join("outside")).unwrap();
+    let roots = gridcraft_engine::file_access::AutomationRoots::new(Some(&base.join("chat")), Some(&base.join("chat"))).unwrap();
+    let mut s = Server::new(Box::new(Headless::new().with_automation_roots(roots)));
+    ok(&mut s, "set_cell", json!({"cell": "A1", "input": "kept"}));
+    let out = base.join("outside/leak.xlsx");
+    let e = fails(&mut s, "save_workbook", json!({"path": out.to_str().unwrap()}));
+    assert!(e.contains("outside the write root"), "{e}");
+    assert!(!out.exists());
+    // A relative path lands inside the write root.
+    ok(&mut s, "save_workbook", json!({"path": "inside.xlsx"}));
+    assert!(base.join("chat/inside.xlsx").exists());
+    let e = fails(&mut s, "open_workbook", json!({"path": base.join("outside/x.xlsx").to_str().unwrap()}));
+    assert!(e.contains("outside the read root"), "{e}");
+    let _ = std::fs::remove_dir_all(&base);
+}

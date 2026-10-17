@@ -29,7 +29,10 @@ fn dictionary() -> &'static HashSet<String> {
         {
             let mut set = HashSet::new();
             for path in ["/usr/share/dict/words", "/usr/share/dict/american-english", "/usr/share/dict/british-english"] {
-                if let Ok(text) = std::fs::read_to_string(path) {
+                // The system word list is the app's own file, not the agent's: read outside the
+                // automation roots (WHIQ), through `io` like every other file.
+                if let Ok(bytes) = crate::file_access::unconfined(|| crate::io::read_file(path)) {
+                    let text = String::from_utf8_lossy(&bytes);
                     for w in text.lines().take(2_000_000) {
                         set.insert(w.trim().to_lowercase());
                     }
