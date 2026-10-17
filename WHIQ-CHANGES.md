@@ -190,8 +190,39 @@ pipeline every `tools/call` goes through, `server_status`, `job_status`, error c
   neither wrote nor read them (a save dropped them). Now the slicer part, the slicer cache
   (`x15:tableSlicerCache tableId column`), the workbook and sheet extensions, the `Slicer_<column>`
   defined name and the drawing frame (`mc:AlternateContent` `sle:slicer`) are written, and read
-  back from Excel files; the selection is the table's filter. PivotTable slicers are still not
-  modelled: reading one warns and drops it (see "Not done").
+  back from Excel files; the selection is the table's filter.
+- **PivotTable slicers** (round 2). Model: `Slicer::pivots` lists the connected PivotTables
+  (`Sheet2!PivotTable1`, Excel's Report Connections); `column` is the source field. Engine: the
+  slicer's selection filters every connected PivotTable when it is computed (`pivot::compute`),
+  `insert.slicer {pivot, column}`, `slicer.connections {pivots}`, `slicer.list`, and
+  `slicer.toggle` / `slicer.selectAll` accept a slicer by caption; renaming the PivotTable's sheet
+  rewrites the links, deleting the PivotTable removes its slicers. XLSX: written as Excel 2010
+  does — the `x14` slicer cache naming its PivotTables by `tabId` (the sheet's `sheetId`) and name,
+  `data/tabular pivotCacheId` matching the cache's new `x14:pivotCacheDefinition pivotCacheId`,
+  the items with their `s` selection flags, the `x14` sheet `slicerList`, the `a14` drawing frame,
+  the `Slicer_<field>` name, and the selection as hidden items of that field in every connected
+  PivotTable (on an axis or not). Every id is regenerated on each save; a slicer whose
+  PivotTables or field are gone is left out, so nothing dangles. PivotTables one slicer connects
+  now share one PivotCache (Excel's rule; `pivot.rs` builds a cache over several PivotTables, with
+  the union of their axis fields, groupings, calculated fields and the slicer fields). Read back
+  from Excel files: the selection comes from the cache items and the PivotCache's shared items;
+  the hidden-items filter Excel also wrote for that field is folded into the slicer (it owns it).
+  `refreshOnLoad="1"` stays on every cache, so Excel recomputes the report on open; PivotTable
+  definitions, caches, records and styles (`pivotTableStyleInfo`) are rewritten from the model.
+- Test fixture `tests/mcp-contract/fixtures/pivot-slicer.xlsx` (made by `make_pivot_slicer.py` in
+  the same folder, laid out as Excel 2016 saves it: cacheId 5 vs pivotCacheId 2, a slicer on a
+  field on no axis with one item selected, a slicer on a row field, custom properties). Tests:
+  `gridcraft-xlsx tests::pivot_slicer::*` (read, write with a renamed and moved sheet, every
+  reference consistent, nothing dangling when the PivotTable is gone), engine
+  `cmd::slicer::tests::*` (the report follows the slicers, sheet rename, save/reopen, delete,
+  `insert.slicer {pivot}`), contract `authoring::pivot_and_slicers_survive_open_edit_save_reopen`
+  (open → edit source → refresh → rename sheet → insert rows → save → reopen in a new process →
+  clear a slicer → save; `tabId`s, `refreshOnLoad`, style and custom properties checked; `check`
+  passes).
+- Fixed along the way (an upstream calc bug the command fuzzer hit once the command list grew): a
+  dynamic array that reads its own old spill range now gets the same values from an incremental
+  recalculation as from a full one — stale spilled values of a formula being recalculated are
+  never read back (`calc/src/recalc.rs`; test `self_referencing_spill_agrees_with_full_recalc`).
 - **MCP editing tools**: `insert_rows`, `insert_columns`, `delete_rows`, `delete_columns`
   (`"7"`, `"5:7"`, `"C"`, on any `sheet`), `rename_sheet`, `add_sheet`, `conditional_format`,
   `data_validation`, plus the existing `write_range`, `set_cell`, `format_range`.
@@ -230,8 +261,6 @@ pipeline every `tools/call` goes through, `server_status`, `job_status`, error c
 
 ## Not done / known limits
 
-- **PivotTable slicers** (Excel `x14` slicer caches over a PivotCache) are not modelled: opening a
-  file with one warns, and saving drops it. Table slicers round-trip.
 - Bundled fonts are Noto Sans and Noto Sans Arabic only: in PNG renders and in `fonts: embedded`
   PDFs every Latin family (Calibri, Times, Courier…) is drawn in Noto Sans, italics are slanted
   synthetically; CJK, Hebrew-specific, Devanagari… glyphs have no face (the PDF's `Auto` mode keeps

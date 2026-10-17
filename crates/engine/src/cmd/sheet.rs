@@ -812,6 +812,26 @@ fn rename_sheet(s: &mut Session, p: &Json) -> Result<Json> {
                 n.formula = gridcraft_formula::print(&gridcraft_formula::adjust::rename_sheet(e, &old, &name));
             }
         }
+        // WHIQ: PivotTable slicers follow their PivotTables' sheet.
+        for i in 0..cx.wb.sheets.len() {
+            let hit = cx.wb.sheet(i).is_some_and(|sh| {
+                sh.slicers
+                    .iter()
+                    .flat_map(|sl| sl.pivots.iter())
+                    .any(|l| crate::pivot::parse_chart_link(l).is_some_and(|(s, _)| s.eq_ignore_ascii_case(&old)))
+            });
+            if hit {
+                for sl in cx.sheet_mut(i)?.slicers.iter_mut() {
+                    for l in sl.pivots.iter_mut() {
+                        if let Some((s, pv)) = crate::pivot::parse_chart_link(l)
+                            && s.eq_ignore_ascii_case(&old)
+                        {
+                            *l = crate::pivot::chart_link(&name, &pv);
+                        }
+                    }
+                }
+            }
+        }
         cx.structural = true;
         Ok(Json::Null)
     })

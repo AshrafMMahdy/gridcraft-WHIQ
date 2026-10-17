@@ -867,6 +867,17 @@ pub fn compute(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Result<Out
             Some((c, f, g.unwrap_or_default(), g.is_none()))
         })
         .collect();
+    // WHIQ: the selections of the slicers connected to this PivotTable filter its records too
+    // (they are not report filters, so nothing is drawn for them).
+    let sheet_name = wb.sheet(pivot_sheet).map(|s| s.name.clone()).unwrap_or_default();
+    let slicer_filters = slicer_filters(wb, &sheet_name, &pt.name);
+    let mut filters = filters;
+    for f in &slicer_filters {
+        if let Some(c) = src.col(&f.source_col) {
+            let g = axis_group(&f.source_col).unwrap_or_default();
+            filters.push((c, f, g, false));
+        }
+    }
     let shown_filters: Vec<&(usize, &PivotFilter, PivotDateGroup, bool)> = filters.iter().filter(|f| f.3).collect();
 
     let k = vals.len();
@@ -1588,6 +1599,42 @@ fn rebind_charts(wb: &mut Workbook, sheet: &str, pivot: &str, origin: CellRef, o
             ch.series = series.clone();
         }
     }
+}
+
+/// WHIQ: the selections of the slicers connected to a PivotTable, as filters on its fields.
+pub fn slicer_filters(wb: &Workbook, sheet: &str, pivot: &str) -> Vec<PivotFilter> {
+    wb.sheets
+        .iter()
+        .flat_map(|sh| sh.slicers.iter())
+        .filter(|sl| sl.pivots.iter().any(|l| links_to(l, sheet, pivot)))
+        .filter_map(|sl| sl.selected.clone().map(|selected| PivotFilter { source_col: sl.column.clone(), selected: Some(selected) }))
+        .collect()
+}
+
+/// WHIQ: (sheet, index) of the PivotTable a link (`Sheet2!PivotTable1`) names.
+pub fn find_linked(wb: &Workbook, link: &str) -> Option<(usize, usize)> {
+    let (sheet, name) = parse_chart_link(link)?;
+    let si = wb.sheets.iter().position(|s| s.name.eq_ignore_ascii_case(&sheet))?;
+    let pi = wb.sheet(si)?.pivots.iter().position(|p| p.name.eq_ignore_ascii_case(&name))?;
+    Some((si, pi))
+}
+
+/// WHIQ: the distinct item labels of a PivotTable source field, in first-seen order (a pivot
+/// slicer's tiles).
+pub fn field_items(wb: &Workbook, sheet: usize, idx: usize, field: &str) -> Vec<String> {
+    let Some(pt) = wb.sheet(sheet).and_then(|s| s.pivots.get(idx)) else { return vec![] };
+    let Ok(src) = read_source(wb, &pt.source, sheet) else { return vec![] };
+    let Some(c) = src.col(field) else { return vec![] };
+    let fmt = src.formats.get(c).cloned().unwrap_or_else(|| "General".into());
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for rec in &src.rows {
+        let label = item_label(wb, rec.get(c).unwrap_or(&Value::Empty), PivotDateGroup::None, &fmt);
+        if seen.insert(label.to_lowercase()) {
+            out.push(label);
+        }
+    }
+    out
 }
 
 /// Clears a pivot's last output area.

@@ -3282,3 +3282,22 @@ fn paste_special_validation_moves_relative_references() {
     assert!(!ok(&mut s, "C3", "5"), "the pasted rule checks C3, not A1");
     assert!(ok(&mut s, "C3", "20"));
 }
+
+/// WHIQ: a dynamic array reading its own (old) spill range gets the same values from an
+/// incremental recalculation as from a full one (the old spilled values are never read back).
+#[test]
+fn self_referencing_spill_agrees_with_full_recalc() {
+    let mut s = Session::new();
+    s.execute("file.new", json!({"sample": "budget"})).unwrap();
+    s.execute("cell.set", json!({"cell": "J24", "input": "=TRANSPOSE(J23:L28)"})).unwrap();
+    s.execute("edit.copy", json!({"range": "I:K"})).unwrap();
+    let _ = s.execute("edit.paste", json!({"at": "L19"}));
+    let d = s.doc_mut().unwrap();
+    let before: Vec<(CellRef, Value)> =
+        (18..40).flat_map(|r| (8..16).map(move |c| CellRef::new(r, c))).map(|c| (c, d.wb.sheet(0).unwrap().value(c))).collect();
+    let mut wb = (*d.wb).clone();
+    d.calc.recalc_all(&mut wb);
+    for (c, v) in before {
+        assert_eq!(wb.sheet(0).unwrap().value(c), v, "{}", c.a1());
+    }
+}

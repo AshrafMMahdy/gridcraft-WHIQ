@@ -1367,6 +1367,19 @@ fn delete(s: &mut Session, p: &Json) -> Result<Json> {
                 }
             }
         }
+        // WHIQ: its slicers lose the connection; a slicer connected to nothing else goes.
+        if let Some((sheet, name)) = cx.wb.sheet(si).and_then(|sh| sh.pivots.get(pi).map(|pt| (sh.name.clone(), pt.name.clone()))) {
+            for i in 0..cx.wb.sheets.len() {
+                let linked = |sl: &Slicer| sl.pivots.iter().any(|l| pv::links_to(l, &sheet, &name));
+                if cx.wb.sheet(i).is_some_and(|sh| sh.slicers.iter().any(linked)) {
+                    let sh = cx.sheet_mut(i)?;
+                    for sl in sh.slicers.iter_mut() {
+                        sl.pivots.retain(|l| !pv::links_to(l, &sheet, &name));
+                    }
+                    sh.slicers.retain(|sl| !(sl.pivots.is_empty() && sl.table.is_empty()));
+                }
+            }
+        }
         pv::clear_output(&mut cx.wb, si, pi);
         let sh = cx.sheet_mut(si)?;
         if pi < sh.pivots.len() {

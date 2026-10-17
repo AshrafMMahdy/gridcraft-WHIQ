@@ -659,6 +659,11 @@ pub struct Slicer {
     pub selected: Option<Vec<String>>,
     /// Number of button columns in the layout (Excel default 1).
     pub columns: u32,
+    /// WHIQ: a PivotTable slicer's PivotTables (`Sheet2!PivotTable1`, as a PivotChart names its
+    /// PivotTable; Excel's Report Connections). Empty for a table slicer. `column` is then the
+    /// PivotTable source field, and the selection filters every connected PivotTable.
+    #[serde(default)]
+    pub pivots: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

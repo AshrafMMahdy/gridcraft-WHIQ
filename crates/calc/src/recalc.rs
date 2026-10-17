@@ -624,6 +624,23 @@ fn fit_to_range(v: Value, range: RangeRef) -> Value {
     Array::new(h, w, data).map(Value::from).unwrap_or(Value::Error(CellError::Value))
 }
 
+impl PassHost<'_> {
+    /// The formula recalculated in this pass whose last spill covers `c` (not `c` itself).
+    fn recomputed_owner(&self, sheet: usize, c: CellRef) -> Option<Key> {
+        if self.pending.is_empty() && self.results.is_empty() {
+            return None;
+        }
+        let sh = self.wb.sheet(sheet)?;
+        if !sh.spill.contains_key(&c) {
+            return None;
+        }
+        sh.spill_ranges
+            .iter()
+            .find(|(o, r)| **o != c && r.contains(c) && (self.pending.contains(&(sheet, **o)) || self.results.contains_key(&(sheet, **o))))
+            .map(|(o, _)| (sheet, *o))
+    }
+}
+
 impl Host for PassHost<'_> {
     fn workbook(&self) -> &Workbook {
         self.wb
@@ -652,6 +669,22 @@ impl Host for PassHost<'_> {
         let k = (sheet, c);
         if self.pending.contains(&k) || self.results.contains_key(&k) {
             return self.compute(k);
+        }
+        // A cell the last pass spilled into from a formula recalculated in this one: that
+        // formula's new array decides (and while it is being evaluated, the cell reads as blank,
+        // as a full recalculation sees it), never the stale value.
+        if let Some(owner) = self.recomputed_owner(sheet, c) {
+            if self.in_progress.contains(&owner) {
+                return Value::Empty;
+            }
+            self.compute(owner);
+            if let Some(arr) = self.spills.get(&owner) {
+                let (dr, dc) = ((c.row - owner.1.row) as usize, (c.col - owner.1.col) as usize);
+                if dr < arr.rows && dc < arr.cols {
+                    return arr.get(dr, dc).cloned().unwrap_or_default();
+                }
+            }
+            return Value::Empty;
         }
         // A cell covered by a spill computed in this pass.
         for (anchor, arr) in &self.spills {
@@ -682,8 +715,18 @@ impl Host for PassHost<'_> {
                 *slot = cell.value.clone();
             }
         }
+        // Spill ranges of formulas recalculated in this pass: their old values are stale.
+        let live: Vec<RangeRef> = if self.pending.is_empty() && self.results.is_empty() {
+            Vec::new()
+        } else {
+            sh.spill_ranges
+                .iter()
+                .filter(|(o, _)| self.pending.contains(&(sheet, **o)) || self.results.contains_key(&(sheet, **o)))
+                .map(|(_, r)| *r)
+                .collect()
+        };
         for (c, v) in sh.spill.range(range.start..=range.end) {
-            if range.contains(*c) {
+            if range.contains(*c) && !live.iter().any(|r| r.contains(*c)) {
                 let i = (c.row - range.start.row) as usize * w + (c.col - range.start.col) as usize;
                 if let Some(slot) = out.get_mut(i)
                     && slot.is_empty()

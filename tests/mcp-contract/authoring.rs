@@ -240,3 +240,60 @@ fn in_place_edits_keep_charts_pivots_slicers_and_unmodelled_parts() {
     let out = std::process::Command::new(binary()).args(["check", base.to_str().unwrap()]).output().unwrap();
     assert!(out.status.success(), "check: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
 }
+
+/// An Excel-shaped workbook with a PivotTable and two PivotTable slicers survives open → edit →
+/// save → reopen, with the slicer references rewritten, and `check` passes.
+#[test]
+fn pivot_and_slicers_survive_open_edit_save_reopen() {
+    let dir = folder("pivotslicer");
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/mcp-contract/fixtures/pivot-slicer.xlsx");
+    let book = dir.join("pivot.xlsx");
+    std::fs::copy(&src, &book).unwrap();
+    let mut m = start(&dir, "Analyst");
+    m.ok("open_workbook", json!({"path": "pivot.xlsx"}));
+    // Edit the source, the slicer and the sheet the PivotTable is on.
+    m.ok("set_cell", json!({"cell": "Data!C2", "input": "100"}));
+    m.ok("execute_command", json!({"command": "sheet.activate", "params": {"sheet": "Pivot"}}));
+    let list = m.ok("execute_command", json!({"command": "slicer.list", "params": {}}));
+    let product =
+        list["result"]["slicers"].as_array().or(list["slicers"].as_array()).unwrap().iter().find(|x| x["field"] == "Product").cloned().unwrap();
+    assert_eq!(product["selected"], json!(["Bolts"]), "{list}");
+    assert_eq!(product["pivots"], json!(["Pivot!PivotTable1"]));
+    m.ok("execute_command", json!({"command": "pivot.refresh", "params": {"replace": true}}));
+    m.ok("rename_sheet", json!({"sheet": "Pivot", "name": "Report"}));
+    m.ok("insert_rows", json!({"rows": "20", "sheet": "Report"}));
+    m.ok("save_workbook", json!({}));
+    let parts = zip_entries(&book);
+    for want in
+        ["xl/pivotTables/pivotTable1.xml", "xl/pivotCache/pivotCacheDefinition1.xml", "xl/pivotCache/pivotCacheRecords1.xml", "docProps/custom.xml"]
+    {
+        assert!(parts.contains(&want.to_string()), "{want}: {parts:?}");
+    }
+    assert_eq!(parts.iter().filter(|p| p.starts_with("xl/slicerCaches/")).count(), 2, "{parts:?}");
+    assert!(zip_text(&book, "docProps/custom.xml").contains("CRC-17A"));
+    let cache = zip_text(&book, "xl/pivotCache/pivotCacheDefinition1.xml");
+    assert!(cache.contains("refreshOnLoad=\"1\""));
+    let table = zip_text(&book, "xl/pivotTables/pivotTable1.xml");
+    assert!(table.contains("PivotStyleMedium9"), "the PivotTable style survives");
+    let wbx = zip_text(&book, "xl/workbook.xml");
+    let report_id = wbx.split("<sheet name=\"Report\" sheetId=\"").nth(1).and_then(|r| r.split('"').next()).unwrap().to_string();
+    for p in parts.iter().filter(|p| p.starts_with("xl/slicerCaches/")) {
+        let x = zip_text(&book, p);
+        assert!(x.contains(&format!("<pivotTable tabId=\"{report_id}\" name=\"PivotTable1\"/>")), "{x}");
+    }
+    // The report reflects the edit (Bolts only, North 100 + 2): 100+2+7+3+4 = 116.
+    assert_eq!(cells_of(&book, "Report!B8"), json!([[116.0]]), "grand total");
+    // Reopen in a fresh process: the slicers are still connected, then toggle one and save again.
+    drop(m);
+    let mut m = start(&dir, "Analyst");
+    m.ok("open_workbook", json!({"path": "pivot.xlsx"}));
+    m.ok("execute_command", json!({"command": "sheet.activate", "params": {"sheet": "Report"}}));
+    let list = m.ok("execute_command", json!({"command": "slicer.list", "params": {}}));
+    let slicers = list["result"]["slicers"].as_array().or(list["slicers"].as_array()).cloned().unwrap();
+    assert!(slicers.iter().all(|x| x["pivots"] == json!(["Report!PivotTable1"])), "{list}");
+    m.ok("execute_command", json!({"command": "slicer.selectAll", "params": {"slicer": "Product"}}));
+    m.ok("save_workbook", json!({"overwrite": true}));
+    assert_eq!(cells_of(&book, "Report!B8"), json!([[149.0]]), "every product once the Product slicer is cleared");
+    let out = std::process::Command::new(binary()).args(["check", book.to_str().unwrap()]).output().unwrap();
+    assert!(out.status.success(), "check: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+}

@@ -35,6 +35,8 @@ pub struct Ctx<'a> {
     pub slicers: Vec<crate::slicers::Pending>,
     pub slicer_frames: Vec<(String, String, gridcraft_model::Anchor)>,
     pub table_file_ids: Vec<(u32, String)>,
+    /// `sheetId` → model sheet name (PivotTable slicers name their PivotTables' sheets by id).
+    pub sheet_ids: Vec<(u32, String)>,
 }
 
 impl Ctx<'_> {
@@ -90,6 +92,7 @@ pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
         slicers: vec![],
         slicer_frames: vec![],
         table_file_ids: vec![],
+        sheet_ids: vec![],
     };
     let root_rels = cx.pkg.rels("")?;
     let wb_part = find_rel(&root_rels, "officeDocument").map(|r| r.target.clone()).unwrap_or_else(|| "xl/workbook.xml".into());
@@ -247,6 +250,9 @@ pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
             _ => Visibility::Visible,
         };
         file_to_model.push(Some(wb.sheets.len()));
+        if let Some(id) = se.attr_u32("sheetId") {
+            cx.sheet_ids.push((id, sheet.name.clone()));
+        }
         wb.sheets.push(Arc::new(sheet));
     }
     if wb.sheets.is_empty() {
