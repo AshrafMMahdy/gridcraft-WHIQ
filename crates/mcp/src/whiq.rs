@@ -1033,6 +1033,18 @@ pub fn rss_bytes() -> Option<u64> {
     Some(pages.saturating_mul(4096))
 }
 
+/// The fonts exports embed (craft-fonts): how many faces, and the families.
+fn fonts_value() -> Value {
+    let faces = gridcraft_engine::text::faces();
+    let mut families: Vec<&str> = Vec::new();
+    for f in faces {
+        if !families.contains(&f.family) {
+            families.push(f.family);
+        }
+    }
+    json!({"faces": faces.len(), "families": families, "default": gridcraft_engine::text::resolve_family("Calibri")})
+}
+
 /// What server_status answers. `extra` adds the runtime's part (jobs, busy, limits).
 pub fn status_value(snap: Option<&DocSnapshot>, roots: (Option<PathBuf>, Option<PathBuf>), settings: &Settings, extra: Value) -> Value {
     let doc = snap.map(|s| {
@@ -1050,6 +1062,7 @@ pub fn status_value(snap: Option<&DocSnapshot>, roots: (Option<PathBuf>, Option<
         "version": env!("CARGO_PKG_VERSION"),
         "whiq": true,
         "memory": {"rss_bytes": rss_bytes()},
+        "fonts": fonts_value(),
         "document": doc,
         "roots": {"read": read.map(|p| p.display().to_string()), "write": write.map(|p| p.display().to_string())},
         "author": settings.author,

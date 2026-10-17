@@ -282,6 +282,9 @@ fn info_strings_are_capped() {
 
 #[test]
 fn embedded_fonts_carry_arabic_as_subset_type0_fonts() {
+    if !gridcraft_text::fonts_for_tests() {
+        return;
+    }
     let mut d = PdfDoc::new();
     d.text_mode = TextMode::Auto;
     let pg = d.add_page(300.0, 200.0);
@@ -315,6 +318,9 @@ fn standard_mode_is_upstream_behaviour() {
 
 #[test]
 fn embedded_text_is_extractable() {
+    if !gridcraft_text::fonts_for_tests() {
+        return;
+    }
     // Proved with poppler's pdftotext when it is installed.
     let Ok(dir) = std::env::var("CARGO_TARGET_TMPDIR").map(std::path::PathBuf::from).or_else(|_| Ok::<_, ()>(std::env::temp_dir())) else { return };
     let mut d = PdfDoc::new();
@@ -332,5 +338,46 @@ fn embedded_text_is_extractable() {
     assert!(text.contains("Invoice total"), "{text}");
     let letters: String = text.chars().filter(|c| !c.is_whitespace() && !matches!(*c, '\u{202A}'..='\u{202E}' | '\u{200E}' | '\u{200F}')).collect();
     assert!(letters.contains("الإجمالي"), "Arabic text is extractable in order: {text}");
+    let _ = std::fs::remove_file(path);
+}
+
+/// WHIQ: italics in real italic faces, families from cell font names, CJK in a CFF face, and
+/// fonts named so `pdffonts` shows each one embedded as a subset.
+#[test]
+fn families_italics_and_cff_faces_are_embedded() {
+    if !gridcraft_text::fonts_for_tests() {
+        return;
+    }
+    let mut d = PdfDoc::new();
+    d.text_mode = TextMode::Embedded;
+    let pg = d.add_page(400.0, 300.0);
+    pg.text_family(10.0, 20.0, 12.0, Font::Helvetica, Some("Calibri"), [0, 0, 0], "Calibri regular", 0.0, None);
+    pg.text_family(10.0, 40.0, 12.0, Font::HelveticaOblique, Some("Calibri"), [0, 0, 0], "Calibri italic", 0.0, None);
+    pg.text_family(10.0, 60.0, 12.0, Font::HelveticaBoldOblique, Some("Calibri"), [0, 0, 0], "Calibri bold italic", 0.0, None);
+    pg.text_family(10.0, 80.0, 12.0, Font::Helvetica, Some("Arial"), [0, 0, 0], "Arial", 0.0, None);
+    pg.text_family(10.0, 100.0, 12.0, Font::TimesRoman, Some("Times New Roman"), [0, 0, 0], "Times", 0.0, None);
+    pg.text_family(10.0, 120.0, 12.0, Font::Helvetica, Some("Calibri"), [0, 0, 0], "合計 金額", 0.0, None);
+    pg.text_family(10.0, 140.0, 12.0, Font::HelveticaOblique, Some("Calibri"), [0, 0, 0], "مائل", 0.0, None);
+    let pdf = d.finish();
+    let s = String::from_utf8_lossy(&pdf);
+    for name in ["+Carlito-Regular", "+Carlito-Italic", "+Carlito-BoldItalic", "+LiberationSans-Regular", "+LiberationSerif-Regular"] {
+        assert!(s.contains(name), "{name}");
+    }
+    assert!(s.contains("/Subtype /CIDFontType0") && s.contains("/FontFile3") && s.contains("/Subtype /OpenType"), "the CJK face is CFF");
+    assert!(s.contains("/ItalicAngle -"), "italic faces say so");
+    check_xref(&pdf);
+    let Ok(dir) = std::env::var("CARGO_TARGET_TMPDIR").map(std::path::PathBuf::from).or_else(|_| Ok::<_, ()>(std::env::temp_dir())) else { return };
+    let path = dir.join(format!("gc-families-{}.pdf", std::process::id()));
+    std::fs::write(&path, &pdf).unwrap();
+    if let Ok(out) = std::process::Command::new("pdftotext").arg(&path).arg("-").output() {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for want in ["Calibri italic", "Calibri bold italic", "合計", "金額"] {
+            assert!(text.contains(want), "pdftotext reads {want}: {text}");
+        }
+    }
+    if let Ok(out) = std::process::Command::new("pdffonts").arg(&path).output() {
+        let t = String::from_utf8_lossy(&out.stdout);
+        assert!(t.lines().skip(2).all(|l| l.contains(" yes yes ")), "every font embedded and subset: {t}");
+    }
     let _ = std::fs::remove_file(path);
 }

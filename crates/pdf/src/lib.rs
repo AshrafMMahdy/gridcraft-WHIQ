@@ -57,6 +57,16 @@ pub enum TextMode {
 /// Paragraph direction for [`Page::text_dir`] (re-exported from `gridcraft-text`).
 pub use gridcraft_text::Dir;
 
+/// The embedded-font style of a standard font, in `family` when given.
+fn text_style(font: Font, family: Option<&str>) -> gridcraft_text::TextStyle<'_> {
+    let fallback = match font {
+        Font::TimesRoman | Font::TimesBold | Font::TimesItalic | Font::TimesBoldItalic => "Times New Roman",
+        Font::Courier | Font::CourierBold | Font::CourierOblique | Font::CourierBoldOblique => "Courier New",
+        _ => "Calibri",
+    };
+    gridcraft_text::TextStyle { family: family.filter(|f| !f.trim().is_empty()).unwrap_or(fallback), bold: font.is_bold(), italic: font.is_italic() }
+}
+
 /// A font family for [`Font::styled`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Family {
@@ -524,17 +534,41 @@ impl Page {
 
     /// WHIQ: width of `text` as this page draws it (standard metrics or shaped embedded glyphs).
     pub fn measure(&self, font: Font, size: f32, text: &str) -> f32 {
-        if self.embeds(text) { gridcraft_text::width(text, size, font.is_bold()) } else { text_width(font, size, text) }
+        self.measure_family(font, None, size, text)
+    }
+
+    /// WHIQ: [`Page::measure`] for text in font family `family` (a cell's font name; `None`: the
+    /// standard font's class — Helvetica as Calibri, Times as Times New Roman, Courier as Courier New).
+    pub fn measure_family(&self, font: Font, family: Option<&str>, size: f32, text: &str) -> f32 {
+        if self.embeds(text) { gridcraft_text::width_styled(text, size, &text_style(font, family)) } else { text_width(font, size, text) }
     }
 
     /// WHIQ: text with a paragraph direction (`None`: from its first strong character). Shaped
     /// and embedded when [`Page::embeds`] says so; the standard fonts otherwise.
     pub fn text_dir(&mut self, x: f32, y: f32, size: f32, font: Font, color: Rgb, text: &str, angle: f32, base: Option<Dir>) {
+        self.text_family(x, y, size, font, None, color, text, angle, base);
+    }
+
+    /// WHIQ: [`Page::text_dir`] in font family `family` (a cell's font name, see
+    /// [`Page::measure_family`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn text_family(
+        &mut self,
+        x: f32,
+        y: f32,
+        size: f32,
+        font: Font,
+        family: Option<&str>,
+        color: Rgb,
+        text: &str,
+        angle: f32,
+        base: Option<Dir>,
+    ) {
         if text.is_empty() || !extent(size) || !finite(&[x, y]) {
             return;
         }
         if self.embeds(text) {
-            let line = gridcraft_text::shape(text, size, font.is_bold(), base);
+            let line = gridcraft_text::shape_styled(text, size, &text_style(font, family), base);
             self.glyph_run(x, y, size, color, &line, angle, font.is_italic());
             return;
         }
@@ -568,11 +602,17 @@ impl Page {
             return;
         }
         let size = size.min(10_000.0);
+        let _ = italic;
         let (sn, cs) = if angle.is_finite() { angle.sin_cos() } else { (0.0, 1.0) };
-        // Synthetic oblique for italics (the bundled faces are upright).
-        let k = if italic { 0.2 } else { 0.0 };
-        let (a, b, c, d) = (cs, -sn, k * cs + sn, -k * sn + cs);
-        let mut s = format!("BT\n{}\n{} {} {} {} {} {} Tm\n", rgb_op(color, false), n(a), n(b), n(c), n(d), n(x), n(self.y(y)));
+        // The line matrix; a glyph whose face has no italic (Arabic) is slanted.
+        let (px, py) = (x, self.y(y));
+        let matrix = |slant: bool| {
+            let k = if slant { 0.2 } else { 0.0 };
+            let (a, b, c, d) = (cs, -sn, k * cs + sn, -k * sn + cs);
+            format!("{} {} {} {} {} {} Tm\n", n(a), n(b), n(c), n(d), n(px), n(py))
+        };
+        let mut slanted = line.glyphs.first().is_some_and(|g| g.slant);
+        let mut s = format!("BT\n{}\n{}", rgb_op(color, false), matrix(slanted));
         let mut face: Option<u8> = None;
         let mut rise = 0.0f32;
         // Pen position (text space, points) after the last glyph shown.
@@ -603,6 +643,13 @@ impl Page {
                 continue;
             }
             let Some(fc) = gridcraft_text::face(g.face) else { continue };
+            if g.slant != slanted {
+                // A new matrix puts the pen back at the line origin.
+                flush(&mut s, &mut tj);
+                s.push_str(&matrix(g.slant));
+                slanted = g.slant;
+                cur = 0.0;
+            }
             if face != Some(g.face) {
                 flush(&mut s, &mut tj);
                 let _ = writeln!(s, "/G{} {} Tf", g.face, n(size));
@@ -618,7 +665,7 @@ impl Page {
             if adj.abs() > 0.05 {
                 let _ = write!(tj, "{} ", n(adj));
             }
-            let cid = cids.cid(g.face, g.gid, g.text.as_deref().unwrap_or(""));
+            let cid = cids.cid(g.face, g.gid, g.text.as_deref().unwrap_or(""), fc.data.starts_with(b"OTTO"));
             let _ = write!(tj, "<{cid:04X}> ");
             cur = g.x + fc.advance(g.gid) * size / fc.upem;
         }

@@ -1,2 +1,9 @@
+# WHIQ: local builds embed the craft-fonts checkout next to this repository when it exists
+# (build.rs warns and continues without it), like WordCraft and DeckCraft. The checkout must be at
+# the commit pinned in WHIQ-CHANGES.md (Fonts) for the Latin faces. CI and releases set
+# CRAFT_FONTS_DIR explicitly, and CRAFT_FONTS_REQUIRED=1.
+[env]
+CRAFT_FONTS_DIR = { value = "../craft-fonts", relative = true }
+
 [alias]
 xtask = "run --package xtask --"

@@ -271,12 +271,14 @@ impl Canvas {
             return;
         }
         let (sn, cs) = if angle.is_finite() { angle.sin_cos() } else { (0.0, 1.0) };
-        let k = if italic { -0.2 } else { 0.0 };
+        let _ = italic;
         let mut pb = PathBuilder::new();
         for g in line.glyphs.iter().take(20_000) {
             if !finite(&[g.x, g.dy]) {
                 continue;
             }
+            // Italic faces are drawn as they are; a face with no italic (Arabic) is slanted.
+            let k = if g.slant { -0.2 } else { 0.0 };
             // Glyph space (x right, y down) → canvas: skew, then rotate about the line origin.
             let ox = x + g.x * cs - g.dy * sn;
             let oy = y + g.x * sn + g.dy * cs;
@@ -291,7 +293,7 @@ impl Canvas {
         self.pixmap.fill_path(&path, &p, FillRule::Winding, Transform::identity(), m.as_ref());
     }
 
-    /// Text at `(x, y)` (baseline) in the bundled faces.
+    /// Text at `(x, y)` (baseline) in the embedded faces, in the default family.
     pub fn text(
         &mut self,
         x: f32,
@@ -304,8 +306,25 @@ impl Canvas {
         angle: f32,
         base: Option<gridcraft_text::Dir>,
     ) {
-        let line = gridcraft_text::shape(text, size, bold, base);
-        self.glyphs(x, y, size, color, &line, angle, italic);
+        self.text_styled(x, y, size, &gridcraft_text::TextStyle { family: "", bold, italic }, color, text, angle, base);
+    }
+
+    /// Text at `(x, y)` (baseline) in `style`'s family (a font name, see
+    /// `gridcraft_text::resolve_family`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn text_styled(
+        &mut self,
+        x: f32,
+        y: f32,
+        size: f32,
+        style: &gridcraft_text::TextStyle<'_>,
+        color: Rgb,
+        text: &str,
+        angle: f32,
+        base: Option<gridcraft_text::Dir>,
+    ) {
+        let line = gridcraft_text::shape_styled(text, size, style, base);
+        self.glyphs(x, y, size, color, &line, angle, style.italic);
     }
 
     /// Draws an RGBA image (`pw`×`ph` pixels, straight alpha) into the box `(x, y, w, h)`.
@@ -374,6 +393,9 @@ mod tests {
 
     #[test]
     fn arabic_text_puts_ink_on_the_canvas() {
+        if !gridcraft_text::fonts_for_tests() {
+            return;
+        }
         let mut c = Canvas::new(200, 50, [255, 255, 255]).unwrap();
         c.text(10.0, 35.0, 24.0, false, false, [0, 0, 0], "مرحبا", 0.0, None);
         let dark = (0..200).flat_map(|x| (0..50).map(move |y| (x, y))).filter(|(x, y)| c.pixel(*x, *y).is_some_and(|p| p[0] < 100)).count();

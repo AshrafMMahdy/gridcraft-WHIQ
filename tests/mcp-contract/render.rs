@@ -9,6 +9,18 @@ fn start(dir: &std::path::Path) -> Mcp {
     Mcp::start(&["--automation-read-root", d, "--automation-write-root", d, "--author", "Contract"])
 }
 
+/// Does the binary embed craft-fonts? Without them the font-dependent checks are skipped, unless
+/// `CRAFT_FONTS_REQUIRED` is set (CI, releases), where that fails.
+fn has_fonts(m: &mut Mcp) -> bool {
+    let s = m.ok("server_status", json!({}));
+    let ok = s["fonts"]["faces"].as_u64().unwrap_or(0) > 0;
+    assert!(ok || std::env::var_os("CRAFT_FONTS_REQUIRED").is_none(), "CRAFT_FONTS_REQUIRED is set but the binary embeds no fonts");
+    if !ok {
+        eprintln!("skipped: gridcraft-cli built without craft-fonts");
+    }
+    ok
+}
+
 /// Dark pixels in the left and right halves of a box of a PNG.
 fn ink(png: &[u8], x0: u32, x1: u32, y0: u32, y1: u32) -> (usize, usize) {
     let img = image::load_from_memory(png).unwrap().to_rgba8();
@@ -45,6 +57,9 @@ fn arabic_sheet(m: &mut Mcp) {
 fn arabic_png_render() {
     let dir = folder("arabic-png");
     let mut m = start(&dir);
+    if !has_fonts(&mut m) {
+        return;
+    }
     arabic_sheet(&mut m);
     let v = m.ok("render_range", json!({"range": "A1:D4", "path": "arabic.png", "scale": 1, "gridlines": false}));
     let png = std::fs::read(dir.join("arabic.png")).unwrap();
@@ -79,13 +94,16 @@ fn arabic_png_render() {
 fn arabic_pdf_export_embeds_subset_fonts() {
     let dir = folder("arabic-pdf");
     let mut m = start(&dir);
+    if !has_fonts(&mut m) {
+        return;
+    }
     arabic_sheet(&mut m);
     let v = m.ok("export_pdf", json!({"path": "report.pdf"}));
     assert_eq!(v["pages"], 1, "{v}");
     let pdf = std::fs::read(dir.join("report.pdf")).unwrap();
     let text = String::from_utf8_lossy(&pdf);
     assert!(text.contains("/Subtype /Type0") && text.contains("/FontFile2") && text.contains("/ToUnicode"));
-    assert!(text.contains("+NotoSansArabic-") && text.contains("+NotoSans-Regular"), "subset fonts embedded");
+    assert!(text.contains("+NotoSansArabic-") && text.contains("+Carlito-Regular"), "subset fonts embedded");
     assert!(!text.contains("/BaseFont /Helvetica"), "every font embedded by default");
     assert!(pdf.len() < 120_000, "subsets, not whole fonts: {} bytes", pdf.len());
     if let Ok(out) = std::process::Command::new("pdftotext").arg(dir.join("report.pdf")).arg("-").output() {

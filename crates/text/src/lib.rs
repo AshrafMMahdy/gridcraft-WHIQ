@@ -1,15 +1,21 @@
 //! WHIQ: text layout for GridCraft's exports (PDF and PNG).
 //!
-//! - **Fonts always available**: Noto Sans (Latin, Greek, Cyrillic) and Noto Sans Arabic, regular
-//!   and bold, are compiled into native builds (SIL OFL 1.1, `assets/fonts/whiq/`). Web builds
-//!   carry none ([`faces`] is empty) and exports fall back to the PDF standard fonts.
+//! - **Fonts** come from the craft-fonts build input (`CRAFT_FONTS_DIR`, see `build.rs`), as in
+//!   WordCraft and DeckCraft: the Latin presentation families (Carlito for Calibri, Caladea for
+//!   Cambria, Liberation Sans / Serif / Mono for Arial, Times New Roman and Courier New, and
+//!   others) with real bold, italic and bold-italic faces, Noto Sans Arabic (a variable font,
+//!   instanced at regular and bold weights), and the CJK faces. A cell's font name picks its
+//!   family ([`resolve_family`]): the family itself when embedded, else its open substitute, else
+//!   Carlito. Without craft-fonts ([`available`] is false) exports use the PDF standard fonts.
 //! - **Bidi**: the Unicode Bidirectional Algorithm orders each line; the paragraph direction is the
 //!   one given, else the first strong character's ([`base_direction`]): an Arabic line is
 //!   right-to-left.
-//! - **Shaping**: HarfRust shapes each run with its script and direction (Arabic joining,
-//!   ligatures, marks, mirrored brackets in right-to-left runs). Characters pick a face by script
-//!   (Arabic → Noto Sans Arabic, else Noto Sans), neutrals stay with their neighbours, and a face
-//!   that lacks a character hands it to the other one.
+//! - **Shaping**: HarfRust shapes each run with its script, direction and (variable fonts) its
+//!   instance (Arabic joining, ligatures, marks, mirrored brackets in right-to-left runs).
+//!   Characters pick a face by script (Arabic → the Arabic face), neutrals stay with their
+//!   neighbours, and a character the face lacks goes to the first face that has it (CJK, Thai…).
+//! - **Italics** use the family's italic face. Only a face with no italic at all (Arabic script has
+//!   none) is slanted ([`Glyph::slant`]).
 //! - **Outlines** ([`outline`]) for rasterising, **glyph text** for PDF `ToUnicode` maps.
 //!
 //! Positions are in the caller's units (points or pixels): `size` is the font size in them.
@@ -18,27 +24,51 @@
 
 use std::sync::OnceLock;
 
-use harfrust::{Direction, ShapeOptions, ShaperData, UnicodeBuffer};
+use harfrust::{Direction, ShapeOptions, ShaperData, ShaperInstance, UnicodeBuffer};
 use skrifa::MetadataProvider;
-use skrifa::instance::{LocationRef, Size};
+use skrifa::instance::{Location, LocationRef, Size};
 use skrifa::outline::{DrawSettings, OutlinePen};
+use skrifa::raw::TableProvider;
 use unicode_script::{Script, UnicodeScript};
 
-/// A bundled face.
+/// A font from the craft-fonts build input (empty unless built with `CRAFT_FONTS_DIR`).
+pub struct CraftFont {
+    pub family: &'static str,
+    pub style: &'static str,
+    /// ISO 15924 scripts the font is for, e.g. `"Arab"`.
+    pub scripts: &'static [&'static str],
+    pub bytes: &'static [u8],
+}
+
+include!(concat!(env!("OUT_DIR"), "/craft_fonts.rs"));
+
+/// A face: one font file, or one instance (weight) of a variable font.
 pub struct Face {
-    /// PostScript name (`NotoSans-Regular`).
-    pub name: &'static str,
+    /// PostScript-style name, unique among the faces (`Carlito-BoldItalic`).
+    pub name: String,
+    pub family: &'static str,
     pub data: &'static [u8],
+    /// Weight 600 or more.
     pub bold: bool,
+    pub weight: u16,
+    pub italic: bool,
+    /// For Arabic script.
     pub arabic: bool,
+    pub scripts: &'static [&'static str],
+    /// Variation settings of this instance (user space), empty for a static font.
+    pub variations: Vec<([u8; 4], f32)>,
     pub upem: f32,
     /// Ascender / descender (positive up / positive down) in font units.
     pub ascent: f32,
     pub descent: f32,
     pub cap_height: f32,
+    /// Degrees, counter-clockwise from vertical (negative for a right-leaning italic).
+    pub italic_angle: f32,
     /// Font bounding box in font units: x_min, y_min, x_max, y_max.
     pub bbox: [f32; 4],
+    location: Location,
     shaper: ShaperData,
+    instance: Option<ShaperInstance>,
 }
 
 impl Face {
@@ -51,11 +81,11 @@ impl Face {
         skrifa::FontRef::new(self.data).ok().and_then(|f| f.charmap().map(c)).map(|g| g.to_u32().min(u32::from(u16::MAX)) as u16).unwrap_or(0)
     }
 
-    /// Advance of glyph `gid` in font units.
+    /// Advance of glyph `gid` in font units (at this instance).
     pub fn advance(&self, gid: u16) -> f32 {
         skrifa::FontRef::new(self.data)
             .ok()
-            .and_then(|f| f.glyph_metrics(Size::unscaled(), LocationRef::default()).advance_width(skrifa::GlyphId::new(u32::from(gid))))
+            .and_then(|f| f.glyph_metrics(Size::unscaled(), LocationRef::from(&self.location)).advance_width(skrifa::GlyphId::new(u32::from(gid))))
             .unwrap_or(self.upem / 2.0)
     }
 
@@ -63,64 +93,253 @@ impl Face {
     pub fn glyph_count(&self) -> u32 {
         skrifa::FontRef::new(self.data).ok().map(|f| u32::from(f.maxp().map(|m| m.num_glyphs()).unwrap_or(0))).unwrap_or(0)
     }
+
+    /// Is this an instance of a variable font?
+    pub fn is_variable(&self) -> bool {
+        !self.variations.is_empty()
+    }
 }
 
-use skrifa::raw::TableProvider;
+/// (bold, italic, weight) of a manifest style name; `None` for a variable font's style.
+fn static_style(style: &str) -> Option<(bool, u16)> {
+    let s = style.to_ascii_lowercase();
+    if s.contains("variable") {
+        return None;
+    }
+    let italic = s.contains("italic") || s.contains("oblique");
+    let weight = if s.contains("semibold") || s.contains("semi bold") || s.contains("demibold") {
+        600
+    } else if s.contains("extrabold") || s.contains("extra bold") {
+        800
+    } else if s.contains("bold") {
+        700
+    } else if s.contains("black") || s.contains("heavy") {
+        900
+    } else if s.contains("medium") {
+        500
+    } else if s.contains("light") {
+        300
+    } else {
+        400
+    };
+    Some((italic, weight))
+}
 
-/// The bundled fonts: (PostScript name, bytes, bold, Arabic).
-#[cfg(not(target_arch = "wasm32"))]
-const BUNDLED: &[(&str, &[u8], bool, bool)] = &[
-    ("NotoSans-Regular", include_bytes!("../../../assets/fonts/whiq/NotoSans-Regular.ttf"), false, false),
-    ("NotoSans-Bold", include_bytes!("../../../assets/fonts/whiq/NotoSans-Bold.ttf"), true, false),
-    ("NotoSansArabic-Regular", include_bytes!("../../../assets/fonts/whiq/NotoSansArabic-Regular.ttf"), false, true),
-    ("NotoSansArabic-Bold", include_bytes!("../../../assets/fonts/whiq/NotoSansArabic-Bold.ttf"), true, true),
-];
-#[cfg(target_arch = "wasm32")]
-const BUNDLED: &[(&str, &[u8], bool, bool)] = &[];
-
-fn load(name: &'static str, data: &'static [u8], bold: bool, arabic: bool) -> Option<Face> {
+fn load(cf: &'static CraftFont, italic: bool, weight: u16, variable: bool) -> Option<Face> {
+    let data = cf.bytes;
     let f = skrifa::FontRef::new(data).ok()?;
-    let m = f.metrics(Size::unscaled(), LocationRef::default());
     let hb = harfrust::FontRef::new(data).ok()?;
+    let mut variations = Vec::new();
+    let location = if variable {
+        let wght = f.axes().iter().find(|a| a.tag() == skrifa::Tag::new(b"wght"));
+        let value = wght.as_ref().map(|a| f32::from(weight).clamp(a.min_value(), a.max_value())).unwrap_or(f32::from(weight));
+        if wght.is_some() {
+            variations.push((*b"wght", value));
+        }
+        f.axes().location(variations.iter().map(|(t, v)| (skrifa::Tag::new(t), *v)))
+    } else {
+        Location::default()
+    };
+    let m = f.metrics(Size::unscaled(), LocationRef::from(&location));
     let bbox = m.bounds.map(|b| [b.x_min, b.y_min, b.x_max, b.y_max]).unwrap_or([0.0, m.descent, f32::from(m.units_per_em), m.ascent]);
+    let instance = (!variations.is_empty())
+        .then(|| ShaperInstance::from_variations(&hb, variations.iter().map(|(t, v)| harfrust::Variation { tag: harfrust::Tag::new(t), value: *v })));
+    let style = match (weight >= 600, italic) {
+        (false, false) => "Regular",
+        (true, false) => "Bold",
+        (false, true) => "Italic",
+        (true, true) => "BoldItalic",
+    };
+    let family_ps: String = cf.family.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
     Some(Face {
-        name,
+        name: format!("{family_ps}-{style}"),
+        family: cf.family,
         data,
-        bold,
-        arabic,
+        bold: weight >= 600,
+        weight,
+        italic,
+        arabic: cf.scripts.contains(&"Arab"),
+        scripts: cf.scripts,
+        variations,
         upem: f32::from(m.units_per_em.max(1)),
         ascent: m.ascent,
         descent: -m.descent,
         cap_height: m.cap_height.unwrap_or(m.ascent * 0.7),
+        italic_angle: m.italic_angle,
         bbox,
+        location,
         shaper: ShaperData::new(&hb),
+        instance,
     })
 }
 
-/// The bundled faces, parsed once. Empty on the web.
+/// Every face, parsed once: the craft-fonts files, each variable font as a regular and a bold
+/// instance. Empty without craft-fonts and on the web.
 pub fn faces() -> &'static [Face] {
     static FACES: OnceLock<Vec<Face>> = OnceLock::new();
-    FACES.get_or_init(|| BUNDLED.iter().filter_map(|(n, d, b, a)| load(n, d, *b, *a)).collect())
+    FACES.get_or_init(|| {
+        let mut out: Vec<Face> = Vec::new();
+        for cf in CRAFT_FONTS {
+            // A variable font (a weight axis), whatever its manifest style says.
+            let variable = skrifa::FontRef::new(cf.bytes).is_ok_and(|f| f.axes().iter().any(|a| a.tag() == skrifa::Tag::new(b"wght")));
+            match static_style(cf.style).filter(|_| !variable) {
+                Some((italic, weight)) => out.extend(load(cf, italic, weight, false)),
+                None => {
+                    let italic = cf.style.to_ascii_lowercase().contains("italic");
+                    out.extend(load(cf, italic, 400, true));
+                    out.extend(load(cf, italic, 700, true));
+                }
+            }
+        }
+        // Unique names (a family listed twice, or a static face next to an instance).
+        let mut seen: Vec<String> = Vec::new();
+        for f in out.iter_mut() {
+            let base = f.name.clone();
+            let mut k = 2;
+            while seen.contains(&f.name) {
+                f.name = format!("{base}{k}");
+                k += 1;
+            }
+            seen.push(f.name.clone());
+        }
+        out.truncate(250);
+        out
+    })
 }
 
-/// Are fonts available to shape and embed (native builds)?
+/// Are fonts available to shape and embed (a native build with craft-fonts)?
 pub fn available() -> bool {
-    faces().len() >= 2
-}
-
-/// Index of the face for (bold, arabic), falling back to any face.
-fn face_index(bold: bool, arabic: bool) -> u8 {
-    let f = faces();
-    f.iter()
-        .position(|x| x.bold == bold && x.arabic == arabic)
-        .or_else(|| f.iter().position(|x| x.arabic == arabic))
-        .or_else(|| (!f.is_empty()).then_some(0))
-        .unwrap_or(0) as u8
+    faces().iter().any(|f| f.scripts.contains(&"Latn"))
 }
 
 /// The face at `i`.
 pub fn face(i: u8) -> Option<&'static Face> {
     faces().get(usize::from(i))
+}
+
+/// Open substitutes for the fonts spreadsheets ask for (metric-compatible where one exists).
+const ALIASES: &[(&str, &str)] = &[
+    ("calibri", "Carlito"),
+    ("calibri light", "Carlito"),
+    ("aptos", "Carlito"),
+    ("aptos narrow", "Carlito"),
+    ("aptos display", "Carlito"),
+    ("segoe ui", "Carlito"),
+    ("candara", "Carlito"),
+    ("corbel", "Carlito"),
+    ("cambria", "Caladea"),
+    ("cambria math", "Caladea"),
+    ("constantia", "Caladea"),
+    ("arial", "Liberation Sans"),
+    ("arial narrow", "Liberation Sans"),
+    ("arial unicode ms", "Liberation Sans"),
+    ("helvetica", "Liberation Sans"),
+    ("helvetica neue", "Liberation Sans"),
+    ("tahoma", "Liberation Sans"),
+    ("verdana", "Liberation Sans"),
+    ("trebuchet ms", "Liberation Sans"),
+    ("century gothic", "Liberation Sans"),
+    ("sans-serif", "Liberation Sans"),
+    ("times new roman", "Liberation Serif"),
+    ("times", "Liberation Serif"),
+    ("georgia", "Liberation Serif"),
+    ("garamond", "Liberation Serif"),
+    ("book antiqua", "Liberation Serif"),
+    ("palatino linotype", "Liberation Serif"),
+    ("traditional arabic", "Liberation Serif"),
+    ("simplified arabic", "Liberation Serif"),
+    ("serif", "Liberation Serif"),
+    ("courier new", "Liberation Mono"),
+    ("courier", "Liberation Mono"),
+    ("consolas", "Liberation Mono"),
+    ("lucida console", "Liberation Mono"),
+    ("monospace", "Liberation Mono"),
+    ("source sans pro", "Source Sans 3"),
+    ("source serif pro", "Source Serif 4"),
+];
+
+/// The default family (Excel's default font is Calibri).
+const DEFAULT_FAMILIES: &[&str] = &["Carlito", "Liberation Sans", "Source Sans 3", "Inter"];
+
+/// The embedded family a font name is drawn in: the family itself, its open substitute, or the
+/// default (Carlito). `None` without fonts.
+pub fn resolve_family(name: &str) -> Option<&'static str> {
+    let fs = faces();
+    let has = |n: &str| fs.iter().find(|f| f.family.eq_ignore_ascii_case(n)).map(|f| f.family);
+    let n = name.trim().trim_matches('"').trim_matches('\'');
+    if !n.is_empty()
+        && let Some(f) = has(n)
+    {
+        return Some(f);
+    }
+    let lower = n.to_ascii_lowercase();
+    if let Some((_, sub)) = ALIASES.iter().find(|(a, _)| *a == lower)
+        && let Some(f) = has(sub)
+    {
+        return Some(f);
+    }
+    DEFAULT_FAMILIES.iter().find_map(|d| has(d)).or_else(|| fs.iter().find(|f| f.scripts.contains(&"Latn")).map(|f| f.family))
+}
+
+/// The face of `family` closest to (bold, italic).
+fn styled(family: &str, bold: bool, italic: bool) -> Option<u8> {
+    let target: i32 = if bold { 700 } else { 400 };
+    faces()
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.family == family)
+        .min_by_key(|(_, f)| (if f.italic == italic { 0 } else { 1000 }) + (i32::from(f.weight) - target).abs() + i32::from(f.is_variable()))
+        .map(|(i, _)| i as u8)
+}
+
+/// The face for text in font `family` (any name), bold and italic as asked.
+pub fn face_for(family: &str, bold: bool, italic: bool) -> Option<u8> {
+    styled(resolve_family(family)?, bold, italic)
+}
+
+/// The Arabic face at this weight.
+fn arabic_face(bold: bool) -> Option<u8> {
+    let fam = faces().iter().find(|f| f.arabic)?.family;
+    styled(fam, bold, false)
+}
+
+/// ISO 15924 tags a character's script is covered by.
+fn script_tags(c: char) -> &'static [&'static str] {
+    match c.script() {
+        Script::Han => &["Hans", "Jpan", "Hant", "Kore"],
+        Script::Hiragana | Script::Katakana => &["Jpan"],
+        Script::Hangul => &["Kore"],
+        Script::Thai => &["Thai"],
+        Script::Arabic => &["Arab"],
+        Script::Hebrew => &["Hebr"],
+        Script::Devanagari => &["Deva"],
+        _ => &[],
+    }
+}
+
+/// A face that has `c`, styled like the text (first one whose script covers it, else any).
+fn fallback(c: char, bold: bool, italic: bool) -> Option<u8> {
+    let fs = faces();
+    let tags = script_tags(c);
+    let mut families: Vec<&'static str> = Vec::new();
+    // By script tag in order, sans-serif families (Gothic, Sans) before the others.
+    let sans = |f: &str| f.contains("Gothic") || f.contains("Sans");
+    for tag in tags {
+        let mut here: Vec<&'static str> = Vec::new();
+        for f in fs.iter().filter(|f| f.scripts.contains(tag)) {
+            if !families.contains(&f.family) && !here.contains(&f.family) {
+                here.push(f.family);
+            }
+        }
+        here.sort_by_key(|f| !sans(f));
+        families.extend(here);
+    }
+    for f in fs {
+        if !families.contains(&f.family) {
+            families.push(f.family);
+        }
+    }
+    families.into_iter().filter_map(|fam| styled(fam, bold, italic)).find(|&i| face(i).is_some_and(|f| f.glyph(c) != 0))
 }
 
 // ---------------------------------------------------------------- direction
@@ -171,6 +390,8 @@ pub struct Glyph {
     pub advance: f32,
     /// The characters this glyph shows (first glyph of a cluster), for text extraction.
     pub text: Option<String>,
+    /// Italic text in a face with no italic (Arabic): drawn slanted.
+    pub slant: bool,
 }
 
 /// A line laid out in visual order, left to right.
@@ -194,11 +415,30 @@ fn neutral(c: char) -> bool {
     matches!(c.script(), Script::Common | Script::Inherited | Script::Unknown)
 }
 
+/// How a line is set: font family (any name, see [`resolve_family`]), bold, italic.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TextStyle<'a> {
+    pub family: &'a str,
+    pub bold: bool,
+    pub italic: bool,
+}
+
 /// Face per character of `text` (logical order).
-fn assign_faces(text: &str, bold: bool) -> Vec<u8> {
-    let latin = face_index(bold, false);
-    let arabic = face_index(bold, true);
+fn assign_faces(text: &str, st: &TextStyle<'_>) -> Vec<u8> {
+    let latin = face_for(st.family, st.bold, st.italic).unwrap_or(0);
+    let arabic = arabic_face(st.bold).unwrap_or(latin);
     let has = |f: u8, c: char| face(f).is_some_and(|x| x.glyph(c) != 0);
+    let pick = |preferred: u8, c: char| -> u8 {
+        if has(preferred, c) {
+            preferred
+        } else if preferred != latin && has(latin, c) {
+            latin
+        } else if preferred != arabic && has(arabic, c) {
+            arabic
+        } else {
+            fallback(c, st.bold, st.italic).unwrap_or(preferred)
+        }
+    };
     let chars: Vec<char> = text.chars().collect();
     let strong: Vec<Option<u8>> = chars
         .iter()
@@ -206,11 +446,9 @@ fn assign_faces(text: &str, bold: bool) -> Vec<u8> {
             if neutral(c) {
                 None
             } else if arabic_script(c) {
-                Some(if has(arabic, c) || !has(latin, c) { arabic } else { latin })
-            } else if has(latin, c) || !has(arabic, c) {
-                Some(latin)
+                Some(pick(arabic, c))
             } else {
-                Some(arabic)
+                Some(pick(latin, c))
             }
         })
         .collect();
@@ -219,17 +457,8 @@ fn assign_faces(text: &str, bold: bool) -> Vec<u8> {
     for (i, &c) in chars.iter().enumerate() {
         let f = match strong.get(i).copied().flatten() {
             Some(f) => f,
-            None => {
-                // A neutral stays with the run it is in: the previous strong face, else the next.
-                let near = prev.or_else(|| strong.iter().skip(i + 1).flatten().next().copied()).unwrap_or(latin);
-                if has(near, c) || !has(if near == latin { arabic } else { latin }, c) {
-                    near
-                } else if near == latin {
-                    arabic
-                } else {
-                    latin
-                }
-            }
+            // A neutral stays with the run it is in: the previous strong face, else the next.
+            None => pick(prev.or_else(|| strong.iter().skip(i + 1).flatten().next().copied()).unwrap_or(latin), c),
         };
         if strong.get(i).copied().flatten().is_some() {
             prev = Some(f);
@@ -241,10 +470,11 @@ fn assign_faces(text: &str, bold: bool) -> Vec<u8> {
 
 /// Shapes one run of one face and direction; returns glyphs (visual order) with `x` relative
 /// to the run start and the run's advance.
-fn shape_run(text: &str, offset: usize, full: &str, f: u8, rtl: bool, scale: f32) -> (Vec<Glyph>, f32) {
+fn shape_run(text: &str, offset: usize, full: &str, f: u8, rtl: bool, scale: f32, italic: bool) -> (Vec<Glyph>, f32) {
     let Some(fc) = face(f) else { return (vec![], 0.0) };
     let Some(font) = fc.font() else { return (vec![], 0.0) };
-    let shaper = fc.shaper.shaper(&font).instance(None).build();
+    let shaper = fc.shaper.shaper(&font).instance(fc.instance.as_ref()).build();
+    let slant = italic && !fc.italic;
     let mut buf = UnicodeBuffer::new();
     for (i, c) in text.char_indices() {
         buf.add(c, (offset + i) as u32);
@@ -286,15 +516,22 @@ fn shape_run(text: &str, offset: usize, full: &str, f: u8, rtl: bool, scale: f32
             dy: -(pos.y_offset as f32) * scale,
             advance: pos.x_advance as f32 * scale,
             text,
+            slant,
         });
         pen += pos.x_advance as f32 * scale;
     }
     (out, pen)
 }
 
-/// Lays out one line of `text` (newlines are treated as spaces) at `size`, in `bold` or
-/// regular, with paragraph direction `base` (`None`: the first strong character's).
+/// Lays out one line of `text` (newlines are treated as spaces) at `size` in the default family,
+/// with paragraph direction `base` (`None`: the first strong character's).
 pub fn shape(text: &str, size: f32, bold: bool, base: Option<Dir>) -> Line {
+    shape_styled(text, size, &TextStyle { family: "", bold, italic: false }, base)
+}
+
+/// Lays out one line of `text` (newlines are treated as spaces) at `size` in `style`, with
+/// paragraph direction `base` (`None`: the first strong character's).
+pub fn shape_styled(text: &str, size: f32, style: &TextStyle<'_>, base: Option<Dir>) -> Line {
     if !available() || text.is_empty() || !size.is_finite() || size <= 0.0 {
         return Line::default();
     }
@@ -303,7 +540,7 @@ pub fn shape(text: &str, size: f32, bold: bool, base: Option<Dir>) -> Line {
     let base = base.or_else(|| base_direction(&text)).unwrap_or(Dir::Ltr);
     let level = if base == Dir::Rtl { unicode_bidi::Level::rtl() } else { unicode_bidi::Level::ltr() };
     let info = unicode_bidi::BidiInfo::new(&text, Some(level));
-    let faces_of = assign_faces(&text, bold);
+    let faces_of = assign_faces(&text, style);
     let byte_face: Vec<(usize, u8)> = text.char_indices().map(|(i, _)| i).zip(faces_of.iter().copied()).collect();
     let face_at = |b: usize| byte_face.iter().find(|(i, _)| *i == b).map(|(_, f)| *f).unwrap_or(0);
     let mut line = Line { rtl: base == Dir::Rtl, text: text.clone(), ..Line::default() };
@@ -333,7 +570,7 @@ pub fn shape(text: &str, size: f32, bold: bool, base: Option<Dir>) -> Line {
                 let (Some(&(s, _, f)), Some(&e)) = (pieces.get(k), ends.get(k)) else { continue };
                 let Some(piece) = text.get(s..e) else { continue };
                 let scale = face(f).map_or(0.0, |x| size / x.upem);
-                let (glyphs, adv) = shape_run(piece, s, &text, f, rtl, scale);
+                let (glyphs, adv) = shape_run(piece, s, &text, f, rtl, scale, style.italic);
                 for mut g in glyphs {
                     g.x += pen;
                     line.glyphs.push(g);
@@ -346,9 +583,14 @@ pub fn shape(text: &str, size: f32, bold: bool, base: Option<Dir>) -> Line {
     line
 }
 
-/// Width of `text` laid out at `size`.
+/// Width of `text` laid out at `size` in the default family.
 pub fn width(text: &str, size: f32, bold: bool) -> f32 {
     shape(text, size, bold, None).width
+}
+
+/// Width of `text` laid out at `size` in `style`.
+pub fn width_styled(text: &str, size: f32, style: &TextStyle<'_>) -> f32 {
+    shape_styled(text, size, style, None).width
 }
 
 // ---------------------------------------------------------------- outlines
@@ -388,7 +630,18 @@ pub fn outline(f: u8, gid: u16, size: f32, pen: &mut dyn Pen) -> bool {
     let Ok(font) = skrifa::FontRef::new(fc.data) else { return false };
     let glyphs = font.outline_glyphs();
     let Some(g) = glyphs.get(skrifa::GlyphId::new(u32::from(gid))) else { return false };
-    g.draw(DrawSettings::unhinted(Size::new(size), LocationRef::default()), &mut Flip(pen)).is_ok()
+    g.draw(DrawSettings::unhinted(Size::new(size), LocationRef::from(&fc.location)), &mut Flip(pen)).is_ok()
+}
+
+/// For tests: are fonts there? Without craft-fonts a test that needs them is skipped, unless
+/// `CRAFT_FONTS_REQUIRED` is set (CI, releases), where that is a failure.
+pub fn fonts_for_tests() -> bool {
+    if available() {
+        return true;
+    }
+    assert!(std::env::var_os("CRAFT_FONTS_REQUIRED").is_none(), "CRAFT_FONTS_REQUIRED is set but no craft-fonts are embedded (CRAFT_FONTS_DIR)");
+    eprintln!("skipped: built without craft-fonts (set CRAFT_FONTS_DIR)");
+    false
 }
 
 #[cfg(test)]
@@ -396,19 +649,66 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
+    fn latin() -> u8 {
+        face_for("", false, false).unwrap()
+    }
+    fn arabic() -> u8 {
+        arabic_face(false).unwrap()
+    }
+
     #[test]
-    fn fonts_are_bundled() {
-        assert!(available());
-        assert_eq!(faces().len(), 4);
-        let latin = face(face_index(false, false)).unwrap();
-        let arabic = face(face_index(false, true)).unwrap();
-        assert_ne!(latin.glyph('A'), 0);
-        assert_ne!(arabic.glyph('م'), 0);
-        assert_eq!(latin.glyph('م'), 0, "Noto Sans has no Arabic: the fallback is needed");
+    fn craft_fonts_are_embedded() {
+        if !fonts_for_tests() {
+            return;
+        }
+        let l = face(latin()).unwrap();
+        let a = face(arabic()).unwrap();
+        assert_eq!(l.family, "Carlito", "Calibri's metric-compatible substitute is the default");
+        assert_ne!(l.glyph('A'), 0);
+        assert_ne!(a.glyph('م'), 0);
+        assert_eq!(l.glyph('م'), 0, "Carlito has no Arabic: the fallback is needed");
+        // Real italic and bold-italic faces.
+        for (b, i) in [(false, true), (true, true), (true, false)] {
+            let f = face(face_for("Calibri", b, i).unwrap()).unwrap();
+            assert_eq!((f.family, f.bold, f.italic), ("Carlito", b, i));
+            assert!(!f.is_variable());
+        }
+        assert!(face(face_for("Calibri", false, true).unwrap()).unwrap().italic_angle < 0.0);
+        // Office fonts map to their substitutes; unknown names to the default.
+        assert_eq!(resolve_family("Arial"), Some("Liberation Sans"));
+        assert_eq!(resolve_family("Times New Roman"), Some("Liberation Serif"));
+        assert_eq!(resolve_family("Courier New"), Some("Liberation Mono"));
+        assert_eq!(resolve_family("Cambria"), Some("Caladea"));
+        assert_eq!(resolve_family("Lato"), Some("Lato"));
+        assert_eq!(resolve_family("No Such Font"), Some("Carlito"));
+        // The variable Arabic font gives a regular and a real bold instance.
+        let ab = face(arabic_face(true).unwrap()).unwrap();
+        assert!(ab.bold && ab.arabic && ab.is_variable(), "{}", ab.name);
+        assert!(faces().iter().map(|f| &f.name).collect::<std::collections::HashSet<_>>().len() == faces().len());
+    }
+
+    #[test]
+    fn italic_uses_the_italic_face_and_arabic_is_slanted() {
+        if !fonts_for_tests() {
+            return;
+        }
+        let st = TextStyle { family: "Calibri", bold: false, italic: true };
+        let l = shape_styled("Total مجموع", 12.0, &st, None);
+        let it = face_for("Calibri", false, true).unwrap();
+        assert!(l.glyphs.iter().filter(|g| g.face == it).all(|g| !g.slant));
+        assert!(l.glyphs.iter().any(|g| g.face == it));
+        assert!(l.glyphs.iter().filter(|g| face(g.face).unwrap().arabic).all(|g| g.slant), "no Arabic italic exists");
+        let upright = shape_styled("Total", 12.0, &TextStyle { family: "Calibri", ..TextStyle::default() }, None);
+        let italic = shape_styled("Total", 12.0, &st, None);
+        assert_ne!(upright.glyphs[0].face, italic.glyphs[0].face, "the italic face, not a slanted copy");
+        assert!(face(italic.glyphs[0].face).unwrap().italic);
     }
 
     #[test]
     fn latin_shapes_left_to_right() {
+        if !fonts_for_tests() {
+            return;
+        }
         let l = shape("Hello", 10.0, false, None);
         assert_eq!(l.glyphs.len(), 5);
         assert!(!l.rtl);
@@ -421,36 +721,42 @@ mod tests {
 
     #[test]
     fn arabic_is_joined_and_right_to_left() {
+        if !fonts_for_tests() {
+            return;
+        }
         let text = "مرحبا";
         let l = shape(text, 12.0, false, None);
         assert!(l.rtl, "an Arabic line is right-to-left by default");
-        let arabic = face_index(false, true);
+        let arabic = arabic();
         assert!(l.glyphs.iter().all(|g| g.face == arabic && g.gid != 0), "{l:?}");
-        // Joined forms differ from the isolated (cmap) glyphs: shaping happened.
         let f = face(arabic).unwrap();
         let isolated: Vec<u16> = text.chars().map(|c| f.glyph(c)).collect();
         let shaped: Vec<u16> = l.glyphs.iter().map(|g| g.gid).collect();
         assert_ne!(shaped, isolated, "contextual forms are used");
-        // Visual order: the first letter (logical) is drawn rightmost.
         let first = l.glyphs.iter().find(|g| g.text.as_deref().is_some_and(|t| t.starts_with('م'))).unwrap();
         assert!(first.x >= l.glyphs.iter().map(|g| g.x).fold(0.0, f32::max) - 0.01, "{l:?}");
+        // Bold Arabic is the bold instance, and wider.
+        assert!(width(text, 12.0, true) > l.width);
     }
 
     #[test]
     fn mixed_lines_keep_each_script_in_its_face() {
+        if !fonts_for_tests() {
+            return;
+        }
         let l = shape("Total: 1,250 ريال", 10.0, false, None);
         assert!(!l.rtl, "the first strong character is Latin");
-        let latin = face_index(false, false);
-        let arabic = face_index(false, true);
-        assert!(l.glyphs.iter().any(|g| g.face == latin));
-        assert!(l.glyphs.iter().any(|g| g.face == arabic));
+        assert!(l.glyphs.iter().any(|g| g.face == latin()));
+        assert!(l.glyphs.iter().any(|g| g.face == arabic()));
         assert!(l.glyphs.iter().all(|g| g.gid != 0), "no missing glyphs: {l:?}");
         let r = shape("المجموع 1250 SAR", 10.0, false, None);
         assert!(r.rtl);
-        // In a right-to-left line, the Latin "SAR" (logically last) is drawn leftmost.
         let sar = r.glyphs.iter().position(|g| g.text.as_deref() == Some("S")).unwrap();
         let alif = r.glyphs.iter().position(|g| g.text.as_deref().is_some_and(|t| t.starts_with('ا'))).unwrap();
         assert!(r.glyphs[sar].x < r.glyphs[alif].x);
+        // CJK goes to a CJK face.
+        let c = shape("合計 Total", 10.0, false, None);
+        assert!(c.glyphs.iter().all(|g| g.gid != 0), "{c:?}");
     }
 
     #[test]
@@ -465,15 +771,17 @@ mod tests {
             fn curve_to(&mut self, _: f32, _: f32, _: f32, _: f32, _: f32, _: f32) {}
             fn close(&mut self) {}
         }
-        let l = shape("ب", 20.0, false, None);
-        let mut c = Count(0);
-        assert!(outline(l.glyphs[0].face, l.glyphs[0].gid, 20.0, &mut c));
-        assert!(c.0 >= 1);
         assert_eq!(base_direction("123 abc"), Some(Dir::Ltr));
         assert_eq!(base_direction("  ١٢ مرحبا"), Some(Dir::Rtl));
         assert_eq!(base_direction("123"), None);
         assert!(is_complex("مرحبا") && !is_complex("Hello, world"));
-        // An explicit direction wins.
+        if !fonts_for_tests() {
+            return;
+        }
+        let l = shape("ب", 20.0, true, None);
+        let mut c = Count(0);
+        assert!(outline(l.glyphs[0].face, l.glyphs[0].gid, 20.0, &mut c));
+        assert!(c.0 >= 1);
         assert!(shape("abc", 10.0, false, Some(Dir::Rtl)).rtl);
         assert!(shape("", 10.0, false, None).glyphs.is_empty());
         assert!(shape("x", f32::NAN, false, None).glyphs.is_empty());

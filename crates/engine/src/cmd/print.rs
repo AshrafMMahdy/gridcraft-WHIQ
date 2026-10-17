@@ -620,9 +620,25 @@ pub(crate) trait Canvas {
     fn circle(&mut self, cx: f32, cy: f32, r: f32, fill: Option<Rgb>, stroke: Option<(Rgb, f32)>);
     /// Text with its baseline origin at `(x, y)`, rotated clockwise by `angle`, in paragraph
     /// direction `base` (`None`: from its first strong character).
-    fn text_dir(&mut self, x: f32, y: f32, size: f32, font: Font, color: Rgb, text: &str, angle: f32, base: Option<gridcraft_text::Dir>);
-    /// Width of `text` as this surface draws it.
-    fn measure(&self, font: Font, size: f32, text: &str) -> f32;
+    #[allow(clippy::too_many_arguments)]
+    fn text_dir(
+        &mut self,
+        x: f32,
+        y: f32,
+        size: f32,
+        font: Font,
+        family: Option<&str>,
+        color: Rgb,
+        text: &str,
+        angle: f32,
+        base: Option<gridcraft_text::Dir>,
+    );
+    /// Width of `text` as this surface draws it, in font family `family` (a cell's font name;
+    /// `None`: the standard font's class).
+    fn measure_in(&self, font: Font, family: Option<&str>, size: f32, text: &str) -> f32;
+    fn measure(&self, font: Font, size: f32, text: &str) -> f32 {
+        self.measure_in(font, None, size, text)
+    }
     fn image_rgba(&mut self, x: f32, y: f32, w: f32, h: f32, rgba: &[u8], pw: u32, ph: u32);
     fn save(&mut self);
     fn restore(&mut self);
@@ -632,10 +648,10 @@ pub(crate) trait Canvas {
         self.stroke_line_dashed(x0, y0, x1, y1, width, color, &[]);
     }
     fn text(&mut self, x: f32, y: f32, size: f32, font: Font, color: Rgb, text: &str) {
-        self.text_dir(x, y, size, font, color, text, 0.0, None);
+        self.text_dir(x, y, size, font, None, color, text, 0.0, None);
     }
     fn text_rotated(&mut self, x: f32, y: f32, size: f32, font: Font, color: Rgb, text: &str, angle: f32) {
-        self.text_dir(x, y, size, font, color, text, angle, None);
+        self.text_dir(x, y, size, font, None, color, text, angle, None);
     }
 }
 
@@ -658,11 +674,22 @@ impl Canvas for Page {
     fn circle(&mut self, cx: f32, cy: f32, r: f32, fill: Option<Rgb>, stroke: Option<(Rgb, f32)>) {
         Page::circle(self, cx, cy, r, fill, stroke);
     }
-    fn text_dir(&mut self, x: f32, y: f32, size: f32, font: Font, color: Rgb, text: &str, angle: f32, base: Option<gridcraft_text::Dir>) {
-        Page::text_dir(self, x, y, size, font, color, text, angle, base);
+    fn text_dir(
+        &mut self,
+        x: f32,
+        y: f32,
+        size: f32,
+        font: Font,
+        family: Option<&str>,
+        color: Rgb,
+        text: &str,
+        angle: f32,
+        base: Option<gridcraft_text::Dir>,
+    ) {
+        Page::text_family(self, x, y, size, font, family, color, text, angle, base);
     }
-    fn measure(&self, font: Font, size: f32, text: &str) -> f32 {
-        Page::measure(self, font, size, text)
+    fn measure_in(&self, font: Font, family: Option<&str>, size: f32, text: &str) -> f32 {
+        Page::measure_family(self, font, family, size, text)
     }
     fn image_rgba(&mut self, x: f32, y: f32, w: f32, h: f32, rgba: &[u8], pw: u32, ph: u32) {
         Page::image_rgba(self, x, y, w, h, rgba, pw, ph);
@@ -697,11 +724,27 @@ impl Canvas for gridcraft_raster::Canvas {
     fn circle(&mut self, cx: f32, cy: f32, r: f32, fill: Option<Rgb>, stroke: Option<(Rgb, f32)>) {
         gridcraft_raster::Canvas::circle(self, cx, cy, r, fill, stroke);
     }
-    fn text_dir(&mut self, x: f32, y: f32, size: f32, font: Font, color: Rgb, text: &str, angle: f32, base: Option<gridcraft_text::Dir>) {
-        gridcraft_raster::Canvas::text(self, x, y, size, font.is_bold(), font.is_italic(), color, text, angle, base);
+    fn text_dir(
+        &mut self,
+        x: f32,
+        y: f32,
+        size: f32,
+        font: Font,
+        family: Option<&str>,
+        color: Rgb,
+        text: &str,
+        angle: f32,
+        base: Option<gridcraft_text::Dir>,
+    ) {
+        let st = raster_style(font, family);
+        gridcraft_raster::Canvas::text_styled(self, x, y, size, &st, color, text, angle, base);
     }
-    fn measure(&self, font: Font, size: f32, text: &str) -> f32 {
-        if gridcraft_text::available() { gridcraft_text::width(text, size, font.is_bold()) } else { gridcraft_pdf::text_width(font, size, text) }
+    fn measure_in(&self, font: Font, family: Option<&str>, size: f32, text: &str) -> f32 {
+        if gridcraft_text::available() {
+            gridcraft_text::width_styled(text, size, &raster_style(font, family))
+        } else {
+            gridcraft_pdf::text_width(font, size, text)
+        }
     }
     fn image_rgba(&mut self, x: f32, y: f32, w: f32, h: f32, rgba: &[u8], pw: u32, ph: u32) {
         gridcraft_raster::Canvas::image_rgba(self, x, y, w, h, rgba, pw, ph);
@@ -715,6 +758,17 @@ impl Canvas for gridcraft_raster::Canvas {
     fn clip_rect(&mut self, x: f32, y: f32, w: f32, h: f32) {
         gridcraft_raster::Canvas::clip_rect(self, x, y, w, h);
     }
+}
+
+/// The embedded-font style for a standard font, in `family` when given (Helvetica draws as
+/// Calibri, Times as Times New Roman, Courier as Courier New).
+fn raster_style(font: Font, family: Option<&str>) -> gridcraft_text::TextStyle<'_> {
+    let fallback = match font {
+        Font::TimesRoman | Font::TimesBold | Font::TimesItalic | Font::TimesBoldItalic => "Times New Roman",
+        Font::Courier | Font::CourierBold | Font::CourierOblique | Font::CourierBoldOblique => "Courier New",
+        _ => "Calibri",
+    };
+    gridcraft_text::TextStyle { family: family.filter(|f| !f.trim().is_empty()).unwrap_or(fallback), bold: font.is_bold(), italic: font.is_italic() }
 }
 
 /// WHIQ: a right-to-left sheet: everything the cell painter draws is reflected about the
@@ -759,15 +813,26 @@ impl Canvas for Mirror<'_> {
         let cx = self.x(cx);
         self.inner.circle(cx, cy, r, fill, stroke);
     }
-    fn text_dir(&mut self, x: f32, y: f32, size: f32, font: Font, color: Rgb, text: &str, angle: f32, base: Option<gridcraft_text::Dir>) {
+    fn text_dir(
+        &mut self,
+        x: f32,
+        y: f32,
+        size: f32,
+        font: Font,
+        family: Option<&str>,
+        color: Rgb,
+        text: &str,
+        angle: f32,
+        base: Option<gridcraft_text::Dir>,
+    ) {
         // The text's box is reflected; its glyphs are not.
-        let w = self.inner.measure(font, size, text);
+        let w = self.inner.measure_in(font, family, size, text);
         let cos = if angle.is_finite() { angle.cos() } else { 1.0 };
         let x = self.x(x) - w * cos;
-        self.inner.text_dir(x, y, size, font, color, text, angle, base);
+        self.inner.text_dir(x, y, size, font, family, color, text, angle, base);
     }
-    fn measure(&self, font: Font, size: f32, text: &str) -> f32 {
-        self.inner.measure(font, size, text)
+    fn measure_in(&self, font: Font, family: Option<&str>, size: f32, text: &str) -> f32 {
+        self.inner.measure_in(font, family, size, text)
     }
     fn image_rgba(&mut self, x: f32, y: f32, w: f32, h: f32, rgba: &[u8], pw: u32, ph: u32) {
         let x = self.x(x + w);
@@ -1258,6 +1323,8 @@ fn draw_text(
     let st = &l.style;
     let mut size = st.font.size.clamp(1.0, 409.0) * b.scale;
     let font = font_for(st);
+    // The cell's font family, for embedded fonts (Calibri → Carlito, Arial → Liberation Sans…).
+    let fam = Some(st.font.name.as_str());
     let pad = PAD_PX * b.k;
     let indent = st.align.indent as f32 * 9.0 * b.k;
     let avail = (w - 2.0 * pad - indent).max(0.0);
@@ -1274,7 +1341,7 @@ fn draw_text(
     } else if code == "General"
         && let Value::Number(n) = v
     {
-        let digit = pg.measure(font, size, "0").max(0.1);
+        let digit = pg.measure_in(font, fam, size, "0").max(0.1);
         let max_chars = (avail / digit).floor().max(1.0) as usize;
         gridcraft_numfmt::format_general_fit(n, max_chars.min(11)).unwrap_or_else(|| "#".repeat(max_chars.min(255)))
     } else {
@@ -1286,15 +1353,15 @@ fn draw_text(
     if text.is_empty() {
         return;
     }
-    let mut tw = pg.measure(font, size, &text);
+    let mut tw = pg.measure_in(font, fam, size, &text);
     if st.align.shrink && !wrap && tw > avail && tw > 0.0 {
         size = (size * avail / tw).max(1.0);
-        tw = pg.measure(font, size, &text);
+        tw = pg.measure_in(font, fam, size, &text);
     }
     if is_num && !wrap && tw > avail + 0.01 && !sh.show_formulas {
-        let hash = pg.measure(font, size, "#").max(0.1);
+        let hash = pg.measure_in(font, fam, size, "#").max(0.1);
         text = "#".repeat(((avail / hash).floor().max(1.0) as usize).min(255));
-        tw = pg.measure(font, size, &text);
+        tw = pg.measure_in(font, fam, size, &text);
     }
     // WHIQ: the text's direction (reading order, else its first strong character, else the
     // sheet's). General-aligned text starts at its reading start: an Arabic cell is right
@@ -1326,8 +1393,8 @@ fn draw_text(
     let rotated = rot != 0 && rot != 255;
     // Rotated text wraps along its own direction: upright (±90°) text to the row height.
     let lines: Vec<String> = match (wrap, rotated) {
-        (true, false) => wrap_lines_by(&text, avail.max(size), &|t| pg.measure(font, size, t)),
-        (true, true) if rot.abs() == 90 => wrap_lines_by(&text, (h - 2.0 * pad).max(size), &|t| pg.measure(font, size, t)),
+        (true, false) => wrap_lines_by(&text, avail.max(size), &|t| pg.measure_in(font, fam, size, t)),
+        (true, true) if rot.abs() == 90 => wrap_lines_by(&text, (h - 2.0 * pad).max(size), &|t| pg.measure_in(font, fam, size, t)),
         (true, true) => vec![text.lines().next().unwrap_or_default().to_string()],
         (false, _) => vec![text],
     };
@@ -1390,7 +1457,7 @@ fn draw_text(
             } else {
                 (x + pad + (last - i) * line_h, y + pad + size * 0.8)
             };
-            pg.text_dir(ox, oy, size, font, color, t, angle, dir);
+            pg.text_dir(ox, oy, size, font, fam, color, t, angle, dir);
         }
         pg.restore();
         return;
@@ -1401,7 +1468,7 @@ fn draw_text(
         let mut yy = y + pad + size * 0.8;
         for ch in chars {
             let s = ch.to_string();
-            let cw = pg.measure(font, size, &s);
+            let cw = pg.measure_in(font, fam, size, &s);
             pg.text(x + (w - cw) / 2.0, yy, size, font, color, &s);
             yy += line_h;
             if yy > y + h + line_h {
@@ -1412,7 +1479,7 @@ fn draw_text(
         return;
     }
     for (i, line) in lines.iter().enumerate() {
-        let lw = pg.measure(font, size, line);
+        let lw = pg.measure_in(font, fam, size, line);
         let lx = match h_align {
             HAlign::Right => x + w - pad - lw - indent,
             HAlign::Center => x + (w + across - lw) / 2.0,
@@ -1422,7 +1489,7 @@ fn draw_text(
         if ly - size > y + h || ly < y - line_h {
             continue;
         }
-        pg.text_dir(lx, ly, size, font, color, line, 0.0, dir);
+        pg.text_dir(lx, ly, size, font, fam, color, line, 0.0, dir);
         if st.font.underline != Underline::None {
             let uw = (size * 0.06).max(0.2);
             pg.stroke_line(lx, ly + size * 0.12, lx + lw, ly + size * 0.12, uw, color);
@@ -2218,6 +2285,9 @@ mod tests {
 
     #[test]
     fn arabic_cells_are_right_aligned_and_latin_left_aligned_in_png() {
+        if !gridcraft_text::fonts_for_tests() {
+            return;
+        }
         let mut s = s();
         s.execute("home.columnWidth", json!({"cols": "A:A", "chars": 30})).unwrap();
         s.execute("cell.set", json!({"cell": "A1", "input": "مرحبا"})).unwrap();
@@ -2259,6 +2329,9 @@ mod tests {
 
     #[test]
     fn pdf_embeds_subset_fonts_for_arabic_only_where_needed() {
+        if !gridcraft_text::fonts_for_tests() {
+            return;
+        }
         let mut s = s();
         s.execute("cell.set", json!({"cell": "A1", "input": "hello"})).unwrap();
         s.execute("cell.set", json!({"cell": "A2", "input": "الإجمالي"})).unwrap();
@@ -2266,7 +2339,7 @@ mod tests {
         assert!(contains(&pdf, "(hello) Tj"), "plain text keeps the standard font");
         assert!(contains(&pdf, "/Type0") && contains(&pdf, "+NotoSansArabic-Regular") && contains(&pdf, "/FontFile2"));
         let (pdf, _) = pdf_of(&mut s, json!({"fonts": "embedded"}));
-        assert!(!contains(&pdf, "(hello) Tj") && contains(&pdf, "+NotoSans-Regular"), "every string embedded");
+        assert!(!contains(&pdf, "(hello) Tj") && contains(&pdf, "+Carlito-Regular"), "every string embedded");
         let (pdf, _) = pdf_of(&mut s, json!({"fonts": "standard"}));
         assert!(!contains(&pdf, "/Type0"));
         assert!(s.execute("file.exportPdf", json!({"fonts": "bogus"})).is_err());

@@ -96,16 +96,12 @@ pipeline every `tools/call` goes through, `server_status`, `job_status`, error c
 
 ## 3. Arabic and complex text: shaping, bidi, embedded subset fonts, RTL sheets
 
-- **`crates/text` (`gridcraft-text`, layer 0, new).** Noto Sans and Noto Sans Arabic (regular,
-  bold; SIL OFL 1.1, `assets/fonts/whiq/`, ATTRIBUTION rows) are compiled into native builds, so
-  an Arabic fallback face is always in the binary (web builds carry none and keep the standard
-  PDF fonts). Lines are ordered with the Unicode Bidirectional Algorithm (`unicode-bidi`); the
+- **`crates/text` (`gridcraft-text`, layer 0, new).** Fonts come from craft-fonts (see "Fonts"
+  below). Lines are ordered with the Unicode Bidirectional Algorithm (`unicode-bidi`); the
   paragraph direction is the one given, else the first strong character's (an Arabic cell is
   RTL). Runs are shaped with HarfRust (Arabic joining, ligatures, marks, mirrored brackets);
-  characters pick a face by script, neutrals stay with their run, a face lacking a character
-  hands it to the other. Glyph outlines come from skrifa. *Deviation from upstream policy:*
-  upstream keeps fonts out of the repository (craft-fonts); the WHIQ contract requires an Arabic
-  fallback always present, so these four OFL faces are vendored, documented in ATTRIBUTION.md.
+  characters pick a face by script, neutrals stay with their run, a character the face lacks goes
+  to the first face that has it. Glyph outlines come from skrifa.
 - **PDF (`crates/pdf`).** New `TextMode`: `Standard` (upstream), `Auto` (standard fonts for
   plain left-to-right WinAnsi text, embedded shaped text for everything else — the engine's new
   default) and `Embedded` (every string; the MCP `export_pdf` default). Embedded text is a Type0 /
@@ -237,6 +233,50 @@ pipeline every `tools/call` goes through, `server_status`, `job_status`, error c
   `lastModifiedBy` is the caller and `gridcraft-cli check` passes. Engine
   `build::tests::table_slicers_round_trip_through_xlsx`.
 
+## Fonts (round 2): craft-fonts, as in WordCraft and DeckCraft
+
+- The four Noto files vendored in round 1 are gone (`assets/fonts/whiq/` and their ATTRIBUTION
+  rows): fonts live in [storytold/craft-fonts](https://github.com/storytold/craft-fonts), as the
+  upstream rule says. `crates/text/build.rs` follows craft-fonts' `docs/integration.md` recipe and
+  DeckCraft's: with `CRAFT_FONTS_DIR=<checkout>` it embeds every font of `fonts/latin-manifest.txt`
+  and `fonts/manifest.txt`; without it exports use the PDF standard fonts (the app builds, tests and
+  runs; font-dependent tests skip, see below). `.cargo/config.toml` points `CRAFT_FONTS_DIR` at a
+  checkout next to this repository (`../craft-fonts`), like DeckCraft's.
+- **Pinned craft-fonts commit: `43913056ce82a3fdad0ef69f6b88d1dc922a8104`** (branch
+  `pr/latin-presentation-fonts`, the commit DeckCraft's CI and releases pin): Carlito (Calibri's
+  metric-compatible substitute), Caladea (Cambria), Liberation Sans / Serif / Mono (Arial, Times New
+  Roman, Courier New), each with **Regular, Bold, Italic and Bold Italic**, Inter, Lato, Source
+  Sans 3 / Serif 4, Merriweather, Poppins, Montserrat, Open Sans, Roboto, Nunito Sans, Playfair
+  Display; Noto Sans Arabic (variable: instanced at weight 400 and 700, so bold Arabic is the real
+  bold design); BIZ UDPGothic, BIZ UDMincho, Shippori Mincho (Japanese) and Noto Sans CJK SC
+  (Chinese, a CFF font, embedded as CIDFontType0 / `FontFile3 /OpenType`).
+- A cell's font name picks the family: the family itself when embedded (Lato, Roboto…), else its
+  open substitute (Calibri, Aptos, Segoe UI → Carlito; Cambria → Caladea; Arial, Helvetica,
+  Tahoma, Verdana → Liberation Sans; Times New Roman, Georgia → Liberation Serif; Courier New,
+  Consolas → Liberation Mono), else Carlito. **Italic and bold italic use the family's italic
+  faces** (PDF `ItalicAngle` and the Italic flag set); only a face with no italic design is slanted.
+- **`CRAFT_FONTS_REQUIRED=1`** (releases): the build fails when the checkout is missing, a manifest
+  is malformed, there is no Arabic font, or no Latin family has all four styles (an un-pinned
+  checkout without the Latin manifest fails here). Tests that need fonts fail instead of skipping
+  when it is set at test time.
+- `server_status` reports `fonts: {faces, families, default}`.
+- Binary size: the release `gridcraft-cli` grows from ~20 MB to ~80 MB (about 60 MB of fonts, CJK
+  included).
+
+**Release recipe:**
+
+```sh
+git clone https://github.com/storytold/craft-fonts ../craft-fonts
+git -C ../craft-fonts fetch origin pr/latin-presentation-fonts
+git -C ../craft-fonts checkout --detach 43913056ce82a3fdad0ef69f6b88d1dc922a8104
+CRAFT_FONTS_DIR=$PWD/../craft-fonts CRAFT_FONTS_REQUIRED=1 cargo build --release -p gridcraft-cli
+CRAFT_FONTS_DIR=$PWD/../craft-fonts CRAFT_FONTS_REQUIRED=1 cargo test
+tests/mcp-contract/smoke.sh target/release/gridcraft-cli
+```
+
+(Windows: the same with `set CRAFT_FONTS_DIR=%CD%\..\craft-fonts` and `set CRAFT_FONTS_REQUIRED=1`;
+the path must be absolute.)
+
 ## Tests
 
 - `cargo test` runs everything; the WHIQ-specific suites:
@@ -261,10 +301,11 @@ pipeline every `tools/call` goes through, `server_status`, `job_status`, error c
 
 ## Not done / known limits
 
-- Bundled fonts are Noto Sans and Noto Sans Arabic only: in PNG renders and in `fonts: embedded`
-  PDFs every Latin family (Calibri, Times, Courier…) is drawn in Noto Sans, italics are slanted
-  synthetically; CJK, Hebrew-specific, Devanagari… glyphs have no face (the PDF's `Auto` mode keeps
-  the standard fonts for plain Latin text). System fonts are not looked up.
+- Scripts with no craft-fonts face (Hebrew, Devanagari, Korean Hangul…) have no glyphs in
+  exports; Arabic, Latin, Greek and Cyrillic (Carlito, Liberation), Japanese and Chinese do.
+  Arabic script has no italic design anywhere, so italic Arabic is slanted; CJK has no bold or
+  italic face in craft-fonts, so bold CJK is the regular weight and italic CJK is slanted.
+  System fonts are not looked up (every export looks the same on every machine).
 - Rotated text on right-to-left sheets is placed approximately (the box is mirrored, not the
   glyph run).
 - Memory is measured on Linux (`/proc/self/statm`); elsewhere `server_status` gives an estimate

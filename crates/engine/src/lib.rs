@@ -37,6 +37,8 @@ pub use gridcraft_core as core;
 pub use gridcraft_formula as formula;
 pub use gridcraft_model as model;
 pub use gridcraft_numfmt as numfmt;
+/// WHIQ: the export text layout (fonts, shaping).
+pub use gridcraft_text as text;
 pub use selection::Selection;
 
 #[derive(Debug, thiserror::Error)]
