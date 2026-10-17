@@ -23,7 +23,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Export as PDF",
             ["File", "Export"],
             None,
-            "{path?, sheets?: active|all, range?: \"A1:F40\" (active sheet), fitToPage?: bool, fonts?: auto|embedded|standard (auto: embedded subset fonts for Arabic and other non-Latin text), pages?: \"2-5\"} → {pages, bytes, path} or {pages, bytes, base64} when no path. Honours each sheet's Page Setup.",
+            "{path?, sheets?: active|all, range?: \"A1:F40\" (active sheet), fitToPage?: bool, standardFonts?: bool (smallest file: PDF base fonts for plain text), fonts?: embedded (default: every string in embedded subset fonts)|auto|standard, pages?: \"2-5\"} → {pages, bytes, path} or {pages, bytes, base64} when no path. Honours each sheet's Page Setup.",
             has_doc,
             export_pdf
         ),
@@ -1797,7 +1797,9 @@ fn paint_page_cells<'a>(
 
 /// Renders laid-out sheets to a PDF.
 pub fn render_pdf(wb: &Workbook, layouts: &[SheetLayout], file: &str, path: &str) -> (Vec<u8>, usize) {
-    render_pdf_with(wb, layouts, file, path, gridcraft_pdf::TextMode::Auto, None)
+    // WHIQ: every string in embedded subset fonts, so the PDF looks the same everywhere (the PDF
+    // standard fonts when the build has no craft-fonts).
+    render_pdf_with(wb, layouts, file, path, gridcraft_pdf::TextMode::Embedded, None)
 }
 
 /// WHIQ: [`render_pdf`] with a text mode: `Auto` (standard fonts for plain text, embedded
@@ -1868,11 +1870,15 @@ pub fn render_pdf_with(
 
 fn build_pdf(s: &Session, p: &Json, cmd: &str) -> Result<(Vec<u8>, usize)> {
     let opts = PrintOptions::from_params(p, cmd)?;
-    let mode = match str_param(p, "fonts").map(str::to_ascii_lowercase).as_deref() {
-        None | Some("auto") => gridcraft_pdf::TextMode::Auto,
-        Some("embedded" | "embed") => gridcraft_pdf::TextMode::Embedded,
-        Some("standard") => gridcraft_pdf::TextMode::Standard,
-        Some(other) => return Err(bad(cmd, format!("`fonts` must be auto, embedded or standard, not `{other}`"))),
+    // WHIQ: embedded subset fonts for every string by default (the PDF looks the same on every
+    // machine); `standardFonts: true` for the smallest file (PDF base fonts for WinAnsi text,
+    // embedded only for Arabic and the like), `fonts` for the finer choice.
+    let mode = match (bool_param(p, "standardFonts"), str_param(p, "fonts").map(str::to_ascii_lowercase).as_deref()) {
+        (Some(true), _) => gridcraft_pdf::TextMode::Auto,
+        (_, None | Some("embedded" | "embed")) => gridcraft_pdf::TextMode::Embedded,
+        (_, Some("auto")) => gridcraft_pdf::TextMode::Auto,
+        (_, Some("standard")) => gridcraft_pdf::TextMode::Standard,
+        (_, Some(other)) => return Err(bad(cmd, format!("`fonts` must be embedded, auto or standard, not `{other}`"))),
     };
     let d = s.doc()?;
     let lays = layouts(&d.wb, &opts);
@@ -2261,6 +2267,11 @@ mod tests {
         s
     }
     fn pdf_of(s: &mut Session, p: Json) -> (Vec<u8>, u64) {
+        // These tests read the drawn text (`(text) Tj`): the standard fonts keep it literal.
+        let mut p = p;
+        if p.get("fonts").is_none() && p.get("standardFonts").is_none() {
+            p["standardFonts"] = json!(true);
+        }
         let r = s.execute("file.exportPdf", p).unwrap();
         let bytes = crate::io::base64_decode(r["base64"].as_str().unwrap()).unwrap();
         (bytes, r["pages"].as_u64().unwrap())
@@ -2386,16 +2397,24 @@ mod tests {
     }
 
     #[test]
-    fn pdf_embeds_subset_fonts_for_arabic_only_where_needed() {
+    fn pdf_embeds_every_string_by_default_and_standard_fonts_on_request() {
         if !gridcraft_text::fonts_for_tests() {
             return;
         }
         let mut s = s();
         s.execute("cell.set", json!({"cell": "A1", "input": "hello"})).unwrap();
         s.execute("cell.set", json!({"cell": "A2", "input": "الإجمالي"})).unwrap();
-        let (pdf, _) = pdf_of(&mut s, json!({}));
-        assert!(contains(&pdf, "(hello) Tj"), "plain text keeps the standard font");
-        assert!(contains(&pdf, "/Type0") && contains(&pdf, "+NotoSansArabic-Regular") && contains(&pdf, "/FontFile2"));
+        // Default: every string in embedded subset fonts (Latin too), no PDF base font.
+        let r = s.execute("file.exportPdf", json!({})).unwrap();
+        let pdf = crate::io::base64_decode(r["base64"].as_str().unwrap()).unwrap();
+        assert!(!contains(&pdf, "(hello) Tj") && contains(&pdf, "+Carlito-Regular"), "Latin embedded too");
+        assert!(contains(&pdf, "+NotoSansArabic-Regular") && contains(&pdf, "/FontFile2"));
+        assert!(!contains(&pdf, "/BaseFont /Helvetica"), "no font the reader must supply");
+        // standardFonts: the smallest file — base fonts for plain text, Arabic still embedded.
+        let (small, _) = pdf_of(&mut s, json!({"standardFonts": true}));
+        assert!(contains(&small, "(hello) Tj"), "plain text keeps the standard font");
+        assert!(contains(&small, "/Type0") && contains(&small, "+NotoSansArabic-Regular"));
+        assert!(small.len() < pdf.len());
         let (pdf, _) = pdf_of(&mut s, json!({"fonts": "embedded"}));
         assert!(!contains(&pdf, "(hello) Tj") && contains(&pdf, "+Carlito-Regular"), "every string embedded");
         let (pdf, _) = pdf_of(&mut s, json!({"fonts": "standard"}));
@@ -2595,7 +2614,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("gridcraft-print-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("out.pdf");
-        let r = s.execute("file.exportPdf", json!({"path": path.to_str().unwrap()})).unwrap();
+        let r = s.execute("file.exportPdf", json!({"path": path.to_str().unwrap(), "standardFonts": true})).unwrap();
         assert_eq!(r["pages"], 1);
         let bytes = std::fs::read(&path).unwrap();
         assert!(bytes.starts_with(b"%PDF-"));
@@ -2616,7 +2635,8 @@ mod tests {
         assert_eq!(r["pages"], 1);
         let bytes = std::fs::read(&path).unwrap();
         assert!(bytes.starts_with(b"%PDF-"));
-        assert!(contains(&bytes, "(hello) Tj"));
+        // Embedded subset fonts by default (the standard fonts without craft-fonts).
+        assert!(if gridcraft_text::available() { contains(&bytes, "+Carlito-Regular") } else { contains(&bytes, "(hello) Tj") });
         // The PDF is a print, not the workbook's file: Save still asks where to put the workbook.
         let d = s.doc().unwrap();
         assert!(d.path.is_none() && d.is_dirty());

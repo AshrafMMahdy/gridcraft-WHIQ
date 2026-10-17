@@ -103,8 +103,8 @@ pipeline every `tools/call` goes through, `server_status`, `job_status`, error c
   characters pick a face by script, neutrals stay with their run, a character the face lacks goes
   to the first face that has it. Glyph outlines come from skrifa.
 - **PDF (`crates/pdf`).** New `TextMode`: `Standard` (upstream), `Auto` (standard fonts for
-  plain left-to-right WinAnsi text, embedded shaped text for everything else — the engine's new
-  default) and `Embedded` (every string; the MCP `export_pdf` default). Embedded text is a Type0 /
+  plain left-to-right WinAnsi text, embedded shaped text for everything else) and `Embedded`
+  (every string; the default since round 2, see "PDF fonts by default"). Embedded text is a Type0 /
   CIDFontType2 font per face with a **subset** FontFile2 (`subsetter`, Flate-compressed),
   `CIDToGIDMap`, `/W` widths and a `ToUnicode` map. Every (glyph, text) pair has its own CID, because
   shaped Arabic draws different letters with one glyph plus dots; marks follow their base in the
@@ -322,6 +322,19 @@ the path must be absolute.)
 - Test: contract `checkpoints_survive_a_hard_kill` (no file after 2 changes, one after 3, the same
   file rewritten after 3 more, SIGKILL, the file holds all six edits and the next server lists it;
   a time-based checkpoint; saving removes it; real `rss_bytes`).
+
+## PDF fonts by default (round 2)
+
+- Every PDF the engine writes (`file.exportPdf`, `file.print`, Save As PDF, MCP `export_pdf`)
+  now embeds **every** string — Latin included — in subset fonts by default (`TextMode::Embedded`:
+  Carlito for Calibri, Liberation for Arial / Times / Courier… see "Fonts"), so the PDF looks the
+  same in every reader and on every machine and no base font is left for the reader to supply.
+  `standardFonts: true` (MCP `standard_fonts: true`) keeps the smallest file: PDF base fonts for
+  plain Latin text, embedded subsets only for Arabic and other scripts; `fonts: "standard"` is
+  upstream's base-fonts-only output. Without craft-fonts the base fonts are used.
+- Tests: engine `pdf_embeds_every_string_by_default_and_standard_fonts_on_request` (no
+  `/BaseFont /Helvetica` by default, `(hello) Tj` only with `standardFonts`, which is smaller);
+  upstream's tests that read drawn text as `(text) Tj` ask for `standardFonts`.
 
 ## Tests
 

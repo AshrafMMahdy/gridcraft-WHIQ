@@ -204,8 +204,9 @@ fn more_definitions() -> Vec<Value> {
             "export_pdf",
             "Export PDF",
             "Export the active sheet (or every sheet) to PDF with page setup: paper, orientation, fit to width, repeat header \
-             rows, margins, gridlines, headings, header/footer. Fonts are embedded as subsets (Arabic shaped, with an Arabic \
-             fallback font always available), so the PDF looks the same everywhere and its text can be selected. The page \
+             rows, margins, gridlines, headings, header/footer. Every font is embedded as a subset (Latin in the cell's family \
+             or its open substitute, Arabic shaped), so the PDF looks the same everywhere and its text can be selected; \
+             `standard_fonts: true` gives the smallest file. The page \
              setup given is kept on the sheet (it prints the same way next time).",
             obj(
                 json!({
@@ -222,7 +223,8 @@ fn more_definitions() -> Vec<Value> {
                     "headings": boolean("Print row and column headings"),
                     "header": string("Page header, e.g. \"&CQuarterly report\""),
                     "footer": string("Page footer, e.g. \"&CPage &P of &N\""),
-                    "fonts": enumeration("embedded (default): every font embedded as a subset; auto: only non-Latin text; standard: PDF base fonts", &["embedded", "auto", "standard"]),
+                    "standard_fonts": boolean("Smallest file: PDF base fonts for plain Latin text (Arabic and other scripts stay embedded). Default false: every font embedded as a subset, so the PDF looks the same everywhere"),
+                    "fonts": enumeration("Finer choice: embedded (default), auto (= standard_fonts), standard (base fonts only; non-Latin text is lost)", &["embedded", "auto", "standard"]),
                     "pages": string("Only these pages of the export, e.g. \"3\" or \"2-5\" (numbered as in the whole export)"),
                 }),
                 &[],
@@ -517,7 +519,11 @@ fn export_pdf(b: &mut dyn Backend, a: &Args) -> Result<Value, String> {
     {
         o.insert("fitToPage".into(), f);
     }
-    p["fonts"] = json!(a.get("fonts").and_then(Value::as_str).unwrap_or("embedded"));
+    if a.get("standard_fonts").and_then(Value::as_bool) == Some(true) {
+        p["standardFonts"] = json!(true);
+    } else {
+        p["fonts"] = json!(a.get("fonts").and_then(Value::as_str).unwrap_or("embedded"));
+    }
     exec(b, "file.exportPdf", p)
 }
 

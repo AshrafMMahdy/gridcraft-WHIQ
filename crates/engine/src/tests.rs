@@ -2784,7 +2784,7 @@ fn cell_picture_json_save_retains_content_and_pdf_draws_without_error_text() {
     let saved = s.execute("file.saveBytes", json!({"format": "json"})).unwrap();
     s.execute("file.open", json!({"name": "pictures.json", "base64": saved["base64"]})).unwrap();
     assert_eq!(cell_picture(&s, "B2").unwrap().data, original_cell_picture());
-    let pdf = s.execute("file.exportPdf", json!({"range": "A1:C3"})).unwrap();
+    let pdf = s.execute("file.exportPdf", json!({"range": "A1:C3", "standardFonts": true})).unwrap();
     let data = crate::io::base64_decode(pdf["base64"].as_str().unwrap()).unwrap();
     let pdf_text = String::from_utf8_lossy(&data);
     assert!(pdf_text.contains("/Subtype /Image"));
