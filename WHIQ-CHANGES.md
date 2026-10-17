@@ -115,7 +115,11 @@ pipeline every `tools/call` goes through, `server_status`, `job_status`, error c
   General-aligned text starts at its reading start (Arabic right-aligned), numbers stay right.
 - **RTL sheets** (`view.rightToLeft`, `sheet.right_to_left`): PDF and PNG draw the sheet mirrored
   (column A on the right, row headings on the right, overflow to the left), text and pictures
-  not flipped; charts, pictures and shapes are anchored from the right.
+  not flipped; charts, pictures and shapes are anchored from the right. Rotated text is placed
+  exactly (round 2): a run from origin O at angle a, ending at E, is drawn from the reflected E at
+  angle −a, so it covers the reflected baseline with its ascent on the reflected side (test
+  `rotated_text_on_right_to_left_sheets_is_the_exact_mirror`: at ±30°, 45°, ±90° and 15° the RTL
+  ink box equals the reflected LTR ink box within one pixel).
 - The sheet painter (`crates/engine/src/cmd/print.rs`) now draws on a `Canvas` trait (PDF page or
   raster canvas) and measures text with the surface's own metrics (shaped widths for wrapping,
   alignment, shrink-to-fit, `####`, chart labels).
@@ -306,8 +310,6 @@ the path must be absolute.)
   Arabic script has no italic design anywhere, so italic Arabic is slanted; CJK has no bold or
   italic face in craft-fonts, so bold CJK is the regular weight and italic CJK is slanted.
   System fonts are not looked up (every export looks the same on every machine).
-- Rotated text on right-to-left sheets is placed approximately (the box is mirrored, not the
-  glyph run).
 - Memory is measured on Linux (`/proc/self/statm`); elsewhere `server_status` gives an estimate
   from the cell count and `--max-memory-mb` has nothing to compare with.
 - A job can't be cancelled; a call that never ends keeps the worker busy (the server keeps

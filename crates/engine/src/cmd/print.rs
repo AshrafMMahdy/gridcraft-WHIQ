@@ -825,11 +825,16 @@ impl Canvas for Mirror<'_> {
         angle: f32,
         base: Option<gridcraft_text::Dir>,
     ) {
-        // The text's box is reflected; its glyphs are not.
+        // The text's box is reflected exactly; its glyphs are not. A run from origin O along
+        // angle a (clockwise, y down) to its end E = O + w·(cos a, sin a) reflects to the segment
+        // E'→O'; drawn from E' at angle −a it covers that segment with its ascent on the
+        // reflected side (the up-normal (sin a, −cos a) reflects to (−sin a, −cos a), which is the
+        // up-normal of angle −a).
         let w = self.inner.measure_in(font, family, size, text);
-        let cos = if angle.is_finite() { angle.cos() } else { 1.0 };
-        let x = self.x(x) - w * cos;
-        self.inner.text_dir(x, y, size, font, family, color, text, angle, base);
+        let (sin, cos) = if angle.is_finite() { angle.sin_cos() } else { (0.0, 1.0) };
+        let (ex, ey) = (x + w * cos, y + w * sin);
+        let angle = if angle.is_finite() && angle != 0.0 { -angle } else { 0.0 };
+        self.inner.text_dir(self.x(ex), ey, size, font, family, color, text, angle, base);
     }
     fn measure_in(&self, font: Font, family: Option<&str>, size: f32, text: &str) -> f32 {
         self.inner.measure_in(font, family, size, text)
@@ -2325,6 +2330,57 @@ mod tests {
         let (pdf, pages) = pdf_of(&mut s, json!({}));
         assert_eq!(pages, 1);
         assert!(contains(&pdf, "(x) Tj"));
+    }
+
+    /// The ink box of a PNG (x0, y0, x1, y1) over dark pixels.
+    fn ink_box(png: &[u8]) -> (u32, u32, u32, u32) {
+        let img = image::load_from_memory(png).unwrap().to_rgba8();
+        let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
+        for (x, y, p) in img.enumerate_pixels() {
+            if p.0[0] < 128 {
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+            }
+        }
+        (x0, y0, x1, y1)
+    }
+
+    #[test]
+    fn rotated_text_on_right_to_left_sheets_is_the_exact_mirror() {
+        if !gridcraft_text::fonts_for_tests() {
+            return;
+        }
+        // Mirror-symmetric letters (H, I, O): the ink box of the reflected run must then be the
+        // reflected ink box exactly (asymmetric glyphs move ink inside the same layout box).
+        for (angle, text) in [(45, "HOHIHOH"), (-30, "HIHOHIH"), (90, "OHHO"), (-90, "IHOHI"), (15, "HHHH HHHH")] {
+            let mut s = s();
+            s.execute("home.columnWidth", json!({"cols": "A:C", "chars": 14})).unwrap();
+            s.execute("home.rowHeight", json!({"rows": "1:1", "height": 90})).unwrap();
+            s.execute("cell.set", json!({"cell": "B1", "input": text})).unwrap();
+            s.execute("home.orientation", json!({"range": "B1", "angle": angle})).unwrap();
+            let render = |s: &mut Session| {
+                let r = s.execute("file.renderPng", json!({"range": "A1:C1", "scale": 2, "gridlines": false})).unwrap();
+                (crate::io::base64_decode(r["base64"].as_str().unwrap()).unwrap(), r["width"].as_u64().unwrap() as u32)
+            };
+            let (ltr, w) = render(&mut s);
+            s.execute("view.rightToLeft", json!({"on": true})).unwrap();
+            let (rtl, w2) = render(&mut s);
+            assert_eq!(w, w2);
+            let (a0, b0, a1, b1) = ink_box(&ltr);
+            let (c0, d0, c1, d1) = ink_box(&rtl);
+            assert!(a1 > a0 && b1 > b0, "{angle}: text drawn");
+            // The RTL ink box is the LTR one reflected about the picture's centre line.
+            let (m0, m1) = (w - 1 - a1, w - 1 - a0);
+            let near = |p: u32, q: u32| p.abs_diff(q) <= 1;
+            assert!(
+                near(c0, m0) && near(c1, m1) && near(d0, b0) && near(d1, b1),
+                "{angle}: rtl {:?} vs mirrored ltr {:?}",
+                (c0, d0, c1, d1),
+                (m0, b0, m1, b1)
+            );
+        }
     }
 
     #[test]
