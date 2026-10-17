@@ -45,6 +45,8 @@ pub fn read_sheet(cx: &mut Ctx<'_>, part: &str, name: &str) -> Result<Sheet, IoE
     let mut sheet = Sheet::new(name);
     let mut st = RowState::default();
     let res = xml::parse_streaming(&bytes, &["row"], &mut |row| {
+        // WHIQ: a safe point for `cancel` while a large file opens.
+        gridcraft_core::cancel::checkpoint();
         read_row(cx, &mut sheet, &mut st, &row);
         Ok(())
     });

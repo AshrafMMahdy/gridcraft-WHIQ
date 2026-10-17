@@ -1,6 +1,6 @@
 //! The shared contract (sections 1–8).
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -350,4 +350,66 @@ fn caller_identity() {
     let core = crate::harness::zip_text(&dir.join("who.xlsx"), "docProps/core.xml");
     assert!(core.contains("<cp:lastModifiedBy>Mona</cp:lastModifiedBy>"), "{core}");
     assert!(core.contains("<dc:creator>Mona</dc:creator>"), "{core}");
+}
+
+// Round 2: `cancel` stops the call in progress or a job at a safe point; the document stays as
+// it was before that call.
+#[test]
+fn cancel_stops_calls_and_jobs_and_keeps_the_document() {
+    let dir = folder("cancel");
+    let mut m = start(&dir, &["--call-timeout-ms", "300"]);
+    // Nothing to cancel.
+    assert_eq!(m.err("cancel", json!({}))["code"], "not_running");
+    assert_eq!(m.err("cancel", json!({"job_id": "job-77"}))["code"], "not_found");
+    // A long call, cancelled while it runs (no job id: the call in progress).
+    let t0 = Instant::now();
+    let slow = m.begin("tools/call", json!({"name": "debug_sleep", "arguments": {"ms": 20000}}));
+    std::thread::sleep(Duration::from_millis(100));
+    let c = m.ok("cancel", json!({}));
+    assert_eq!(c["status"], "cancelling", "{c}");
+    let job = c["job_id"].as_str().unwrap().to_string();
+    let r = m.wait_for(&slow, 30);
+    let res = &r["result"];
+    // Either the call's own answer (cancelled) or its hand-off as a job, then cancelled.
+    let status = if res["isError"] == true {
+        assert_eq!(res["structuredContent"]["error"]["code"], "cancelled", "{r}");
+        m.ok("job_status", json!({"job_id": job}))["status"].clone()
+    } else {
+        m.finish_job(&job, 30)["status"].clone()
+    };
+    assert_eq!(status, "cancelled");
+    assert!(t0.elapsed() < Duration::from_secs(10), "stopped long before the 20 s sleep ended");
+    // The job is over: cancelling it again says so.
+    assert_eq!(m.err("cancel", json!({"job_id": job}))["code"], "not_running");
+
+    // A big edit run as a job, cancelled part-way: nothing of it stays.
+    m.ok("set_cell", json!({"cell": "D1", "input": "keep me"}));
+    let rows: Vec<Value> = (1..=150_000).map(|i| json!([i, format!("=A{i}*2"), format!("=SUM($A$1:A{i})")])).collect();
+    let h = m.ok("write_range", json!({"range": "A1", "values": rows, "async": true}));
+    let job = h["job_id"].as_str().unwrap().to_string();
+    let c = m.ok("cancel", json!({"job_id": job}));
+    assert_eq!(c["status"], "cancelling");
+    let done = m.finish_job(&job, 60);
+    assert_eq!(done["status"], "cancelled", "{done}");
+    assert_eq!(done["error"]["code"], "cancelled");
+    // The workbook is as it was: D1 kept, nothing written, and it keeps working.
+    assert_eq!(m.ok("read_range", json!({"range": "D1"}))["values"], json!([["keep me"]]));
+    let a = m.ok("read_range", json!({"range": "A1:C2"}));
+    assert!(a["values"].as_array().unwrap().iter().flat_map(|r| r.as_array().unwrap()).all(|v| v.is_null() || v == ""), "{a}");
+    m.ok("write_range", json!({"range": "A1", "values": [[2, "=A1*3"]]}));
+    assert_eq!(m.ok("read_range", json!({"range": "B1"}))["values"], json!([[6.0]]));
+    assert_eq!(m.ok("recalculate", json!({}))["errorCount"], 0);
+
+    // The client cancelling its request (notifications/cancelled) stops it too.
+    let slow = m.begin("tools/call", json!({"name": "debug_sleep", "arguments": {"ms": 20000}}));
+    std::thread::sleep(Duration::from_millis(100));
+    m.send(&json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": slow, "reason": "user gave up"}}));
+    let st = (0..100)
+        .find_map(|_| {
+            std::thread::sleep(Duration::from_millis(100));
+            let s = m.ok("server_status", json!({}));
+            s["busy"].is_null().then_some(s)
+        })
+        .expect("the call stopped");
+    assert!(st["busy"].is_null());
 }

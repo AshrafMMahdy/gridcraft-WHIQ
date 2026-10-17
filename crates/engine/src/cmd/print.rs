@@ -1253,6 +1253,8 @@ fn draw_block(pg: &mut dyn Canvas, b: &Block, gridlines: bool, cf: &mut Option<c
         if let Some(picture) = sh.cell_pictures.get(c) {
             draw_cell_picture(pg, &picture.data, (x, y, w, h), b.k);
         } else {
+            // WHIQ: a safe point for `cancel` while a large export or picture is drawn.
+            gridcraft_core::cancel::checkpoint();
             draw_text(pg, b, *c, l, (x, y, w, h), merged, &merges, (bx, bx + bw));
         }
     }

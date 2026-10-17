@@ -281,6 +281,28 @@ tests/mcp-contract/smoke.sh target/release/gridcraft-cli
 (Windows: the same with `set CRAFT_FONTS_DIR=%CD%\..\craft-fonts` and `set CRAFT_FONTS_REQUIRED=1`;
 the path must be absolute.)
 
+## Cancel (round 2)
+
+- **`cancel` tool** (answered by the stdio loop, like `server_status`, so it works while a call
+  runs): `{job_id?}` stops the call in progress, or the running job named; it answers at once with
+  `status: "cancelling"`, and the call or job then ends with error code **`cancelled`** (job state
+  `cancelled` in `job_status` and `server_status`). Asking for an ended job answers `not_running`
+  with its status; for an unknown one `not_found`. The client's own `notifications/cancelled`
+  (MCP) stops the request it names when that is the call in progress.
+- **Safe points** (`gridcraft_core::cancel::checkpoint`): every formula a recalculation evaluates,
+  every row `range.setValues` writes, every row read from or written to an XLSX file, every 1 024
+  PivotTable source records, every cell an export or picture draws, and the debug sleep. A
+  checkpoint that sees the request unwinds (`resume_unwind`, no panic message) to the command
+  runner, which **puts the workbook back exactly as it was before the command** (the same snapshot
+  the panic guard uses) and rebuilds the calculation state; a command that failed while a stop was
+  pending (a nested command was stopped) is rolled back and reported cancelled as a whole. Files
+  are written only after the workbook is serialized, so a stopped save or export writes nothing.
+  The request targets the worker thread only (`request(thread)`), so nothing else is affected.
+- Tests: contract `cancel_stops_calls_and_jobs_and_keeps_the_document` (a 20 s call stopped in
+  well under 10 s; a 150 000-row write with formulas run as a job, cancelled part-way, leaves the
+  workbook exactly as before and still working; `notifications/cancelled`; `not_running`,
+  `not_found`), engine `cancelled_commands_roll_back`.
+
 ## Tests
 
 - `cargo test` runs everything; the WHIQ-specific suites:
@@ -312,6 +334,4 @@ the path must be absolute.)
   System fonts are not looked up (every export looks the same on every machine).
 - Memory is measured on Linux (`/proc/self/statm`); elsewhere `server_status` gives an estimate
   from the cell count and `--max-memory-mb` has nothing to compare with.
-- A job can't be cancelled; a call that never ends keeps the worker busy (the server keeps
-  answering `busy`, `server_status` and `job_status`, and SIGTERM still auto-saves).
 - Upstream's docs (`docs/*.md`, ROADMAP) are not edited by the fork; this file is the record.

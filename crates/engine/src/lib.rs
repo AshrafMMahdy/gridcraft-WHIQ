@@ -55,6 +55,9 @@ pub enum EngineError {
     Other(String),
     #[error("internal error in `{0}` (the workbook was kept as it was): {1}")]
     Internal(String, String),
+    /// WHIQ: the call was cancelled (see `gridcraft_core::cancel`).
+    #[error("cancelled: `{0}` was stopped at a safe point; the workbook is as it was before it")]
+    Cancelled(String),
 }
 
 pub type Result<T> = std::result::Result<T, EngineError>;
@@ -328,6 +331,17 @@ impl Session {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (spec.run)(self, &params)));
         let result = match result {
             Ok(r) => r,
+            Err(p) if gridcraft_core::cancel::is_cancelled(&*p) => {
+                // WHIQ: a cancellation unwinds like a failure: the workbook goes back as it was.
+                if let Some((uid, wb, sel)) = &before
+                    && let Some(d) = self.docs.iter_mut().find(|d| d.uid == *uid)
+                {
+                    d.wb = wb.clone();
+                    d.selection = sel.clone();
+                    d.calc.rebuild(&d.wb);
+                }
+                return Err(EngineError::Cancelled(id.to_string()));
+            }
             Err(p) => {
                 let msg =
                     p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".into());
@@ -341,6 +355,22 @@ impl Session {
                 }
                 return Err(EngineError::Internal(id.to_string(), msg));
             }
+        };
+        // WHIQ: a command that failed while a stop was asked for (a nested command was
+        // cancelled) is rolled back and reported cancelled as a whole.
+        let result = match result {
+            Err(e) if gridcraft_core::cancel::requested() && !matches!(e, EngineError::Cancelled(_)) => {
+                let _ = e;
+                if let Some((uid, wb, sel)) = &before
+                    && let Some(d) = self.docs.iter_mut().find(|d| d.uid == *uid)
+                {
+                    d.wb = wb.clone();
+                    d.selection = sel.clone();
+                    d.calc.rebuild(&d.wb);
+                }
+                Err(EngineError::Cancelled(id.to_string()))
+            }
+            r => r,
         };
         if spec.journal && result.is_ok() {
             self.journal.push((id.to_string(), cmd::journal_params(&params)));

@@ -125,10 +125,10 @@ pub(crate) const WRITES_FILES: &[&str] = &["save_workbook", "export_pdf", "rende
 
 /// Tools that work without an open document (they stay available after an eviction).
 const NEEDS_NO_DOCUMENT: &[&str] =
-    &["open_workbook", "new_workbook", "build_workbook", "server_status", "job_status", "list_commands", "list_functions", "debug_sleep"];
+    &["open_workbook", "new_workbook", "build_workbook", "server_status", "job_status", "list_commands", "list_functions", "debug_sleep", "cancel"];
 
 /// Tools that run on the dispatcher thread, never queued behind document work.
-pub const CONTROL_TOOLS: &[&str] = &["server_status", "job_status"];
+pub const CONTROL_TOOLS: &[&str] = &["server_status", "job_status", "cancel"];
 
 /// The WHIQ tools (definitions only; the global arguments are added by [`with_globals`]).
 pub fn definitions() -> Vec<Value> {
@@ -141,6 +141,15 @@ pub fn definitions() -> Vec<Value> {
              recovered (auto-saved) files waiting to be reopened. Always answers at once, even while a long call runs.",
             obj(json!({}), &[]),
             crate::tools::READ,
+        ),
+        tool(
+            "cancel",
+            "Cancel",
+            "Stop the call in progress (no job_id) or a running job (job_id). It stops at the next safe point — between \
+             formulas of a recalculation, rows being read, written or drawn, steps of a build — and the workbook is left exactly \
+             as it was before that call. Answers at once; the stopped call or job then ends with code `cancelled`.",
+            obj(json!({"job_id": string("The job to stop (from a call's answer or server_status); default: the call in progress")}), &[]),
+            crate::tools::ANY,
         ),
         tool(
             "job_status",
@@ -702,9 +711,18 @@ fn dispatch(b: &mut dyn Backend, st: &mut CallState, name: &str, a: &Args, warni
         )),
         "debug_sleep" => {
             let ms = a.get("ms").and_then(Value::as_u64).unwrap_or(1000).min(600_000);
-            std::thread::sleep(std::time::Duration::from_millis(ms));
+            // Sleeps in 5 ms steps, each a safe point for `cancel` (no clock: wasm-safe).
+            for _ in 0..ms.div_ceil(5) {
+                gridcraft_engine::core::cancel::checkpoint();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
             Ok(json!({"slept_ms": ms}))
         }
+        "cancel" => Err(ToolError::new(
+            "not_found",
+            "this server runs calls synchronously: there is nothing to cancel while you wait for an answer",
+            "cancel exists under `gridcraft-cli mcp`",
+        )),
         "debug_panic" => provoked_panic(),
         "read_range" => read_range(b, st, a),
         "list_commands" => {
@@ -898,6 +916,9 @@ pub fn classify(b: &mut dyn Backend, tool: &str, a: &Args, msg: &str) -> ToolErr
             e = e.with("write_root", json!(w.display().to_string()));
         }
         return e;
+    }
+    if m.starts_with("cancelled:") || m.contains(": cancelled:") {
+        return ToolError::new("cancelled", msg, "the call was stopped as asked and changed nothing; run it again when you need it");
     }
     if m.contains("no ui in headless mode") {
         return ToolError::new("no_ui", msg, "use render_range or render_sheet for a picture of the cells, or connect to the desktop app");

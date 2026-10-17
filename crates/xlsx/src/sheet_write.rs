@@ -274,6 +274,8 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (
         if cells.is_empty() && info == LineInfo::default() {
             continue;
         }
+        // WHIQ: a safe point for `cancel` while a large workbook is written (before any file is).
+        gridcraft_core::cancel::checkpoint();
         let _ = write!(s, "<row r=\"{}\"", r + 1);
         if let Some(st) = info.style {
             let _ = write!(s, " s=\"{}\" customFormat=\"1\"", sid(st));

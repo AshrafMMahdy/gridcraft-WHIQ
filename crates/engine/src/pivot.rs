@@ -902,6 +902,10 @@ pub fn compute(wb: &Workbook, pt: &PivotTable, pivot_sheet: usize) -> Result<Out
     let row_fmts: Vec<String> = rows.iter().map(|(c, _)| fmt_of(*c)).collect();
     let col_fmts: Vec<String> = cols.iter().map(|(c, _)| fmt_of(*c)).collect();
     'rec: for (ri, rec) in src.rows.iter().enumerate() {
+        if ri % 1024 == 0 {
+            // WHIQ: a safe point for `cancel`.
+            gridcraft_core::cancel::checkpoint();
+        }
         for ((c, f, g, _), fmt) in filters.iter().zip(filter_fmts.iter()) {
             if let Some(sel) = &f.selected {
                 let label = item_label(wb, rec.get(*c).unwrap_or(&Value::Empty), *g, fmt);

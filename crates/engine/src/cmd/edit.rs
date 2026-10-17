@@ -298,6 +298,8 @@ fn range_set_values(s: &mut Session, p: &Json) -> Result<Json> {
     let mut count = 0;
     edit(s, |cx| {
         for (ri, row) in rows.iter().enumerate() {
+            // WHIQ: a safe point for `cancel` (the runner restores the workbook).
+            gridcraft_core::cancel::checkpoint();
             let cols: Vec<&Json> = match row.as_array() {
                 Some(a) => a.iter().collect(),
                 None => vec![row],

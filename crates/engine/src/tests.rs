@@ -3301,3 +3301,25 @@ fn self_referencing_spill_agrees_with_full_recalc() {
         assert_eq!(wb.sheet(0).unwrap().value(c), v, "{}", c.a1());
     }
 }
+
+/// WHIQ: a cancelled command leaves the workbook as it was and the session working.
+#[test]
+fn cancelled_commands_roll_back() {
+    let mut s = Session::new();
+    s.new_workbook();
+    s.execute("cell.set", json!({"cell": "A1", "input": "keep"})).unwrap();
+    gridcraft_core::cancel::request(std::thread::current().id());
+    let r = s.execute("range.setValues", json!({"range": "B1", "values": [[1], [2], [3]]}));
+    gridcraft_core::cancel::clear();
+    assert!(matches!(r, Err(crate::EngineError::Cancelled(_))), "{r:?}");
+    let sh = s.doc().unwrap().wb.sheet(0).unwrap();
+    assert_eq!(sh.value(CellRef::new(0, 0)), Value::text("keep"));
+    assert!(sh.cell(CellRef::new(0, 1)).is_none(), "nothing of the cancelled command stays");
+    // Another thread's request does not touch this one.
+    let other = std::thread::spawn(|| std::thread::current().id()).join().unwrap();
+    gridcraft_core::cancel::request(other);
+    let r = s.execute("range.setValues", json!({"range": "B1", "values": [[1], ["=B1*2"]]}));
+    gridcraft_core::cancel::clear();
+    assert!(r.is_ok());
+    assert_eq!(s.doc().unwrap().wb.sheet(0).unwrap().value(CellRef::new(1, 1)).as_f64(), Some(2.0));
+}

@@ -80,6 +80,8 @@ enum JobState {
     Running,
     Done,
     Failed,
+    /// Stopped by `cancel` (the workbook is as it was before the call).
+    Cancelled,
 }
 
 #[derive(Debug)]
@@ -105,6 +107,8 @@ struct Running {
     tool: String,
     job: u64,
     started: Instant,
+    /// The JSON-RPC id of the call (`notifications/cancelled` names it).
+    id: Value,
 }
 
 enum Work {
@@ -121,6 +125,8 @@ struct Shared {
     evicted: Mutex<Option<Eviction>>,
     last_activity: Mutex<Instant>,
     idle_done: AtomicBool,
+    /// The worker thread (what `cancel` stops).
+    worker: Mutex<Option<std::thread::ThreadId>>,
     config: RuntimeConfig,
     started: Instant,
 }
@@ -192,6 +198,7 @@ impl Shared {
             JobState::Running => "running",
             JobState::Done => "done",
             JobState::Failed => "failed",
+            JobState::Cancelled => "cancelled",
         };
         json!({"job_id": job_name(n), "tool": j.tool, "status": state, "elapsed_ms": elapsed})
     }
@@ -227,6 +234,64 @@ impl Shared {
             v["memory"]["estimated_bytes"] = json!(s.cells.saturating_mul(160));
         }
         v
+    }
+
+    /// `cancel`: asks the call in progress (or the job named, when it is the one running) to stop
+    /// at its next safe point.
+    fn cancel(&self, args: &Value) -> ToolResult {
+        let asked = args.get("job_id").or(args.get("id")).or(args.get("job")).map(|v| match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        });
+        let busy = lock(&self.busy);
+        let target = match (&asked, busy.as_ref()) {
+            (None, Some(b)) => Some(b.clone()),
+            (Some(t), Some(b)) if parse_job(t) == Some(b.job) => Some(b.clone()),
+            _ => None,
+        };
+        if let Some(b) = target {
+            if let Some(t) = *lock(&self.worker) {
+                gridcraft_engine::core::cancel::request(t);
+            }
+            drop(busy);
+            if let Some(j) = lock(&self.jobs).map.get_mut(&b.job) {
+                j.handed_off = true;
+            }
+            return ToolResult::json(&json!({
+                "job_id": job_name(b.job),
+                "tool": b.tool,
+                "status": "cancelling",
+                "next_step": format!(
+                    "it stops at its next safe point and changes nothing; job_status with job_id \"{}\" then says cancelled",
+                    job_name(b.job)
+                ),
+            }));
+        }
+        drop(busy);
+        let jobs = lock(&self.jobs);
+        match asked {
+            None => ToolResult::failure(&ToolError::new("not_running", "no call is running", "nothing to cancel; server_status lists the jobs")),
+            Some(t) => match parse_job(&t).and_then(|n| jobs.map.get(&n).map(|j| (n, j))) {
+                Some((n, j)) => {
+                    let st = self.job_summary(n, j);
+                    ToolResult::failure(
+                        &ToolError::new(
+                            "not_running",
+                            format!("{} has already ended ({})", job_name(n), st["status"].as_str().unwrap_or("")),
+                            "nothing to cancel; job_status has its result",
+                        )
+                        .with("status", st["status"].clone()),
+                    )
+                }
+                None => {
+                    let ids: Vec<String> = jobs.map.keys().map(|n| job_name(*n)).collect();
+                    ToolResult::failure(
+                        &ToolError::new("not_found", format!("there is no job `{t}`"), "use a job_id a call returned; server_status lists the jobs")
+                            .with("closest", json!(contract::closest(&t, ids.iter().map(String::as_str), 5))),
+                    )
+                }
+            },
+        }
     }
 
     fn job_status(&self, args: &Value) -> ToolResult {
@@ -343,6 +408,7 @@ pub fn serve(
         evicted: Mutex::new(None),
         last_activity: Mutex::new(Instant::now()),
         idle_done: AtomicBool::new(false),
+        worker: Mutex::new(None),
         config: config.clone(),
         started: Instant::now(),
     });
@@ -362,6 +428,7 @@ pub fn serve(
     let ws = shared.clone();
     let settings = config.settings.clone();
     let worker = std::thread::Builder::new().name("gridcraft-worker".into()).spawn(move || {
+        *lock(&ws.worker) = Some(std::thread::current().id());
         let mut server = Server::with_settings(factory(), settings);
         let found = lock(&ws.recovered).clone();
         if !found.is_empty() {
@@ -449,7 +516,11 @@ pub fn serve(
                 let args = msg["params"]["arguments"].clone();
                 match contract::normalize_tool_name(&asked, &names) {
                     Some(name) if CONTROL_TOOLS.contains(&name.as_str()) => {
-                        let r = if name == "server_status" { ToolResult::json(&shared.status()) } else { shared.job_status(&args) };
+                        let r = match name.as_str() {
+                            "server_status" => ToolResult::json(&shared.status()),
+                            "cancel" => shared.cancel(&args),
+                            _ => shared.job_status(&args),
+                        };
                         shared.write(&json!({"jsonrpc": "2.0", "id": id, "result": r.to_value()}));
                     }
                     Some(name) => submit(&shared, &work_tx, msg, id, &name, &args),
@@ -461,6 +532,16 @@ pub fn serve(
                 }
             }
             ("resources/read", Some(id)) => submit(&shared, &work_tx, msg, id, "resources/read", &Value::Null),
+            // The client gave up on a request: stop it when it is the call in progress.
+            ("notifications/cancelled", None) => {
+                let asked = msg["params"]["requestId"].clone();
+                let busy = lock(&shared.busy);
+                if busy.as_ref().is_some_and(|b| !asked.is_null() && b.id == asked)
+                    && let Some(t) = *lock(&shared.worker)
+                {
+                    gridcraft_engine::core::cancel::request(t);
+                }
+            }
             _ => {
                 if let Some(r) = local.handle(msg) {
                     shared.write(&r);
@@ -545,7 +626,7 @@ fn submit(shared: &Arc<Shared>, work_tx: &mpsc::Sender<Work>, msg: Value, id: Va
             let Some(oldest) = jobs.map.iter().find(|(_, j)| j.state != JobState::Running).map(|(k, _)| *k) else { break };
             jobs.map.remove(&oldest);
         }
-        *busy = Some(Running { tool: name.to_string(), job: n, started: Instant::now() });
+        *busy = Some(Running { tool: name.to_string(), job: n, started: Instant::now(), id: id.clone() });
         n
     };
     let as_job = name != "resources/read" && starts_as_job(shared, name, args);
@@ -572,7 +653,12 @@ fn submit(shared: &Arc<Shared>, work_tx: &mpsc::Sender<Work>, msg: Value, id: Va
     let timeout = shared.config.call_timeout;
     let _ = std::thread::Builder::new().name("gridcraft-wait".into()).spawn(move || match done_rx.recv_timeout(timeout) {
         Ok(reply) => {
-            lock(&s.jobs).map.remove(&job);
+            // A job someone asked about (cancel names it) keeps its record for job_status.
+            let mut jobs = lock(&s.jobs);
+            if !jobs.map.get(&job).is_some_and(|j| j.handed_off) {
+                jobs.map.remove(&job);
+            }
+            drop(jobs);
             s.write(&reply);
         }
         Err(_) => {
@@ -618,6 +704,12 @@ fn worker_loop(server: &mut Server, shared: &Shared, rx: mpsc::Receiver<Work>) {
                 let reply = match call {
                     Ok(Some(r)) => r,
                     Ok(None) => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+                    // Stopped by `cancel` between commands: each command is whole, nothing half done.
+                    Err(p) if gridcraft_engine::core::cancel::is_cancelled(&*p) => {
+                        let e =
+                            ToolError::new("cancelled", "the call was stopped as asked", "run it again when you need it; the workbook is consistent");
+                        json!({"jsonrpc": "2.0", "id": id, "result": ToolResult::failure(&e).to_value()})
+                    }
                     Err(_) => {
                         let saved = shared.autosave_latest("a call panicked");
                         let mut e = ToolError::new(
@@ -640,7 +732,14 @@ fn worker_loop(server: &mut Server, shared: &Shared, rx: mpsc::Receiver<Work>) {
                     let mut jobs = lock(&shared.jobs);
                     if let Some(j) = jobs.map.get_mut(&job) {
                         let failed = reply["result"]["isError"] == true || reply.get("error").is_some();
-                        j.state = if failed { JobState::Failed } else { JobState::Done };
+                        let cancelled = reply["result"]["structuredContent"]["error"]["code"] == "cancelled";
+                        j.state = if cancelled {
+                            JobState::Cancelled
+                        } else if failed {
+                            JobState::Failed
+                        } else {
+                            JobState::Done
+                        };
                         j.finished = Some(Instant::now());
                         j.result = Some(match reply.get("result") {
                             Some(r) => r.clone(),
@@ -651,7 +750,12 @@ fn worker_loop(server: &mut Server, shared: &Shared, rx: mpsc::Receiver<Work>) {
                         });
                     }
                 }
-                *lock(&shared.busy) = None;
+                {
+                    // A stop asked for this call must not reach the next one.
+                    let mut busy = lock(&shared.busy);
+                    gridcraft_engine::core::cancel::clear();
+                    *busy = None;
+                }
                 shared.touch();
                 let _ = done.send(reply);
                 if let (Some(max), Some(rss)) = (shared.config.max_memory_bytes, crate::whiq::rss_bytes())

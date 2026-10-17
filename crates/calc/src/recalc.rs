@@ -458,6 +458,8 @@ fn spill_blocked(host: &PassHost<'_>, (sheet, anchor): Key, a: &Array) -> bool {
 
 impl PassHost<'_> {
     fn compute(&mut self, k: Key) -> Value {
+        // WHIQ: a safe point for cancelling a long recalculation (the runner restores the workbook).
+        gridcraft_core::cancel::checkpoint();
         if let Some(v) = self.results.get(&k) {
             let v = v.clone();
             if self.iterate && self.tainted.contains(&k) {
