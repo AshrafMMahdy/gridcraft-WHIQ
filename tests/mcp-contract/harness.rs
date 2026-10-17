@@ -171,6 +171,12 @@ impl Mcp {
         }
     }
 
+    /// Kills the process outright (SIGKILL on Unix, TerminateProcess on Windows): no handler runs.
+    pub fn kill(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
     /// Sends SIGTERM (Unix) and waits for the process to end.
     #[cfg(unix)]
     pub fn terminate(mut self) -> std::process::ExitStatus {

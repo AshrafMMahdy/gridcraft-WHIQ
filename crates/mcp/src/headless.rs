@@ -91,6 +91,7 @@ impl Backend for Headless {
     fn snapshot(&self) -> Option<crate::backend::DocSnapshot> {
         let d = self.session.active()?;
         Some(crate::backend::DocSnapshot {
+            uid: d.uid,
             wb: d.wb.clone(),
             title: d.display_title(),
             path: d.path.clone(),

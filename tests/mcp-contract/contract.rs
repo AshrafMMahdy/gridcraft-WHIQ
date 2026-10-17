@@ -413,3 +413,60 @@ fn cancel_stops_calls_and_jobs_and_keeps_the_document() {
         .expect("the call stopped");
     assert!(st["busy"].is_null());
 }
+
+// Round 2: periodic checkpoints — every N changing calls, or when unsaved changes are T seconds
+// old — keep the recovered file current, so a hard kill (no handler runs) loses little.
+#[test]
+fn checkpoints_survive_a_hard_kill() {
+    let dir = folder("checkpoint");
+    let mut m = start(&dir, &["--checkpoint-edits", "3", "--checkpoint-secs", "0"]);
+    m.ok("set_cell", json!({"cell": "A1", "input": "one"}));
+    m.ok("set_cell", json!({"cell": "A2", "input": "two"}));
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(files_in(&dir).iter().all(|f| !f.contains(".recovered-")), "not due after 2 changes: {:?}", files_in(&dir));
+    assert_eq!(m.ok("server_status", json!({}))["checkpoint"]["pending_edits"], 2);
+    m.ok("set_cell", json!({"cell": "A3", "input": "three"}));
+    let wait_for_file = |dir: &std::path::Path| {
+        (0..50).find_map(|_| {
+            std::thread::sleep(Duration::from_millis(100));
+            files_in(dir).into_iter().find(|f| f.contains(".recovered-") && f.ends_with(".xlsx"))
+        })
+    };
+    let file = wait_for_file(&dir).expect("a checkpoint after 3 changes");
+    let st = (0..50)
+        .find_map(|_| {
+            let st = m.ok("server_status", json!({}));
+            if st["checkpoint"]["writes"] == 1 {
+                return Some(st);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            None
+        })
+        .expect("the checkpoint is recorded");
+    assert_eq!(st["checkpoint"]["pending_edits"], 0, "{st}");
+    // Three more: the same file is brought up to date (not a second one).
+    for c in ["A4", "A5", "A6"] {
+        m.ok("set_cell", json!({"cell": c, "input": c}));
+    }
+    std::thread::sleep(Duration::from_millis(800));
+    assert_eq!(files_in(&dir).iter().filter(|f| f.contains(".recovered-") && f.ends_with(".xlsx")).count(), 1, "{:?}", files_in(&dir));
+    // Killed outright: no handler runs, the checkpoint is what is left.
+    m.kill();
+    assert_eq!(cells_of(&dir.join(&file), "A1:A6"), json!([["one"], ["two"], ["three"], ["A4"], ["A5"], ["A6"]]));
+    // The next server announces it.
+    let mut m = start(&dir, &[]);
+    let st = m.ok("server_status", json!({}));
+    assert!(st["recovered_files"].as_array().unwrap().iter().any(|f| f.as_str().unwrap().ends_with(&file)), "{st}");
+    drop(m);
+
+    // Time-based: one change, older than the interval, is written; saving removes the checkpoint.
+    let dir = folder("checkpoint-time");
+    let mut m = start(&dir, &["--checkpoint-edits", "0", "--checkpoint-secs", "1"]);
+    m.ok("set_cell", json!({"cell": "B2", "input": "42"}));
+    let file = wait_for_file(&dir).expect("a checkpoint after a second");
+    m.ok("save_workbook", json!({"path": "saved.xlsx"}));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!dir.join(&file).exists(), "the saved file supersedes the checkpoint");
+    let st = m.ok("server_status", json!({}));
+    assert!(st["memory"]["rss_bytes"].as_u64().unwrap() > 1_000_000, "real memory measurement: {st}");
+}

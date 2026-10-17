@@ -10,6 +10,8 @@ use serde_json::{Value, json};
 /// another thread (SIGTERM, eviction) without asking the busy worker.
 #[derive(Clone, Debug)]
 pub struct DocSnapshot {
+    /// Identifies the document (a new or reopened one has another).
+    pub uid: u64,
     pub wb: std::sync::Arc<gridcraft_engine::model::Workbook>,
     pub title: String,
     pub path: Option<String>,

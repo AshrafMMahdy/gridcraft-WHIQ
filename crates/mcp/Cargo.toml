@@ -14,3 +14,5 @@ serde_json = { workspace = true }
 log = { workspace = true }
 # WHIQ: auto-save on SIGTERM / SIGINT / SIGHUP (Ctrl-C, Ctrl-Break, console close on Windows).
 ctrlc = { version = "3.4", features = ["termination"] }
+# WHIQ: the process's resident memory on Linux, Windows and macOS (server_status, --max-memory-mb).
+memory-stats = "1.2"

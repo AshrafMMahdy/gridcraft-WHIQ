@@ -56,6 +56,10 @@ pub struct RuntimeConfig {
     pub handle_signals: bool,
     /// A call arriving while another runs waits this long for it before answering `busy`.
     pub busy_grace: Duration,
+    /// Checkpoint unsaved work to the recovered file after this many changing calls (0: never).
+    pub checkpoint_edits: u64,
+    /// … and when unsaved changes are this old (`None`: never).
+    pub checkpoint_interval: Option<Duration>,
 }
 
 impl Default for RuntimeConfig {
@@ -71,6 +75,8 @@ impl Default for RuntimeConfig {
             read_root: None,
             handle_signals: true,
             busy_grace: Duration::from_millis(300),
+            checkpoint_edits: 20,
+            checkpoint_interval: Some(Duration::from_secs(60)),
         }
     }
 }
@@ -116,6 +122,22 @@ enum Work {
     Evict { reason: String },
 }
 
+/// WHIQ: the periodic checkpoint of unsaved work (one recovered file per document, rewritten).
+#[derive(Debug, Default)]
+struct Checkpoint {
+    /// The document it is for.
+    uid: u64,
+    path: Option<PathBuf>,
+    /// The workbook (its address) last seen, and last written.
+    seen: usize,
+    written: usize,
+    /// Calls that changed the workbook since the last write.
+    edits: u64,
+    /// When the unsaved changes not yet written began.
+    since: Option<Instant>,
+    writes: u64,
+}
+
 struct Shared {
     out: Mutex<Box<dyn Write + Send>>,
     jobs: Mutex<Jobs>,
@@ -127,6 +149,7 @@ struct Shared {
     idle_done: AtomicBool,
     /// The worker thread (what `cancel` stops).
     worker: Mutex<Option<std::thread::ThreadId>>,
+    checkpoint: Mutex<Checkpoint>,
     config: RuntimeConfig,
     started: Instant,
 }
@@ -167,19 +190,84 @@ impl Shared {
             .or_else(|| std::env::current_dir().ok())?;
         let stem = Path::new(&snap.title).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Book".into());
         let stem: String = stem.chars().map(|c| if c.is_alphanumeric() || " -_.()".contains(c) { c } else { '_' }).collect();
-        let path = dir.join(format!("{}.recovered-{}.xlsx", stem.trim(), stamp()));
+        // The document's checkpoint file, when it has one, is brought up to date rather than
+        // joined by another file.
+        let existing = {
+            let cp = lock(&self.checkpoint);
+            cp.path.clone().filter(|_| cp.uid == snap.uid)
+        };
+        let path = existing.clone().unwrap_or_else(|| dir.join(format!("{}.recovered-{}.xlsx", stem.trim(), stamp())));
         let text = path.to_string_lossy().into_owned();
         let saved = gridcraft_engine::io::save_bytes(&snap.wb, &text).and_then(|bytes| gridcraft_engine::io::write_file(&text, &bytes));
         match saved {
             Ok(()) => {
                 eprintln!("gridcraft-cli: {why}: unsaved work auto-saved to {text}");
-                lock(&self.recovered).push(text);
+                {
+                    let mut cp = lock(&self.checkpoint);
+                    if cp.uid == snap.uid {
+                        cp.path = Some(path.clone());
+                        cp.written = Arc::as_ptr(&snap.wb) as usize;
+                        cp.edits = 0;
+                        cp.since = None;
+                    }
+                }
+                let mut rec = lock(&self.recovered);
+                if !rec.contains(&text) {
+                    rec.push(text);
+                }
                 Some(path)
             }
             Err(e) => {
                 eprintln!("gridcraft-cli: {why}: auto-save to {text} failed: {e}");
                 None
             }
+        }
+    }
+
+    /// Notes the document after a call: counts changes, forgets the checkpoint once saved.
+    fn note_call(&self, snap: Option<&DocSnapshot>) {
+        let Some(s) = snap else { return };
+        let ptr = Arc::as_ptr(&s.wb) as usize;
+        let mut cp = lock(&self.checkpoint);
+        if cp.uid != s.uid {
+            // Another document: the old checkpoint file stays (it holds that document's work).
+            *cp = Checkpoint { uid: s.uid, seen: ptr, written: ptr, ..Checkpoint::default() };
+        }
+        if ptr != cp.seen {
+            cp.seen = ptr;
+            if s.dirty {
+                cp.edits += 1;
+                cp.since.get_or_insert_with(Instant::now);
+            }
+        }
+        if !s.dirty {
+            // Saved (or untouched): the checkpoint is out of date and the file on disk is newer.
+            if let Some(p) = cp.path.take() {
+                let _ = std::fs::remove_file(&p);
+                let text = p.to_string_lossy().into_owned();
+                lock(&self.recovered).retain(|r| *r != text);
+            }
+            cp.edits = 0;
+            cp.since = None;
+            cp.written = ptr;
+        }
+    }
+
+    /// Writes the checkpoint when it is due: `checkpoint_edits` changing calls, or unsaved
+    /// changes older than `checkpoint_interval`, not yet written.
+    fn checkpoint_if_due(&self) {
+        let snap = lock(&self.snapshot).clone();
+        let Some(snap) = snap.filter(|s| s.dirty) else { return };
+        let due = {
+            let cp = lock(&self.checkpoint);
+            let n = self.config.checkpoint_edits;
+            cp.uid == snap.uid
+                && Arc::as_ptr(&snap.wb) as usize != cp.written
+                && cp.edits > 0
+                && ((n > 0 && cp.edits >= n) || self.config.checkpoint_interval.is_some_and(|i| cp.since.is_some_and(|t| t.elapsed() >= i)))
+        };
+        if due && self.autosave(&snap, "checkpoint").is_some() {
+            lock(&self.checkpoint).writes += 1;
         }
     }
 
@@ -211,12 +299,23 @@ impl Shared {
             j.map.iter().filter(|(_, x)| x.handed_off || x.state == JobState::Running).map(|(n, x)| self.job_summary(*n, x)).collect()
         };
         let evicted = lock(&self.evicted).clone();
+        let checkpoint = {
+            let cp = lock(&self.checkpoint);
+            json!({
+                "path": cp.path.as_ref().map(|p| p.display().to_string()),
+                "pending_edits": cp.edits,
+                "writes": cp.writes,
+                "every_edits": self.config.checkpoint_edits,
+                "every_secs": self.config.checkpoint_interval.map(|d| d.as_secs_f64()),
+            })
+        };
         let extra = json!({
             "mode": "concurrent",
             "uptime_ms": self.started.elapsed().as_millis() as u64,
             "busy": busy.map(|b| json!({"tool": b.tool, "job_id": job_name(b.job), "elapsed_ms": b.started.elapsed().as_millis() as u64})),
             "jobs": jobs,
             "recovered_files": lock(&self.recovered).clone(),
+            "checkpoint": checkpoint,
             "evicted": evicted.map(|e| json!({"reason": e.reason, "recovered_path": e.recovered.map(|p| p.display().to_string()), "original_path": e.original})),
             "limits": {
                 "call_timeout_ms": self.config.call_timeout.as_millis() as u64,
@@ -409,6 +508,7 @@ pub fn serve(
         last_activity: Mutex::new(Instant::now()),
         idle_done: AtomicBool::new(false),
         worker: Mutex::new(None),
+        checkpoint: Mutex::new(Checkpoint::default()),
         config: config.clone(),
         started: Instant::now(),
     });
@@ -437,7 +537,9 @@ pub fn serve(
                 found.join(", ")
             ));
         }
-        *lock(&ws.snapshot) = server.backend().snapshot();
+        let snap = server.backend().snapshot();
+        ws.note_call(snap.as_ref());
+        *lock(&ws.snapshot) = snap;
         worker_loop(&mut server, &ws, work_rx);
     })?;
 
@@ -461,6 +563,17 @@ pub fn serve(
                 if tx.send(Work::Evict { reason }).is_err() {
                     return;
                 }
+            }
+        });
+    }
+
+    // WHIQ: periodic checkpoints of unsaved work (a hard kill then loses little).
+    if config.checkpoint_edits > 0 || config.checkpoint_interval.is_some() {
+        let s = shared.clone();
+        let _ = std::thread::Builder::new().name("gridcraft-checkpoint".into()).spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis(200));
+                s.checkpoint_if_due();
             }
         });
     }
@@ -726,7 +839,9 @@ fn worker_loop(server: &mut Server, shared: &Shared, rx: mpsc::Receiver<Work>) {
                         json!({"jsonrpc": "2.0", "id": id, "result": ToolResult::failure(&e).to_value()})
                     }
                 };
-                *lock(&shared.snapshot) = server.backend().snapshot();
+                let snap = server.backend().snapshot();
+                shared.note_call(snap.as_ref());
+                *lock(&shared.snapshot) = snap;
                 *lock(&shared.evicted) = server.state_mut().evicted.clone();
                 {
                     let mut jobs = lock(&shared.jobs);

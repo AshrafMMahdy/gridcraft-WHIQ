@@ -1049,6 +1049,10 @@ fn nearby_files(path: &str) -> Vec<String> {
 
 /// Resident memory of this process in bytes (Linux), else `None`.
 pub fn rss_bytes() -> Option<u64> {
+    // Resident set size on Linux, working set on Windows, resident size on macOS.
+    if let Some(m) = memory_stats::memory_stats() {
+        return Some(m.physical_mem as u64);
+    }
     let text = std::fs::read_to_string("/proc/self/statm").ok()?;
     let pages: u64 = text.split_whitespace().nth(1)?.parse().ok()?;
     Some(pages.saturating_mul(4096))

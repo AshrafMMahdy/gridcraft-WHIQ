@@ -58,6 +58,7 @@ const USAGE: &str = "usage:
                     [--automation-read-root DIR] [--automation-write-root DIR]
                     [--call-timeout-ms N] [--max-memory-mb N] [--evict-idle-secs N]
                     [--job-open-mb N] [--job-cells N] [--max-result-kb N] [--max-read-cells N]
+                    [--checkpoint-edits N (20)] [--checkpoint-secs N (60)]
                      --automation-*-root confine every file the headless server reads/writes;
                      saves never replace an existing file silently (it becomes OLD_<name>);
                      busy/jobs/auto-save: see WHIQ-CHANGES.md
@@ -590,6 +591,8 @@ fn mcp(args: &[String]) -> Result<(), String> {
             "job-cells",
             "max-result-kb",
             "max-read-cells",
+            "checkpoint-edits",
+            "checkpoint-secs",
         ],
         &["no-signals"],
     )?;
@@ -627,6 +630,13 @@ fn mcp(args: &[String]) -> Result<(), String> {
     }
     if let Some(n) = num("max-read-cells")? {
         config.settings.max_read_cells = (n as u64).max(1);
+    }
+    // WHIQ: periodic checkpoints of unsaved work to the recovered file (0 turns one off).
+    if let Some(n) = num("checkpoint-edits")? {
+        config.checkpoint_edits = n as u64;
+    }
+    if let Some(n) = num("checkpoint-secs")? {
+        config.checkpoint_interval = (n > 0.0).then(|| std::time::Duration::from_secs_f64(n.max(0.2)));
     }
     config.handle_signals = !a.has("no-signals");
     if let Some(r) = &roots {

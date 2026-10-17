@@ -303,6 +303,26 @@ the path must be absolute.)
   workbook exactly as before and still working; `notifications/cancelled`; `not_running`,
   `not_found`), engine `cancelled_commands_roll_back`.
 
+## Checkpoints and memory (round 2)
+
+- **Periodic checkpoint auto-save** (`gridcraft-cli mcp --checkpoint-edits N` (default 20)
+  `--checkpoint-secs S` (default 60), 0 turns either off): a background thread writes the open
+  document's unsaved work to its recovered file (`<name>.recovered-<stamp>.xlsx` in the write
+  root) after N calls that changed the workbook, or once unsaved changes are S seconds old. One
+  file per document, rewritten in place (atomically) each time; eviction, signal and hang-up
+  auto-saves update the same file instead of adding one; saving the document deletes it (the
+  saved file is newer). So a hard kill (`kill -9`, Task Manager's End task, a power cut) loses at
+  most N calls or S seconds of work, and the next server announces the file (`recovered_files`).
+  Writing never blocks calls (the workbook snapshot is immutable). `server_status` reports
+  `checkpoint: {path, pending_edits, writes, every_edits, every_secs}`.
+- **Memory** is measured on Linux, Windows (working set) and macOS (resident size) with the
+  `memory-stats` crate (`/proc/self/statm` remains the Linux fallback), so `server_status`
+  `memory.rss_bytes` and `--max-memory-mb` eviction work on all three (`memory-stats` checked for
+  `x86_64-pc-windows-gnu` and `x86_64-apple-darwin`).
+- Test: contract `checkpoints_survive_a_hard_kill` (no file after 2 changes, one after 3, the same
+  file rewritten after 3 more, SIGKILL, the file holds all six edits and the next server lists it;
+  a time-based checkpoint; saving removes it; real `rss_bytes`).
+
 ## Tests
 
 - `cargo test` runs everything; the WHIQ-specific suites:
@@ -332,6 +352,4 @@ the path must be absolute.)
   Arabic script has no italic design anywhere, so italic Arabic is slanted; CJK has no bold or
   italic face in craft-fonts, so bold CJK is the regular weight and italic CJK is slanted.
   System fonts are not looked up (every export looks the same on every machine).
-- Memory is measured on Linux (`/proc/self/statm`); elsewhere `server_status` gives an estimate
-  from the cell count and `--max-memory-mb` has nothing to compare with.
 - Upstream's docs (`docs/*.md`, ROADMAP) are not edited by the fork; this file is the record.
