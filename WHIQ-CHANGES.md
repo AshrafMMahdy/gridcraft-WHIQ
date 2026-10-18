@@ -336,6 +336,68 @@ the path must be absolute.)
   `/BaseFont /Helvetica` by default, `(hello) Tj` only with `standardFonts`, which is smaller);
   upstream's tests that read drawn text as `(text) Tj` ask for `standardFonts`.
 
+## Parity pass (2026-10-18): one contract surface for the three craft forks
+
+WordCraft, GridCraft and DeckCraft were built independently against the same contract; this pass
+read the three MCP servers side by side and gave them one shared surface. **`CONTRACT-PARITY.md`**
+(the same file in the three repositories) is the table: every contract item, what each app did
+before, and the one shape all three answer with now. Where an earlier section of this file says
+otherwise (an error code, a field name, a flag, a default), the parity pass and
+`CONTRACT-PARITY.md` are what holds. Domain tools keep their names.
+
+| Change | Ported from | Where | Tested by (`tests/mcp-contract/` unless noted) |
+|---|---|---|---|
+| Error codes from the shared set of 18 (`contract::code::ALL`): `internal_error` → `internal`, `no_ui` → `unsupported`, `unavailable` → `not_available`, `parse_error` → `invalid_request`, `out_of_range` classified; cancel's `not_running` error became a success answer; an unknown tool is a tool result (`not_found` + `closest`), no longer JSON-RPC `-32602`; the error text block is `[code] reason` / `next_step: …` | WC, DC | `crates/mcp/src/contract.rs`, `whiq.rs`, `runtime.rs`, `server.rs` | every call: `harness::Mcp::call` checks the code is in the shared list; `contract::errors_carry_code_reason_and_next_step`, `crates/mcp/src/tests.rs` |
+| Progress on every call and job — `progress` 0..1, `stage`, `steps`, `stages` — from a new `gridcraft_core::progress` (the MCP worker turns it on for itself; elsewhere a no-op): formulas recalculated, rows of cells written, sheets read and written, PDF pages drawn; `job_status` and `server_status.current_call` report it | DC, WC | `crates/core/src/progress.rs` (new), `crates/calc/src/recalc.rs`, `crates/engine/src/cmd/edit.rs`, `crates/engine/src/cmd/print.rs`, `crates/xlsx/src/read.rs`, `crates/xlsx/src/write.rs`, `runtime.rs` | `contract::busy_and_jobs`, `contract::large_open_is_a_job`, `progress::tests` |
+| `job_status` in the shared shape (`status`, `result` or `error`, a finished job's pictures as content; `is_error` gone); `list_jobs`; `job_status {}` lists | DC, WC | `runtime.rs` (`job_summary`, `job_status`, `list_jobs`) | `contract::busy_and_jobs` |
+| `notifications/cancelled` (clients send it on their own timeouts) no longer stops the call: it carries on as a job, its answer kept for `job_status`; `cancel` answers `{cancelled, status, job_id, tool, next_step}` and takes `queued` | WC | `runtime.rs` (`cancel`, `Job::client_cancelled`) | `contract::cancel_stops_calls_and_jobs_and_keeps_the_document` |
+| Progress notifications: a request with `_meta.progressToken` gets `notifications/progress` while it runs | WC | `runtime.rs` (`progress_notification`, `gridcraft-progress` thread) | `contract::a_call_with_a_progress_token_gets_progress_notifications` |
+| Flags: `--job-after-ms` (15000; was `--call-timeout-ms` 20000), `--busy-after-ms` (300, now settable), `--open-job-mb` (was `--job-open-mb`), `--idle-evict-secs` (was `--evict-idle-secs`), `--max-result-bytes` (was `--max-result-kb`); the old names are still read | WC, DC | `apps/gridcraft-cli/src/main.rs` | `contract::*` use the new names |
+| `evict` tool (for a supervisor); `server_status.evicted` is a list `[{name, reason, recovered_path, original_path}]` | DC | `runtime.rs` (`worker_loop`, `evict`), `whiq.rs` | `contract::evicted_work_is_recovered`, `smoke.sh` |
+| Recovered files: `<name>.recovered-<YYYYMMDD-HHMMSS>.xlsx` (no milliseconds; `-2`… if taken); reported as `recovered_files: [{path, reason, original, at}]` on the next answer (once) and in `server_status` (was a warning line and a list of paths); a live checkpoint shows under `server_status.checkpoints.files` (`checkpoint` → `checkpoints {every_edits, every_secs, pending_edits, writes, files}`); the start-up scan skips a crash's `.sctmp` | WC, DC | `runtime.rs` (`autosave`, `announce`, `find_recovered`, `stamp`) | `contract::sigterm_autosaves_and_the_next_start_names_it`, `contract::checkpoints_survive_a_hard_kill` |
+| `server_status` in the shared shape: `documents [{name, title, path, dirty, active, sheets, cells}]` (was `document` with `unsaved_changes`), `current_call` (was `busy`), `memory {rss_bytes, committed_bytes, limit_bytes, measured, source}`, `fonts {source, faces, families, default, arabic}`, `protocol`, `pid`, `backend`, `idle_ms`, `calls`, `busy_replies`, `limits` | WC, DC | `whiq.rs` (`status_value`), `runtime.rs` (`status`) | `contract::oversized_results_are_trimmed` |
+| OLD_: `OLD_<name>`, then `OLD_2_<name>` (was `OLD_<stem>-2.<ext>`), and the server's own earlier save is kept too (it was replaced silently: the contract says only `overwrite: true` replaces); reported as `previous_files_renamed: [{path, previous}]` + `notice` + a warning (was `saved[].previous_renamed_to`); recovered files are rewritten in place (they are the server's own) | WC, DC | `crates/engine/src/io.rs` (`save_policy`), `whiq.rs` (`run_tool`), `runtime.rs` | `contract::old_rename`, `authoring::in_place_edits_keep_charts_pivots_slicers_and_unmodelled_parts`, engine `io::tests::keep_old_policy_renames_the_previous_file` |
+| Trimmed results continue with `continue_from` on any tool (`contract::trim_from`; on `list_commands` / `list_functions` it is read as `offset`); `max_bytes` per call | WC | `contract.rs`, `whiq.rs` | `contract::byte_budget_trims_any_result`, `contract::tests` |
+| `roundtrip_check`: open + save a workbook in memory and report what a save would drop — parts, relationships, content types, binary parts, each XML part's element inventory — with WordCraft's report keys | WC | `crates/mcp/src/roundtrip.rs` (new), `whiq.rs` | `contract::roundtrip_check_reports_what_a_save_would_keep`, `roundtrip::tests`, `smoke.sh` |
+| Annotations: `cancel` and `evict` not destructive, idempotent (`cancel` was destructive); `list_jobs`, `roundtrip_check` read-only | — | `whiq.rs` | `contract::annotations` |
+| `whiq-release.yml` and `engines.lock.example` (below) | — | `.github/workflows/whiq-release.yml`, `engines.lock.example` | the workflow runs the contract suite and `smoke.sh` on the built binary |
+
+### Fonts: one craft-fonts pin for the three forks
+
+The WHIQ release, the recipe above ("Fonts (round 2)") and `whiq-release.yml` pin craft-fonts
+**`43913056ce82a3fdad0ef69f6b88d1dc922a8104`**, the same commit WordCraft and DeckCraft pin now.
+The upstream `release.yml` (which says abb8331, for upstream's own signed releases) is not
+modified.
+
+### Release workflow
+
+`.github/workflows/whiq-release.yml` (new; the upstream `release.yml` is untouched): on a tag
+`whiq-v*` (or Run workflow, with an optional tag to publish) it builds only `gridcraft-cli`, for
+`x86_64-unknown-linux-musl` (static: the host's glibc does not matter) on ubuntu-22.04 and
+`x86_64-pc-windows-msvc` (static C runtime) on windows-2022, with craft-fonts checked out at the
+pin and `CRAFT_FONTS_REQUIRED=1`; runs the contract suite against the built binary on both (`GRIDCRAFT_CLI`), and
+`smoke.sh` plus a "statically linked" check on Linux; and publishes a GitHub release with
+`gridcraft-cli-<tag>-linux-x86_64.tar.gz`, `gridcraft-cli-<tag>-windows-x86_64.zip` (binary, licences,
+the embedded fonts' licences, `CONTRACT-PARITY.md`, `WHIQ-CHANGES.md`, `BUILD.txt`), `SHA256SUMS`
+and `engines.lock`. Actions are pinned by commit (checkout, rust-toolchain, rust-cache, as in
+upstream CI) or by major (upload/download-artifact); no signing; no secrets (the job's own
+`GITHUB_TOKEN` publishes). `engines.lock.example` at the root shows the JSON the platform's build
+script reads: a list of `{app, tag, file, sha256}`, one per archive; the release's `engines.lock`
+is that file with the real hashes.
+
+
+### Test status after the parity pass (Linux x86_64, 2026-10-18, craft-fonts 43913056, `CRAFT_FONTS_REQUIRED=1`)
+
+- `cargo build --release -p gridcraft-cli` succeeds; the contract suite against the release binary
+  (`GRIDCRAFT_CLI=target/release/gridcraft-cli cargo test --release -p gridcraft-cli`) passes:
+  `mcp_contract` 26/26 (24 before, plus `roundtrip_check` and progress notifications) and the
+  CLI's other tests; `smoke.sh` passes on it.
+- The crates the pass touched (`gridcraft-core`, `-calc`, `-xlsx`, `-engine`, `-mcp`, `-text`,
+  `-pdf`): 720 tests pass, 0 fail, 1 ignored (upstream's); `cargo clippy --no-deps -D warnings`
+  and `cargo fmt --check` on `gridcraft-mcp` / `gridcraft-cli` pass.
+- musl: `cargo build --release --locked -p gridcraft-cli --target x86_64-unknown-linux-musl` gives a
+  `static-pie linked` binary; the contract suite (26/26) and `smoke.sh` pass on it.
+
 ## Tests
 
 - `cargo test` runs everything; the WHIQ-specific suites:
