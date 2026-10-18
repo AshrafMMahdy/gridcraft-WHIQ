@@ -345,7 +345,9 @@ the path must be absolute.)
     large-open job, oversized results and byte budget, idle and memory eviction with recovery,
     SIGTERM auto-save named by the next process, panic, hang-up, OLD_ rename, confinement with
     symlink escapes, annotations, forgiving inputs, caller identity); `render.rs` the Arabic PNG and
-    PDF checks and page setup; `authoring.rs` build_workbook, recalculate and in-place edits. Set
+    PDF checks and page setup; `authoring.rs` build_workbook, recalculate, in-place edits and the
+    PivotTable + slicer fixture (open → edit → save → reopen → `check`); round 2 adds `cancel`
+    and checkpoint tests to `contract.rs`. Set
     `GRIDCRAFT_CLI=target/release/gridcraft-cli` to test a release build. The tests that read PDF
     text use poppler's `pdftotext` when it is installed (and are skipped otherwise).
   - unit tests in `gridcraft-text`, `gridcraft-raster`, `gridcraft-pdf`, `gridcraft-mcp`
@@ -354,9 +356,19 @@ the path must be absolute.)
   (or `tests/mcp-contract/smoke.sh path/to/gridcraft-cli`): one JSON-RPC request at a time, the
   way the platform's client talks — initialize, tools/list, server_status, build_workbook (Arabic
   RTL sheet, table, chart, formulas), read_range, render_sheet, export_pdf with page setup, a save
-  over an existing file (OLD_), a refused path outside the root, forgiving names, recalculate —
-  and checks the files, the embedded Arabic font (`pdffonts`) and the extracted text
-  (`pdftotext`). It prints the folder with every output and exits non-zero on a failure.
+  over an existing file (OLD_), a refused path outside the root, forgiving names, recalculate,
+  `cancel`, and the PivotTable + slicer fixture opened, listed and saved — and checks the files,
+  that craft-fonts are embedded and memory is measured, every PDF font embedded as a subset
+  (Carlito and Noto Sans Arabic, `pdffonts`), the extracted Arabic text (`pdftotext`), both slicer
+  caches in the saved file and `gridcraft-cli check` on it. It prints the folder with every output
+  and exits non-zero on a failure.
+- Run the tests with craft-fonts and `CRAFT_FONTS_REQUIRED=1` (see "Fonts"): font-dependent tests
+  then fail rather than skip. Every test executable links the ~60 MB of fonts; on a small disk run
+  `cargo test -p <crate>` one crate (or `--test` target) at a time.
+- Round 2 status (2026-10-18, craft-fonts at the pinned commit, `CRAFT_FONTS_REQUIRED=1`): every
+  default member's tests pass — 1 683 passed, 0 failed, 1 ignored (upstream's) — plus `cargo clippy
+  --all-targets -D warnings`, `cargo fmt --check`, `cargo xtask layers / assets / wasm`, the
+  contract suite against the release binary (24/24) and the smoke script on the release binary.
 
 ## Not done / known limits
 
