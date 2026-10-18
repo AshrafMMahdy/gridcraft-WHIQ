@@ -42,7 +42,7 @@ pub fn folder(name: &str) -> PathBuf {
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let d = std::env::temp_dir().join(format!("gc-mcp-contract-{}-{name}-{stamp}", std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
-    std::fs::canonicalize(&d).unwrap()
+    plain_path(std::fs::canonicalize(&d).unwrap())
 }
 
 pub struct Mcp {
@@ -264,4 +264,15 @@ pub fn zip_text(path: &Path, name: &str) -> String {
     let mut s = String::new();
     z.by_name(name).unwrap().read_to_string(&mut s).unwrap();
     s
+}
+
+/// The canonical path in the form the server reports it: on Windows, canonicalize gives the verbatim `\\?\C:\...` form, while
+/// the server (and the person reading its answers) uses the plain `C:\...` path to the same folder. A UNC path keeps its prefix.
+pub fn plain_path(p: PathBuf) -> PathBuf {
+    if let Some(rest) = p.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        if !rest.starts_with(r"UNC\") {
+            return PathBuf::from(rest);
+        }
+    }
+    p
 }
