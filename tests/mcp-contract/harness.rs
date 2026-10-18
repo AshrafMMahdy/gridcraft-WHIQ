@@ -9,6 +9,28 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+/// The error codes every craft app answers with (CONTRACT-PARITY.md): no other code may appear.
+pub const CODES: &[&str] = &[
+    "busy",
+    "cancelled",
+    "disk_full",
+    "evicted",
+    "failed",
+    "internal",
+    "invalid_argument",
+    "invalid_request",
+    "locked",
+    "no_document",
+    "not_available",
+    "not_found",
+    "out_of_range",
+    "outside_root",
+    "password_required",
+    "too_large",
+    "unsupported",
+    "wrong_password",
+];
+
 /// The binary under test: `GRIDCRAFT_CLI` (e.g. a release build), else the one cargo built for
 /// this test.
 pub fn binary() -> PathBuf {
@@ -124,6 +146,10 @@ impl Mcp {
         assert!(v.get("error").is_none(), "{name}: protocol error {v}");
         let r = v["result"].clone();
         assert!(r["structuredContent"].is_object(), "{name}: every result carries structuredContent: {r}");
+        if r["isError"] == true {
+            let c = r["structuredContent"]["error"]["code"].as_str().unwrap_or("");
+            assert!(CODES.contains(&c), "{name}: `{c}` is not a shared error code: {r}");
+        }
         r
     }
 

@@ -533,13 +533,21 @@ pub mod save_policy {
 
     /// The name the file at `target` must be moved to before it is replaced, if it must be.
     pub(crate) fn keep_old_for(target: &Path) -> Option<PathBuf> {
-        if !keeps_old_files() || OVERWRITE.with(Cell::get) || !target.is_file() || own(target) {
+        // WHIQ parity pass: every existing file is kept, the server's own earlier saves too (the
+        // contract's rule in every craft app: only `overwrite: true` replaces a file).
+        if !keeps_old_files() || OVERWRITE.with(Cell::get) || !target.is_file() {
             return None;
         }
         Some(old_name(target))
     }
 
-    /// `dir/OLD_<name>`, or the first free `dir/OLD_<stem>-N.<ext>`.
+    /// Whether this process wrote `path` earlier (kept for callers that ask).
+    pub fn written_here(path: &Path) -> bool {
+        own(path)
+    }
+
+    /// `dir/OLD_<name>`, or the first free `dir/OLD_<N>_<name>` (N from 2): the names every
+    /// craft app uses.
     pub fn old_name(target: &Path) -> PathBuf {
         let dir = target.parent().map(Path::to_path_buf).unwrap_or_default();
         let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -547,9 +555,7 @@ pub mod save_policy {
         if !first.exists() {
             return first;
         }
-        let stem = target.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let ext = target.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
-        (2..10_000u32).map(|n| dir.join(format!("OLD_{stem}-{n}{ext}"))).find(|p| !p.exists()).unwrap_or(first)
+        (2..10_000u32).map(|n| dir.join(format!("OLD_{n}_{name}"))).find(|p| !p.exists()).unwrap_or(first)
     }
 
     pub(crate) fn wrote(target: &Path, previous: Option<PathBuf>) {
@@ -697,8 +703,8 @@ mod tests {
     }
 
     /// WHIQ: with the keep-old policy on, a save never replaces a file silently: the previous
-    /// file becomes `OLD_<name>` (then `OLD_<stem>-2.<ext>`), overwriting needs
-    /// `allow_overwrite`, and the process's own earlier save is replaced in place.
+    /// file becomes `OLD_<name>` (then `OLD_2_<name>`, `OLD_3_<name>`…), even the process's own
+    /// earlier save (parity pass), and overwriting needs `allow_overwrite`.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn keep_old_policy_renames_the_previous_file() {
@@ -715,16 +721,16 @@ mod tests {
         let r = save_policy::take_reports();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].previous_renamed_to.as_deref(), Some(dir.join("OLD_Book.xlsx").as_path()));
-        // Our own save is replaced in place.
+        // Our own save is kept too, under the next free OLD_ name.
         write_file(book.to_str().unwrap(), b"v2").unwrap();
-        assert_eq!(save_policy::take_reports()[0].previous_renamed_to, None);
-        assert!(!dir.join("OLD_Book-2.xlsx").exists());
-        // Another file already there, with OLD_ taken: OLD_<stem>-2.
+        assert_eq!(save_policy::take_reports()[0].previous_renamed_to.as_deref(), Some(dir.join("OLD_2_Book.xlsx").as_path()));
+        assert_eq!(std::fs::read(dir.join("OLD_2_Book.xlsx")).unwrap(), b"v1");
+        // Another file already there, with OLD_ taken: OLD_2_<name>.
         let other = dir.join("Other.xlsx");
         std::fs::write(&other, b"a").unwrap();
         std::fs::write(dir.join("OLD_Other.xlsx"), b"older").unwrap();
         write_file(other.to_str().unwrap(), b"b").unwrap();
-        assert_eq!(std::fs::read(dir.join("OLD_Other-2.xlsx")).unwrap(), b"a");
+        assert_eq!(std::fs::read(dir.join("OLD_2_Other.xlsx")).unwrap(), b"a");
         assert_eq!(std::fs::read(dir.join("OLD_Other.xlsx")).unwrap(), b"older");
         // overwrite: true replaces without a copy.
         let third = dir.join("Third.csv");

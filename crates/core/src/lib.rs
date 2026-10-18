@@ -7,6 +7,7 @@ pub mod addr;
 pub mod cancel;
 pub mod date;
 pub mod parse;
+pub mod progress;
 pub mod value;
 
 pub use addr::{CellRef, MAX_COLS, MAX_ROWS, RangeRef, col_to_letters, letters_to_col};

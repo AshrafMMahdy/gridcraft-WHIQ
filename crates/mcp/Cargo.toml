@@ -16,3 +16,6 @@ log = { workspace = true }
 ctrlc = { version = "3.4", features = ["termination"] }
 # WHIQ: the process's resident memory on Linux, Windows and macOS (server_status, --max-memory-mb).
 memory-stats = "1.2"
+# WHIQ parity pass: roundtrip_check reads both packages (OPC part list, relationships, XML).
+zip = { workspace = true }
+quick-xml = { workspace = true }

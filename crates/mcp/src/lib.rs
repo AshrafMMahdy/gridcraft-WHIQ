@@ -17,6 +17,7 @@
 mod backend;
 pub mod contract;
 mod headless;
+pub mod roundtrip;
 pub mod runtime;
 mod server;
 mod tools;

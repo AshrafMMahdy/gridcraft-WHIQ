@@ -211,7 +211,7 @@ fn in_place_edits_keep_charts_pivots_slicers_and_unmodelled_parts() {
     m.ok("rename_sheet", json!({"sheet": "Summary", "name": "Résumé ملخص"}));
     m.ok("write_range", json!({"range": "'Résumé ملخص'!A1", "values": [["Total", "=SUM(Data!C2:C5)"]]}));
     let v = m.ok("save_workbook", json!({}));
-    assert!(v["saved"][0]["previous_renamed_to"].as_str().unwrap().ends_with("OLD_customer.xlsx"), "the original is kept: {v}");
+    assert!(v["previous_files_renamed"][0]["previous"].as_str().unwrap().ends_with("OLD_customer.xlsx"), "the original is kept: {v}");
 
     let after = zip_entries(&base);
     for p in before.iter().filter(|p| !p.starts_with("xl/worksheets/") && !p.ends_with(".rels") && *p != "[Content_Types].xml") {

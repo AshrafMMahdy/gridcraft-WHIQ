@@ -1831,6 +1831,8 @@ pub fn render_pdf_with(
             if pages.is_some_and(|(a, b)| page_no < a || page_no > b) {
                 continue;
             }
+            // WHIQ parity pass: progress by page for job_status.
+            gridcraft_core::progress::step_in("drawing pages", page_no as u64 - 1, total as u64);
             let (Some(rband), Some(cband)) = (lay.row_bands.get(*ri).copied(), lay.col_bands.get(*ci).copied()) else { continue };
             let rsegs = segments(lay.title_rows, rband);
             let csegs = segments(lay.title_cols, cband);

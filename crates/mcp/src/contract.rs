@@ -13,8 +13,52 @@
 
 use serde_json::{Map, Value, json};
 
-/// Arguments every tool accepts besides its own.
-pub const GLOBAL_ARGS: &[&str] = &["caller", "async", "overwrite"];
+/// Arguments every tool accepts besides its own: the same in every craft app (CONTRACT-PARITY.md).
+pub const GLOBAL_ARGS: &[&str] = &["caller", "async", "overwrite", "continue_from", "max_bytes"];
+
+/// The error codes an agent can branch on: the same set in WordCraft, GridCraft and DeckCraft
+/// (CONTRACT-PARITY.md). Every error a tool answers carries one of these.
+pub mod code {
+    pub const BUSY: &str = "busy";
+    pub const CANCELLED: &str = "cancelled";
+    pub const DISK_FULL: &str = "disk_full";
+    pub const EVICTED: &str = "evicted";
+    pub const FAILED: &str = "failed";
+    pub const INTERNAL: &str = "internal";
+    pub const INVALID_ARGUMENT: &str = "invalid_argument";
+    pub const INVALID_REQUEST: &str = "invalid_request";
+    pub const LOCKED: &str = "locked";
+    pub const NO_DOCUMENT: &str = "no_document";
+    pub const NOT_AVAILABLE: &str = "not_available";
+    pub const NOT_FOUND: &str = "not_found";
+    pub const OUT_OF_RANGE: &str = "out_of_range";
+    pub const OUTSIDE_ROOT: &str = "outside_root";
+    pub const PASSWORD_REQUIRED: &str = "password_required";
+    pub const TOO_LARGE: &str = "too_large";
+    pub const UNSUPPORTED: &str = "unsupported";
+    pub const WRONG_PASSWORD: &str = "wrong_password";
+    /// Every code, sorted.
+    pub const ALL: &[&str] = &[
+        BUSY,
+        CANCELLED,
+        DISK_FULL,
+        EVICTED,
+        FAILED,
+        INTERNAL,
+        INVALID_ARGUMENT,
+        INVALID_REQUEST,
+        LOCKED,
+        NO_DOCUMENT,
+        NOT_AVAILABLE,
+        NOT_FOUND,
+        OUT_OF_RANGE,
+        OUTSIDE_ROOT,
+        PASSWORD_REQUIRED,
+        TOO_LARGE,
+        UNSUPPORTED,
+        WRONG_PASSWORD,
+    ];
+}
 
 /// Results above this many bytes of JSON are trimmed.
 pub const MAX_RESULT_BYTES: usize = 256 * 1024;
@@ -50,9 +94,9 @@ impl ToolError {
         Value::Object(o)
     }
 
-    /// The text block shown to the model: the reason, then what to do.
+    /// The text block shown to the model (the same form in every craft app).
     pub fn text(&self) -> String {
-        format!("{}: {}\nNext step: {}", self.code, self.reason, self.next_step)
+        format!("[{}] {}\nnext_step: {}", self.code, self.reason, self.next_step)
     }
 }
 
@@ -203,6 +247,7 @@ const ARG_SYNONYMS: &[(&str, &[&str])] = &[
     ("params", &["parameters", "args", "arguments", "options"]),
     ("type", &["charttype", "kind"]),
     ("job_id", &["id", "job", "jobid"]),
+    ("offset", &["continuefrom", "skip", "start"]),
     ("name", &["newname", "title"]),
     ("search", &["query", "filter", "q"]),
 ];
@@ -359,9 +404,47 @@ pub fn normalize_args(schema: &Value, args: &Map<String, Value>) -> (Map<String,
 
 // ---------------------------------------------------------------- trimming
 
+/// [`trim_result`] resuming at item `from` of the result's largest list (the `continue_from` a
+/// trimmed answer gave): the same continuation every craft app offers for any tool.
+pub fn trim_from(v: Value, from: usize, max: usize) -> Value {
+    if from == 0 {
+        return trim_result(v, max);
+    }
+    let size = |v: &Value| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0);
+    let (v, total) = match v {
+        Value::Array(items) => {
+            let total = items.len();
+            (Value::Array(items.into_iter().skip(from).collect()), total)
+        }
+        Value::Object(mut o) => {
+            let key = o.iter().filter(|(_, x)| x.is_array()).max_by_key(|(_, x)| size(x)).map(|(k, _)| k.clone());
+            let mut total = 0;
+            if let Some(k) = key
+                && let Some(Value::Array(items)) = o.remove(&k)
+            {
+                total = items.len();
+                o.insert(k, Value::Array(items.into_iter().skip(from).collect()));
+            }
+            (Value::Object(o), total)
+        }
+        other => (other, 0),
+    };
+    let mut t = trim_result(v, max);
+    // Offsets in the answer count from the start of the whole list.
+    if let Some(o) = t.as_object_mut() {
+        if let Some(n) = o.get("continue_from").and_then(Value::as_u64) {
+            o.insert("continue_from".into(), json!(n as usize + from));
+            o.insert("next_step".into(), json!(format!("call the same tool again with continue_from: {} for the rest", n as usize + from)));
+        }
+        o.insert("total".into(), json!(total));
+        o.entry("truncated").or_insert(json!(false));
+    }
+    t
+}
+
 /// Trims `v` so its JSON stays under `max` bytes: the longest array is cut and the result says
 /// `truncated: true`, how many items it holds and where to continue (`continue_from`, an item
-/// offset for the `offset` argument). Objects stay objects.
+/// offset for the `continue_from` / `offset` argument). Objects stay objects.
 pub fn trim_result(v: Value, max: usize) -> Value {
     let size = |v: &Value| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0);
     if size(&v) <= max {
@@ -377,7 +460,7 @@ pub fn trim_result(v: Value, max: usize) -> Value {
                 "total": total,
                 "returned": kept,
                 "continue_from": kept,
-                "next_step": format!("call again with offset: {kept} for the next items"),
+                "next_step": format!("call the same tool again with continue_from: {kept} for the next items"),
             })
         }
         Value::Object(mut o) => {
@@ -398,7 +481,9 @@ pub fn trim_result(v: Value, max: usize) -> Value {
             o.insert("total".into(), json!(total));
             o.insert("returned".into(), json!(kept));
             o.entry("continue_from").or_insert(json!(kept));
-            o.entry("next_step").or_insert(json!(format!("`{key}` holds the first {kept} of {total}; call again with offset: {kept} for the rest")));
+            o.entry("next_step").or_insert(json!(format!(
+                "`{key}` holds the first {kept} of {total}; call the same tool again with continue_from: {kept} for the rest"
+            )));
             Value::Object(o)
         }
         Value::String(s) => {
@@ -435,7 +520,7 @@ pub fn page(v: Value, offset: usize, limit: Option<usize>) -> Value {
     if next < total {
         o["truncated"] = json!(true);
         o["continue_from"] = json!(next);
-        o["next_step"] = json!(format!("call again with offset: {next} for the next items"));
+        o["next_step"] = json!(format!("call again with continue_from: {next} (or offset) for the next items"));
     }
     o
 }
@@ -491,6 +576,12 @@ mod tests {
         assert_eq!(v["code"], "busy");
         assert_eq!(v["reason"], "working on something");
         assert_eq!(v["retry_after_ms"], 500);
-        assert!(e.text().contains("Next step: retry"));
+        assert!(e.text().contains("next_step: retry") && e.text().starts_with("[busy] "));
+        // Resuming a trimmed list at continue_from.
+        let big: Vec<Value> = (0..1000).map(|i| json!({"i": i, "pad": "xxxxxxxxxxxxxxxxxxxx"})).collect();
+        let t = trim_from(json!({"list": big}), 100, 4000);
+        assert_eq!(t["list"][0]["i"], 100);
+        assert_eq!(t["total"], 1000);
+        assert!(t["continue_from"].as_u64().unwrap() > 100);
     }
 }

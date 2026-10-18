@@ -236,6 +236,8 @@ pub fn write_xlsx(wb: &Workbook, kind: XlsxKind) -> Result<Vec<u8>, IoError> {
         let (before, next) = kept.sheet_entries(i, false, sheet_id);
         sheets_xml.push_str(&before);
         sheet_id = next;
+        // WHIQ parity pass: progress by sheet for job_status.
+        gridcraft_core::progress::step_in("writing sheets", i as u64, wb.sheets.len() as u64);
         let (xml, mut rels) = crate::sheet_write::write_sheet(wb, i, i == active, &mut out);
         pivots.add_sheet(wb, i, &mut out, &mut rels);
         let name = format!("xl/worksheets/sheet{}.xml", i + 1);

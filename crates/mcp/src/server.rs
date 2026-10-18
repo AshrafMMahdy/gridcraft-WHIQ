@@ -57,12 +57,12 @@ fn error(id: Value, code: i64, message: impl Into<String>) -> Value {
     let message = message.into();
     // WHIQ: protocol errors carry the contract's code / reason / next step too.
     let kind = match code {
-        PARSE_ERROR => "parse_error",
+        PARSE_ERROR => "invalid_request",
         INVALID_REQUEST => "invalid_request",
         METHOD_NOT_FOUND => "not_found",
         RESOURCE_NOT_FOUND => "not_found",
         INVALID_PARAMS => "invalid_argument",
-        _ => "internal_error",
+        _ => "internal",
     };
     let next = match code {
         PARSE_ERROR | INVALID_REQUEST => {
@@ -200,7 +200,8 @@ impl Server {
             let near = contract::closest(asked, names.iter().map(String::as_str), 3);
             let e = ToolError::new("not_found", format!("unknown tool `{asked}`"), "call tools/list; the closest tools are in `closest`")
                 .with("closest", json!(near));
-            return error_with(id, INVALID_PARAMS, &e);
+            // A tool result the agent sees (as in every craft app), not a protocol error.
+            return response(id, crate::tools::ToolResult::failure(&e).to_value());
         };
         if name != asked {
             self.state.call_warnings.push(format!("tool `{asked}` was read as `{name}`"));

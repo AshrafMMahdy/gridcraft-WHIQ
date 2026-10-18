@@ -29,6 +29,11 @@ cat > "$REQ" <<'JSON'
 {"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"open_workbook","arguments":{"path":"pivot.xlsx"}}}
 {"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"execute_command","arguments":{"command":"slicer.list","params":{"sheet":"Pivot"}}}}
 {"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"save_workbook","arguments":{"path":"pivot-out.xlsx"}}}
+{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"list_jobs","arguments":{}}}
+{"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"job_status","arguments":{"job_id":"job-999"}}}
+{"jsonrpc":"2.0","id":18,"method":"tools/call","params":{"name":"roundtrip_check","arguments":{"path":"report.xlsx"}}}
+{"jsonrpc":"2.0","id":19,"method":"tools/call","params":{"name":"evict","arguments":{}}}
+{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"read_range","arguments":{"range":"A1"}}}
 JSON
 # An Excel-shaped workbook with a PivotTable and two slicers.
 cp "$(dirname "$0")/fixtures/pivot-slicer.xlsx" "$DIR/pivot.xlsx"
@@ -62,10 +67,16 @@ check 8 'OLD_customer.xlsx' "save over an existing file renames it OLD_"
 check 9 '"code":"outside_root"' "a path outside the write root is refused with a next step"
 check 10 '"isError":false.*"warnings"' "forgiving tool name and arguments"
 check 11 '"errorCount":0' "recalculate"
-check 12 '"code":"not_running"' "cancel with nothing running says so"
+check 12 '"status":"not_running"' "cancel with nothing running says so"
 check 13 '"isError":false' "open a workbook with a PivotTable and slicers"
 check 14 'Pivot!PivotTable1.*Bolts|Bolts.*Pivot!PivotTable1' "the PivotTable slicers are connected"
 check 15 '"isError":false' "save it again"
+check 3 '"measured":true' "memory is measured by the OS"
+check 16 '"jobs":\[' "list_jobs"
+check 17 '"code":"not_found"' "job_status of an unknown job"
+check 18 '"lossless":' "roundtrip_check"
+check 19 '"evicted":\[' "evict"
+check 20 '"code":"evicted"' "a call after evict names the recovered file"
 for f in report.xlsx customer.xlsx OLD_customer.xlsx report.png report.pdf pivot-out.xlsx; do
   if [ -s "$DIR/$f" ]; then echo "ok   $f written"; else echo "FAIL $f missing"; fail=1; fi
 done

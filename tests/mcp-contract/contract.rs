@@ -37,19 +37,24 @@ fn errors_carry_code_reason_and_next_step() {
     let e = m.err("read_range", json!({"range": "Sheet9!A1:B2"}));
     assert_eq!(e["code"], "not_found");
     assert_eq!(e["sheets"], json!(["Sheet1"]));
-    // An unknown tool is a protocol error that still says what to do.
-    let v = m.request("tools/call", json!({"name": "reed_range", "arguments": {}}));
-    assert_eq!(v["error"]["code"], -32602);
-    assert_eq!(v["error"]["data"]["code"], "not_found");
-    assert!(v["error"]["data"]["closest"].as_array().unwrap().iter().any(|c| c == "read_range"), "{v}");
-    assert!(v["error"]["data"]["next_step"].is_string());
+    // An unknown tool is an answer the agent sees, naming the closest tools (as in every craft app).
+    let e = m.err("reed_range", json!({}));
+    assert_eq!(e["code"], "not_found");
+    assert!(e["closest"].as_array().unwrap().iter().any(|c| c == "read_range"), "{e}");
+    // The text block: `[code] reason` and the next step.
+    let r = m.call("reed_range", json!({}));
+    let text = r["content"][0]["text"].as_str().unwrap();
+    assert!(text.starts_with("[not_found] ") && text.contains("\nnext_step: "), "{text}");
+    // A protocol error carries the same shape in `data`.
+    let v = m.request("nope/nope", json!({}));
+    assert!(v["error"]["data"]["next_step"].is_string(), "{v}");
 }
 
 // 2. Nothing hangs: busy with a retry time, long work as jobs, results that survive timeouts.
 #[test]
 fn busy_and_jobs() {
     let dir = folder("busy");
-    let mut m = start(&dir, &["--call-timeout-ms", "700"]);
+    let mut m = start(&dir, &["--job-after-ms", "700"]);
     // A slow call runs past the call timeout: it answers with its job id and carries on.
     let slow = m.begin("tools/call", json!({"name": "debug_sleep", "arguments": {"ms": 2500}}));
     std::thread::sleep(Duration::from_millis(100));
@@ -59,16 +64,20 @@ fn busy_and_jobs() {
     assert!(e["retry_after_ms"].as_u64().unwrap() > 0);
     let job = e["job_id"].as_str().unwrap().to_string();
     let st = m.ok("server_status", json!({}));
-    assert_eq!(st["busy"]["tool"], "debug_sleep", "{st}");
+    assert_eq!(st["current_call"]["tool"], "debug_sleep", "{st}");
     let r = m.wait(&slow);
     let hand = &r["result"]["structuredContent"];
     assert_eq!(hand["status"], "running", "{r}");
     assert_eq!(hand["job_id"], job);
     let running = m.ok("job_status", json!({"job_id": job}));
     assert_eq!(running["status"], "running");
+    for k in ["job_id", "tool", "elapsed_ms", "progress", "stage", "steps", "stages", "retry_after_ms", "next_step"] {
+        assert!(running.get(k).is_some(), "job_status lacks {k}: {running}");
+    }
     let done = m.finish_job(&job, 30);
     assert_eq!(done["status"], "done", "{done}");
     assert_eq!(done["result"]["slept_ms"], 2500);
+    assert_eq!(done["progress"], 1.0, "{done}");
     // The result stays available.
     assert_eq!(m.ok("job_status", json!({"job_id": job}))["result"]["slept_ms"], 2500);
     // async: true runs anything as a job from the start.
@@ -79,6 +88,10 @@ fn busy_and_jobs() {
     assert_eq!(m.ok("read_range", json!({"range": "A1:B2"}))["values"], json!([[1.0, 2.0], [3.0, 4.0]]));
     let e = m.err("job_status", json!({"job_id": "job-999"}));
     assert_eq!(e["code"], "not_found");
+    // Every job: list_jobs, and job_status without an id.
+    let all = m.ok("list_jobs", json!({}));
+    assert_eq!(all["jobs"].as_array().unwrap().len(), 2, "{all}");
+    assert_eq!(m.ok("job_status", json!({}))["jobs"], all["jobs"]);
 }
 
 // Opening a big file is a job from the start.
@@ -87,11 +100,14 @@ fn large_open_is_a_job() {
     let dir = folder("bigopen");
     let csv: String = (0..30_000).map(|i| format!("{i},row {i},{}\n", i * 2)).collect();
     std::fs::write(dir.join("big.csv"), csv).unwrap();
-    let mut m = start(&dir, &["--job-open-mb", "0.1"]);
+    let mut m = start(&dir, &["--open-job-mb", "0.1"]);
     let h = m.ok("open_workbook", json!({"path": "big.csv"}));
     let job = h["job_id"].as_str().expect("a job id").to_string();
     let done = m.finish_job(&job, 60);
     assert_eq!(done["status"], "done", "{done}");
+    // Stages and progress, the shape every craft app reports.
+    assert!(!done["stages"].as_array().unwrap().is_empty(), "{done}");
+    assert_eq!(done["progress"], 1.0, "{done}");
     assert_eq!(m.ok("read_range", json!({"range": "B30000"}))["values"], json!([["row 29999"]]));
 }
 
@@ -127,10 +143,30 @@ fn oversized_results_are_trimmed() {
     assert_eq!(p["truncated"], true);
     assert_eq!(p["continue_from"], 5);
     let st = m.ok("server_status", json!({}));
-    for k in ["version", "memory", "document", "jobs", "roots", "limits"] {
+    for k in [
+        "server",
+        "version",
+        "protocol",
+        "pid",
+        "uptime_ms",
+        "author",
+        "memory",
+        "fonts",
+        "roots",
+        "documents",
+        "current_call",
+        "jobs",
+        "recovered_files",
+        "evicted",
+        "checkpoints",
+        "limits",
+    ] {
         assert!(st.get(k).is_some(), "server_status has {k}: {st}");
     }
-    assert_eq!(st["document"]["cells"], 1200);
+    for k in ["rss_bytes", "committed_bytes", "limit_bytes", "measured", "source"] {
+        assert!(st["memory"].get(k).is_some(), "memory has {k}: {st}");
+    }
+    assert_eq!(st["documents"][0]["cells"], 1200);
     assert_eq!(st["roots"]["write"], dir.to_str().unwrap());
 }
 
@@ -138,20 +174,27 @@ fn oversized_results_are_trimmed() {
 #[test]
 fn byte_budget_trims_any_result() {
     let dir = folder("bytes");
-    let mut m = start(&dir, &["--max-result-kb", "8"]);
+    let mut m = start(&dir, &["--max-result-bytes", "8192"]);
     let v = m.ok("list_commands", json!({}));
     assert_eq!(v["truncated"], true, "{}", v.to_string().len());
     assert!(v.to_string().len() < 9 * 1024);
     let from = v["continue_from"].as_u64().unwrap();
     let w = m.ok("list_commands", json!({"offset": from, "limit": 3}));
     assert_eq!(w["offset"], from);
+    // `continue_from` passed back works as well (the shared continuation).
+    let w = m.ok("list_commands", json!({"continue_from": from, "limit": 3}));
+    assert_eq!(w["offset"], from);
+    // A per-call limit.
+    let small = m.ok("list_functions", json!({"max_bytes": 2048}));
+    assert_eq!(small["truncated"], true);
+    assert!(small.to_string().len() < 3 * 1024, "{}", small.to_string().len());
 }
 
 // 3. Eviction: the work is auto-saved inside the write root and the next call names it.
 #[test]
 fn evicted_work_is_recovered() {
     let dir = folder("evict");
-    let mut m = start(&dir, &["--evict-idle-secs", "1"]);
+    let mut m = start(&dir, &["--idle-evict-secs", "1"]);
     m.ok("write_range", json!({"range": "A1", "values": [["kept", 42]]}));
     std::thread::sleep(Duration::from_millis(2200));
     let e = m.err("read_range", json!({"range": "A1:B1"}));
@@ -160,9 +203,15 @@ fn evicted_work_is_recovered() {
     assert!(recovered.starts_with(dir.to_str().unwrap()), "inside the write root: {recovered}");
     assert!(recovered.contains(".recovered-") && recovered.ends_with(".xlsx"));
     assert!(e["next_step"].as_str().unwrap().contains(&recovered));
-    assert!(m.ok("server_status", json!({}))["evicted"]["recovered_path"].is_string());
+    assert!(m.ok("server_status", json!({}))["evicted"][0]["recovered_path"].is_string());
     m.ok("open_workbook", json!({"path": recovered}));
     assert_eq!(m.ok("read_range", json!({"range": "A1:B1"}))["values"], json!([["kept", 42.0]]));
+    // `evict` (for a supervisor) does the same on demand.
+    m.ok("set_cell", json!({"cell": "C1", "input": "more"}));
+    let r = m.ok("evict", json!({}));
+    let rec = r["evicted"][0]["recovered_path"].as_str().unwrap().to_string();
+    assert!(std::path::Path::new(&rec).exists(), "{r}");
+    assert_eq!(m.err("get_cell", json!({"cell": "C1"}))["code"], "evicted");
 }
 
 #[test]
@@ -192,9 +241,10 @@ fn sigterm_autosaves_and_the_next_start_names_it() {
     assert_eq!(cells_of(&path, "A1:B1"), json!([["unsaved", 7.0]]));
     let mut m = start(&dir, &[]);
     let v = m.ok("inspect_workbook", json!({}));
-    let w = v["warnings"].as_array().unwrap();
-    assert!(w.iter().any(|w| w.as_str().unwrap().contains(&rec[0])), "the next call names the recovered file: {v}");
-    assert!(m.ok("server_status", json!({}))["recovered_files"].as_array().unwrap().iter().any(|f| f.as_str().unwrap().ends_with(&rec[0])));
+    assert!(v["recovered_files"].to_string().contains(&rec[0]), "the next call names the recovered file: {v}");
+    assert_eq!(v["recovered_files"][0]["reason"], "found");
+    assert!(m.ok("inspect_workbook", json!({})).get("recovered_files").is_none(), "named once");
+    assert!(m.ok("server_status", json!({}))["recovered_files"].to_string().contains(&rec[0]));
 }
 
 // 3. A panic inside a call loses nothing: an error with a recovery copy, and the server goes on.
@@ -204,7 +254,7 @@ fn panic_is_an_answer_not_a_crash() {
     let mut m = start(&dir, &[]);
     m.ok("set_cell", json!({"cell": "B2", "input": "=6*7"}));
     let e = m.err("debug_panic", json!({}));
-    assert_eq!(e["code"], "internal_error", "{e}");
+    assert_eq!(e["code"], "internal", "{e}");
     let path = std::path::PathBuf::from(e["recovered_path"].as_str().unwrap());
     assert_eq!(cells_of(&path, "B2"), json!([[42.0]]));
     assert_eq!(m.ok("get_cell", json!({"cell": "B2"}))["value"], 42.0);
@@ -232,22 +282,19 @@ fn old_rename() {
     let v = m.ok("save_workbook", json!({"path": "report.xlsx"}));
     assert_eq!(std::fs::read(dir.join("OLD_report.xlsx")).unwrap(), b"the customer's file");
     let old = dir.join("OLD_report.xlsx");
-    assert_eq!(v["saved"][0]["previous_renamed_to"], old.to_str().unwrap(), "{v}");
+    assert_eq!(v["previous_files_renamed"][0]["previous"], old.to_str().unwrap(), "{v}");
+    assert!(v["notice"].as_str().unwrap().contains("OLD_report.xlsx"), "{v}");
     assert!(v["warnings"].as_array().unwrap().iter().any(|w| w.as_str().unwrap().contains("OLD_report.xlsx")));
     assert_eq!(cells_of(&dir.join("report.xlsx"), "A1"), json!([["new"]]));
-    // Saving again replaces our own save; the customer's original stays OLD_.
+    // Saving again keeps our own earlier save too (OLD_2_), as in every craft app.
     m.ok("set_cell", json!({"cell": "A1", "input": "newer"}));
     let v = m.ok("save_workbook", json!({}));
-    assert!(v["saved"][0]["previous_renamed_to"].is_null(), "{v}");
-    assert_eq!(files_in(&dir), vec!["OLD_report.xlsx".to_string(), "report.xlsx".to_string()]);
-    // A second foreign file with OLD_ taken: OLD_<stem>-2; overwrite: true replaces in place.
-    std::fs::write(dir.join("other.xlsx"), b"x").unwrap();
-    std::fs::write(dir.join("OLD_other.xlsx"), b"older").unwrap();
-    m.ok("save_workbook", json!({"path": "other.xlsx"}));
-    assert_eq!(std::fs::read(dir.join("OLD_other-2.xlsx")).unwrap(), b"x");
+    assert!(v["previous_files_renamed"][0]["previous"].as_str().unwrap().ends_with("OLD_2_report.xlsx"), "{v}");
+    assert_eq!(cells_of(&dir.join("OLD_2_report.xlsx"), "A1"), json!([["new"]]));
+    // overwrite: true replaces in place.
     std::fs::write(dir.join("third.xlsx"), b"y").unwrap();
     let v = m.ok("save_workbook", json!({"path": "third.xlsx", "overwrite": true}));
-    assert!(v["saved"][0]["previous_renamed_to"].is_null());
+    assert!(v.get("previous_files_renamed").is_none(), "{v}");
     assert!(!dir.join("OLD_third.xlsx").exists());
 }
 
@@ -296,10 +343,16 @@ fn annotations() {
     let get = |n: &str| tools.iter().find(|t| t["name"] == n).unwrap_or_else(|| panic!("{n}"))["annotations"].clone();
     for t in tools {
         let a = &t["annotations"];
-        assert!(a["readOnlyHint"].is_boolean() && a["destructiveHint"].is_boolean() && a["idempotentHint"].is_boolean(), "{t}");
+        assert!(
+            a["readOnlyHint"].is_boolean()
+                && a["destructiveHint"].is_boolean()
+                && a["idempotentHint"].is_boolean()
+                && a["openWorldHint"].is_boolean(),
+            "{t}"
+        );
         assert!(t["inputSchema"]["properties"]["caller"].is_object(), "every tool takes caller: {}", t["name"]);
     }
-    for r in ["read_range", "get_cell", "inspect_workbook", "server_status", "job_status", "list_functions"] {
+    for r in ["read_range", "get_cell", "inspect_workbook", "server_status", "job_status", "list_jobs", "list_functions", "roundtrip_check"] {
         assert_eq!(get(r)["readOnlyHint"], true, "{r}");
         assert_eq!(get(r)["destructiveHint"], false, "{r}");
     }
@@ -308,6 +361,13 @@ fn annotations() {
         assert_eq!(get(w)["destructiveHint"], true, "{w}");
     }
     assert_eq!(get("insert_chart")["destructiveHint"], false);
+    for n in ["cancel", "evict"] {
+        assert_eq!(
+            (get(n)["readOnlyHint"].as_bool(), get(n)["destructiveHint"].as_bool(), get(n)["idempotentHint"].as_bool()),
+            (Some(false), Some(false), Some(true)),
+            "{n}"
+        );
+    }
     let save = tools.iter().find(|t| t["name"] == "save_workbook").unwrap();
     assert!(save["inputSchema"]["properties"]["overwrite"].is_object());
     // structuredContent everywhere (the harness asserts it on each call).
@@ -357,16 +417,17 @@ fn caller_identity() {
 #[test]
 fn cancel_stops_calls_and_jobs_and_keeps_the_document() {
     let dir = folder("cancel");
-    let mut m = start(&dir, &["--call-timeout-ms", "300"]);
+    let mut m = start(&dir, &["--job-after-ms", "300"]);
     // Nothing to cancel.
-    assert_eq!(m.err("cancel", json!({}))["code"], "not_running");
+    let c = m.ok("cancel", json!({}));
+    assert_eq!((c["cancelled"].as_bool(), c["status"].as_str()), (Some(false), Some("not_running")), "{c}");
     assert_eq!(m.err("cancel", json!({"job_id": "job-77"}))["code"], "not_found");
     // A long call, cancelled while it runs (no job id: the call in progress).
     let t0 = Instant::now();
     let slow = m.begin("tools/call", json!({"name": "debug_sleep", "arguments": {"ms": 20000}}));
     std::thread::sleep(Duration::from_millis(100));
     let c = m.ok("cancel", json!({}));
-    assert_eq!(c["status"], "cancelling", "{c}");
+    assert_eq!((c["cancelled"].as_bool(), c["status"].as_str()), (Some(true), Some("cancelling")), "{c}");
     let job = c["job_id"].as_str().unwrap().to_string();
     let r = m.wait_for(&slow, 30);
     let res = &r["result"];
@@ -380,7 +441,8 @@ fn cancel_stops_calls_and_jobs_and_keeps_the_document() {
     assert_eq!(status, "cancelled");
     assert!(t0.elapsed() < Duration::from_secs(10), "stopped long before the 20 s sleep ended");
     // The job is over: cancelling it again says so.
-    assert_eq!(m.err("cancel", json!({"job_id": job}))["code"], "not_running");
+    let c = m.ok("cancel", json!({"job_id": job}));
+    assert_eq!((c["cancelled"].as_bool(), c["status"].as_str()), (Some(false), Some("cancelled")), "{c}");
 
     // A big edit run as a job, cancelled part-way: nothing of it stays.
     m.ok("set_cell", json!({"cell": "D1", "input": "keep me"}));
@@ -400,18 +462,15 @@ fn cancel_stops_calls_and_jobs_and_keeps_the_document() {
     assert_eq!(m.ok("read_range", json!({"range": "B1"}))["values"], json!([[6.0]]));
     assert_eq!(m.ok("recalculate", json!({}))["errorCount"], 0);
 
-    // The client cancelling its request (notifications/cancelled) stops it too.
-    let slow = m.begin("tools/call", json!({"name": "debug_sleep", "arguments": {"ms": 20000}}));
+    // The client giving up on its request (notifications/cancelled, which clients also send on
+    // their own timeouts): the call carries on as a job, its result kept for job_status.
+    let slow = m.begin("tools/call", json!({"name": "debug_sleep", "arguments": {"ms": 1500}}));
     std::thread::sleep(Duration::from_millis(100));
-    m.send(&json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": slow, "reason": "user gave up"}}));
-    let st = (0..100)
-        .find_map(|_| {
-            std::thread::sleep(Duration::from_millis(100));
-            let s = m.ok("server_status", json!({}));
-            s["busy"].is_null().then_some(s)
-        })
-        .expect("the call stopped");
-    assert!(st["busy"].is_null());
+    m.send(&json!({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": slow, "reason": "client timeout"}}));
+    let job = m.ok("server_status", json!({}))["current_call"]["job_id"].as_str().unwrap().to_string();
+    let done = m.finish_job(&job, 30);
+    assert_eq!(done["status"], "done", "{done}");
+    assert_eq!(done["result"]["slept_ms"], 1500);
 }
 
 // Round 2: periodic checkpoints — every N changing calls, or when unsaved changes are T seconds
@@ -424,7 +483,7 @@ fn checkpoints_survive_a_hard_kill() {
     m.ok("set_cell", json!({"cell": "A2", "input": "two"}));
     std::thread::sleep(Duration::from_millis(600));
     assert!(files_in(&dir).iter().all(|f| !f.contains(".recovered-")), "not due after 2 changes: {:?}", files_in(&dir));
-    assert_eq!(m.ok("server_status", json!({}))["checkpoint"]["pending_edits"], 2);
+    assert_eq!(m.ok("server_status", json!({}))["checkpoints"]["pending_edits"], 2);
     m.ok("set_cell", json!({"cell": "A3", "input": "three"}));
     let wait_for_file = |dir: &std::path::Path| {
         (0..50).find_map(|_| {
@@ -436,14 +495,15 @@ fn checkpoints_survive_a_hard_kill() {
     let st = (0..50)
         .find_map(|_| {
             let st = m.ok("server_status", json!({}));
-            if st["checkpoint"]["writes"] == 1 {
+            if st["checkpoints"]["writes"] == 1 {
                 return Some(st);
             }
             std::thread::sleep(Duration::from_millis(100));
             None
         })
         .expect("the checkpoint is recorded");
-    assert_eq!(st["checkpoint"]["pending_edits"], 0, "{st}");
+    assert_eq!(st["checkpoints"]["pending_edits"], 0, "{st}");
+    assert!(st["checkpoints"]["files"][0]["path"].as_str().unwrap().ends_with(&file), "{st}");
     // Three more: the same file is brought up to date (not a second one).
     for c in ["A4", "A5", "A6"] {
         m.ok("set_cell", json!({"cell": c, "input": c}));
@@ -456,7 +516,7 @@ fn checkpoints_survive_a_hard_kill() {
     // The next server announces it.
     let mut m = start(&dir, &[]);
     let st = m.ok("server_status", json!({}));
-    assert!(st["recovered_files"].as_array().unwrap().iter().any(|f| f.as_str().unwrap().ends_with(&file)), "{st}");
+    assert!(st["recovered_files"].as_array().unwrap().iter().any(|f| f["path"].as_str().unwrap().ends_with(&file)), "{st}");
     drop(m);
 
     // Time-based: one change, older than the interval, is written; saving removes the checkpoint.
@@ -469,4 +529,20 @@ fn checkpoints_survive_a_hard_kill() {
     assert!(!dir.join(&file).exists(), "the saved file supersedes the checkpoint");
     let st = m.ok("server_status", json!({}));
     assert!(st["memory"]["rss_bytes"].as_u64().unwrap() > 1_000_000, "real memory measurement: {st}");
+}
+
+// The round-trip check (as in WordCraft): open + save in memory, report what would be lost.
+#[test]
+fn roundtrip_check_reports_what_a_save_would_keep() {
+    let dir = folder("roundtrip");
+    let mut m = start(&dir, &[]);
+    m.ok("set_cell", json!({"cell": "A1", "input": "kept"}));
+    m.ok("save_workbook", json!({"path": "plain.xlsx"}));
+    let r = m.ok("roundtrip_check", json!({"path": "plain.xlsx"}));
+    assert_eq!(r["lossless"], true, "{r}");
+    for k in ["missingParts", "addedParts", "changedBinaryParts", "missingRelationships", "stories", "problems"] {
+        assert!(r.get(k).is_some(), "{k}: {r}");
+    }
+    let e = m.err("roundtrip_check", json!({"path": "missing.xlsx"}));
+    assert_eq!(e["code"], "not_found", "{e}");
 }

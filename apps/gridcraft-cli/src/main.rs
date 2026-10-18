@@ -56,9 +56,11 @@ const USAGE: &str = "usage:
   gridcraft-cli functions [--json] [--search X] [--category C]
   gridcraft-cli mcp [--connect PORT] [--in FILE | --sample NAME] [--author NAME]
                     [--automation-read-root DIR] [--automation-write-root DIR]
-                    [--call-timeout-ms N] [--max-memory-mb N] [--evict-idle-secs N]
-                    [--job-open-mb N] [--job-cells N] [--max-result-kb N] [--max-read-cells N]
-                    [--checkpoint-edits N (20)] [--checkpoint-secs N (60)]
+                    [--job-after-ms N (15000)] [--busy-after-ms N (300)] [--max-memory-mb N]
+                    [--idle-evict-secs N] [--open-job-mb N (20)] [--job-cells N] [--max-result-bytes N]
+                    [--max-read-cells N] [--checkpoint-edits N (20)] [--checkpoint-secs N (60)]
+                     (the flag names WordCraft and DeckCraft take; the older --call-timeout-ms,
+                     --evict-idle-secs, --job-open-mb and --max-result-kb are still read)
                      --automation-*-root confine every file the headless server reads/writes;
                      saves never replace an existing file silently (it becomes OLD_<name>);
                      busy/jobs/auto-save: see WHIQ-CHANGES.md
@@ -585,11 +587,16 @@ fn mcp(args: &[String]) -> Result<(), String> {
             "automation-write-root",
             "author",
             "call-timeout-ms",
+            "job-after-ms",
+            "busy-after-ms",
             "max-memory-mb",
             "evict-idle-secs",
+            "idle-evict-secs",
             "job-open-mb",
+            "open-job-mb",
             "job-cells",
             "max-result-kb",
+            "max-result-bytes",
             "max-read-cells",
             "checkpoint-edits",
             "checkpoint-secs",
@@ -610,17 +617,25 @@ fn mcp(args: &[String]) -> Result<(), String> {
     .map_err(|e| format!("mcp: {e}"))?;
     let mut config = gridcraft_mcp::runtime::RuntimeConfig::default();
     config.settings.author = a.opt("author").map(str::to_string);
-    if let Some(n) = num("call-timeout-ms")? {
-        config.call_timeout = std::time::Duration::from_millis(n.max(50.0) as u64);
+    // WHIQ parity pass: the flag names every craft app takes (older names still read).
+    let either = |a: &str, b: &str| -> Result<Option<f64>, String> { Ok(num(a)?.or(num(b)?)) };
+    if let Some(n) = either("job-after-ms", "call-timeout-ms")? {
+        config.call_timeout = std::time::Duration::from_millis(n.max(10.0) as u64);
+    }
+    if let Some(n) = num("busy-after-ms")? {
+        config.busy_grace = std::time::Duration::from_millis(n.min(600_000.0) as u64);
     }
     if let Some(n) = num("max-memory-mb")? {
         config.max_memory_bytes = Some((n * 1024.0 * 1024.0) as u64);
     }
-    if let Some(n) = num("evict-idle-secs")? {
+    if let Some(n) = either("idle-evict-secs", "evict-idle-secs")? {
         config.idle_evict = Some(std::time::Duration::from_secs_f64(n.max(0.05)));
     }
-    if let Some(n) = num("job-open-mb")? {
+    if let Some(n) = either("open-job-mb", "job-open-mb")? {
         config.job_open_bytes = (n * 1024.0 * 1024.0) as u64;
+    }
+    if let Some(n) = num("max-result-bytes")? {
+        config.settings.max_result_bytes = (n as usize).max(1024);
     }
     if let Some(n) = num("job-cells")? {
         config.job_cells = n as u64;

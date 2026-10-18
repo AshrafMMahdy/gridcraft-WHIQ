@@ -212,6 +212,8 @@ pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
     let mut pivot_caches = crate::pivot::CachesIn::new(&wb_xml, &wb_rels);
     let sheet_els: Vec<El> = wb_xml.child("sheets").map(|s| s.kids("sheet").cloned().collect()).unwrap_or_default();
     for (i, se) in sheet_els.iter().enumerate() {
+        // WHIQ parity pass: progress by sheet for job_status.
+        gridcraft_core::progress::step_in("reading sheets", i as u64, sheet_els.len() as u64);
         let name = se.attr("name").unwrap_or("").to_string();
         let rel = se.attr("id").and_then(|id| wb_rels.iter().find(|r| r.id == id)).cloned();
         let Some(rel) = rel else {

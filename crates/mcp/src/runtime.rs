@@ -13,7 +13,9 @@
 //!   Ctrl-Break and console close on Windows) or the client hanging up with unsaved changes, the
 //!   snapshot is written to `<name>.recovered-<stamp>.xlsx` inside the write root; the next call
 //!   names the file. Recovered files found in the write root at start are announced too.
-//! - `server_status` and `job_status` are answered by the stdio loop itself, even mid-call.
+//! - `server_status`, `job_status`, `list_jobs` and `cancel` are answered by the stdio loop
+//!   itself, even mid-call. Their shapes (and the error codes, recovered-file names and flags)
+//!   are the same in WordCraft, GridCraft and DeckCraft: CONTRACT-PARITY.md.
 //!
 //! The MCP server is native only (stdio, threads): it never runs in the browser, so the clock
 //! is read freely here.
@@ -30,7 +32,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{Value, json};
 
 use crate::backend::{Backend, DocSnapshot};
-use crate::contract::{self, ToolError};
+use crate::contract::{self, ToolError, code};
 use crate::server::{Server, error_with};
 use crate::tools::ToolResult;
 use crate::whiq::{CONTROL_TOOLS, Eviction, Settings, all_definitions, status_value};
@@ -39,7 +41,8 @@ use crate::whiq::{CONTROL_TOOLS, Eviction, Settings, all_definitions, status_val
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     pub settings: Settings,
-    /// A call still running after this long answers with its job id and carries on.
+    /// `--job-after-ms`: a call still running after this long answers with its job id and
+    /// carries on.
     pub call_timeout: Duration,
     /// open_workbook of a file larger than this runs as a job from the start.
     pub job_open_bytes: u64,
@@ -54,7 +57,8 @@ pub struct RuntimeConfig {
     pub read_root: Option<PathBuf>,
     /// Handle SIGTERM / SIGINT / SIGHUP (and the Windows console events) by auto-saving first.
     pub handle_signals: bool,
-    /// A call arriving while another runs waits this long for it before answering `busy`.
+    /// `--busy-after-ms`: a call arriving while another runs waits this long for it before
+    /// answering `busy`.
     pub busy_grace: Duration,
     /// Checkpoint unsaved work to the recovered file after this many changing calls (0: never).
     pub checkpoint_edits: u64,
@@ -66,7 +70,7 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             settings: Settings::default(),
-            call_timeout: Duration::from_secs(20),
+            call_timeout: Duration::from_secs(15),
             job_open_bytes: 20 * 1024 * 1024,
             job_cells: 250_000,
             max_memory_bytes: None,
@@ -100,6 +104,11 @@ struct Job {
     result: Option<Value>,
     /// The caller was told the job id: the result waits here for job_status.
     handed_off: bool,
+    /// The client gave up on the request (`notifications/cancelled`): its answer is kept for
+    /// job_status and not written.
+    client_cancelled: bool,
+    /// The progress the call reached.
+    progress: Option<gridcraft_engine::core::progress::Progress>,
 }
 
 #[derive(Debug, Default)]
@@ -143,8 +152,15 @@ struct Shared {
     jobs: Mutex<Jobs>,
     busy: Mutex<Option<Running>>,
     snapshot: Mutex<Option<DocSnapshot>>,
-    recovered: Mutex<Vec<String>>,
+    /// Recovered files made or found (`{path, reason, original, at}`).
+    recovered: Mutex<Vec<Value>>,
+    /// Recovered files not yet named to the agent: the next tool answer names them, once.
+    unannounced: Mutex<Vec<Value>>,
     evicted: Mutex<Option<Eviction>>,
+    calls: std::sync::atomic::AtomicU64,
+    busy_replies: std::sync::atomic::AtomicU64,
+    /// The backend's description (server_status).
+    backend: String,
     last_activity: Mutex<Instant>,
     idle_done: AtomicBool,
     /// The worker thread (what `cancel` stops).
@@ -175,6 +191,22 @@ impl Shared {
         let _ = out.flush();
     }
 
+    /// Recovered files not yet named to the agent go into this tool answer (`recovered_files`,
+    /// once), as in every craft app.
+    fn announce(&self, reply: &mut Value) {
+        let Some(sc) = reply.pointer_mut("/result/structuredContent").and_then(Value::as_object_mut) else { return };
+        let news = std::mem::take(&mut *lock(&self.unannounced));
+        if news.is_empty() {
+            return;
+        }
+        let paths: Vec<String> = news.iter().filter_map(|e| e["path"].as_str().map(str::to_string)).collect();
+        sc.insert("recovered_files".into(), Value::Array(news));
+        let note = format!("work was auto-saved to recovered files: {} (open_workbook on one to continue that work)", paths.join(", "));
+        if let Some(content) = reply.pointer_mut("/result/content").and_then(Value::as_array_mut) {
+            content.push(json!({"type": "text", "text": note}));
+        }
+    }
+
     fn touch(&self) {
         *lock(&self.last_activity) = Instant::now();
         self.idle_done.store(false, Ordering::SeqCst);
@@ -196,9 +228,20 @@ impl Shared {
             let cp = lock(&self.checkpoint);
             cp.path.clone().filter(|_| cp.uid == snap.uid)
         };
-        let path = existing.clone().unwrap_or_else(|| dir.join(format!("{}.recovered-{}.xlsx", stem.trim(), stamp())));
+        let path = existing.clone().unwrap_or_else(|| {
+            let base = format!("{}.recovered-{}", stem.trim(), stamp());
+            let mut p = dir.join(format!("{base}.xlsx"));
+            let mut n = 2;
+            while p.exists() && n < 1000 {
+                p = dir.join(format!("{base}-{n}.xlsx"));
+                n += 1;
+            }
+            p
+        });
         let text = path.to_string_lossy().into_owned();
-        let saved = gridcraft_engine::io::save_bytes(&snap.wb, &text).and_then(|bytes| gridcraft_engine::io::write_file(&text, &bytes));
+        // The recovered file is the server's own copy: rewriting it never keeps an OLD_ one.
+        let saved = gridcraft_engine::io::save_bytes(&snap.wb, &text)
+            .and_then(|bytes| gridcraft_engine::io::save_policy::allow_overwrite(true, || gridcraft_engine::io::write_file(&text, &bytes)));
         match saved {
             Ok(()) => {
                 eprintln!("gridcraft-cli: {why}: unsaved work auto-saved to {text}");
@@ -211,9 +254,16 @@ impl Shared {
                         cp.since = None;
                     }
                 }
-                let mut rec = lock(&self.recovered);
-                if !rec.contains(&text) {
-                    rec.push(text);
+                // A checkpoint is listed under server_status.checkpoints; any other auto-save is
+                // work the agent must hear about.
+                if why != "checkpoint" {
+                    let entry = recovered_entry(&text, why, snap.path.as_deref());
+                    let mut rec = lock(&self.recovered);
+                    rec.retain(|r| r["path"] != entry["path"]);
+                    rec.push(entry.clone());
+                    let mut un = lock(&self.unannounced);
+                    un.retain(|r| r["path"] != entry["path"]);
+                    un.push(entry);
                 }
                 Some(path)
             }
@@ -243,9 +293,11 @@ impl Shared {
         if !s.dirty {
             // Saved (or untouched): the checkpoint is out of date and the file on disk is newer.
             if let Some(p) = cp.path.take() {
-                let _ = std::fs::remove_file(&p);
                 let text = p.to_string_lossy().into_owned();
-                lock(&self.recovered).retain(|r| *r != text);
+                // Only a checkpoint nobody was told about goes; a reported recovered file stays.
+                if !lock(&self.recovered).iter().any(|r| r["path"] == text.as_str()) {
+                    let _ = std::fs::remove_file(&p);
+                }
             }
             cp.edits = 0;
             cp.since = None;
@@ -282,13 +334,14 @@ impl Shared {
 
     fn job_summary(&self, n: u64, j: &Job) -> Value {
         let elapsed = j.finished.unwrap_or_else(Instant::now).duration_since(j.started).as_millis() as u64;
-        let state = match j.state {
-            JobState::Running => "running",
-            JobState::Done => "done",
-            JobState::Failed => "failed",
-            JobState::Cancelled => "cancelled",
-        };
-        json!({"job_id": job_name(n), "tool": j.tool, "status": state, "elapsed_ms": elapsed})
+        let state = job_state_name(&j.state);
+        let live = (j.state == JobState::Running).then(gridcraft_engine::core::progress::current).flatten();
+        let p = if j.state == JobState::Running { live.as_ref() } else { j.progress.as_ref() };
+        let mut v = json!({"job_id": job_name(n), "tool": j.tool, "status": state, "elapsed_ms": elapsed});
+        if let (Some(o), Value::Object(f)) = (v.as_object_mut(), progress_fields(p, &j.tool, j.state == JobState::Done)) {
+            o.extend(f);
+        }
+        v
     }
 
     fn status(&self) -> Value {
@@ -302,30 +355,48 @@ impl Shared {
         let checkpoint = {
             let cp = lock(&self.checkpoint);
             json!({
-                "path": cp.path.as_ref().map(|p| p.display().to_string()),
+                "every_edits": self.config.checkpoint_edits,
+                "every_secs": self.config.checkpoint_interval.map(|d| d.as_secs()).unwrap_or(0),
                 "pending_edits": cp.edits,
                 "writes": cp.writes,
-                "every_edits": self.config.checkpoint_edits,
-                "every_secs": self.config.checkpoint_interval.map(|d| d.as_secs_f64()),
+                "files": cp.path.as_ref().map(|p| vec![json!({"path": p.display().to_string(), "document": cp.uid})]).unwrap_or_default(),
             })
         };
+        let current = busy.map(|b| {
+            let mut v = json!({"tool": b.tool, "job_id": job_name(b.job), "elapsed_ms": b.started.elapsed().as_millis() as u64,
+                "cancelling": gridcraft_engine::core::cancel::pending()});
+            if let (Some(o), Value::Object(f)) =
+                (v.as_object_mut(), progress_fields(gridcraft_engine::core::progress::current().as_ref(), &b.tool, false))
+            {
+                o.extend(f);
+            }
+            v
+        });
+        let idle = lock(&self.last_activity).elapsed();
         let extra = json!({
-            "mode": "concurrent",
+            "backend": self.backend,
             "uptime_ms": self.started.elapsed().as_millis() as u64,
-            "busy": busy.map(|b| json!({"tool": b.tool, "job_id": job_name(b.job), "elapsed_ms": b.started.elapsed().as_millis() as u64})),
+            "current_call": current,
             "jobs": jobs,
             "recovered_files": lock(&self.recovered).clone(),
-            "checkpoint": checkpoint,
-            "evicted": evicted.map(|e| json!({"reason": e.reason, "recovered_path": e.recovered.map(|p| p.display().to_string()), "original_path": e.original})),
+            "checkpoints": checkpoint,
+            "evicted": evicted.map(|e| vec![json!({"name": e.original.as_deref().and_then(|o| Path::new(o).file_stem()).map(|s| s.to_string_lossy().into_owned()), "reason": e.reason, "recovered_path": e.recovered.map(|p| p.display().to_string()), "original_path": e.original})]).unwrap_or_default(),
+            "idle_ms": idle.as_millis() as u64,
+            "calls": self.calls.load(Ordering::Relaxed),
+            "busy_replies": self.busy_replies.load(Ordering::Relaxed),
             "limits": {
-                "call_timeout_ms": self.config.call_timeout.as_millis() as u64,
-                "job_open_bytes": self.config.job_open_bytes,
+                "max_result_bytes": self.config.settings.max_result_bytes,
+                "max_read_cells": self.config.settings.max_read_cells,
+                "max_memory_mb": self.config.max_memory_bytes.map(|b| b / (1024 * 1024)),
+                "busy_after_ms": self.config.busy_grace.as_millis() as u64,
+                "job_after_ms": self.config.call_timeout.as_millis() as u64,
+                "open_job_bytes": self.config.job_open_bytes,
                 "job_cells": self.config.job_cells,
-                "max_memory_bytes": self.config.max_memory_bytes,
-                "idle_evict_ms": self.config.idle_evict.map(|d| d.as_millis() as u64),
+                "idle_evict_secs": self.config.idle_evict.map(|d| d.as_secs()),
             },
         });
         let mut v = status_value(snap.as_ref(), (self.config.read_root.clone(), self.config.write_root.clone()), &self.config.settings, extra);
+        v["memory"]["limit_bytes"] = json!(self.config.max_memory_bytes);
         if v["memory"]["rss_bytes"].is_null()
             && let Some(s) = &snap
         {
@@ -336,7 +407,8 @@ impl Shared {
     }
 
     /// `cancel`: asks the call in progress (or the job named, when it is the one running) to stop
-    /// at its next safe point.
+    /// at its next safe point. The answer has the same shape in every craft app:
+    /// `{cancelled, status, job_id, tool, next_step}`.
     fn cancel(&self, args: &Value) -> ToolResult {
         let asked = args.get("job_id").or(args.get("id")).or(args.get("job")).map(|v| match v {
             Value::String(s) => s.clone(),
@@ -357,9 +429,11 @@ impl Shared {
                 j.handed_off = true;
             }
             return ToolResult::json(&json!({
+                "cancelled": true,
                 "job_id": job_name(b.job),
                 "tool": b.tool,
                 "status": "cancelling",
+                "retry_after_ms": 500,
                 "next_step": format!(
                     "it stops at its next safe point and changes nothing; job_status with job_id \"{}\" then says cancelled",
                     job_name(b.job)
@@ -369,23 +443,19 @@ impl Shared {
         drop(busy);
         let jobs = lock(&self.jobs);
         match asked {
-            None => ToolResult::failure(&ToolError::new("not_running", "no call is running", "nothing to cancel; server_status lists the jobs")),
+            None => ToolResult::json(&json!({"cancelled": false, "status": "not_running", "next_step": "no call is running: nothing to stop"})),
             Some(t) => match parse_job(&t).and_then(|n| jobs.map.get(&n).map(|j| (n, j))) {
-                Some((n, j)) => {
-                    let st = self.job_summary(n, j);
-                    ToolResult::failure(
-                        &ToolError::new(
-                            "not_running",
-                            format!("{} has already ended ({})", job_name(n), st["status"].as_str().unwrap_or("")),
-                            "nothing to cancel; job_status has its result",
-                        )
-                        .with("status", st["status"].clone()),
-                    )
-                }
+                Some((n, j)) => ToolResult::json(&json!({
+                    "cancelled": false,
+                    "status": job_state_name(&j.state),
+                    "job_id": job_name(n),
+                    "tool": j.tool,
+                    "next_step": if j.state == JobState::Running { "server_status shows the running call".to_string() } else { format!("the job had ended; job_status with job_id \"{}\" has its result", job_name(n)) },
+                })),
                 None => {
                     let ids: Vec<String> = jobs.map.keys().map(|n| job_name(*n)).collect();
                     ToolResult::failure(
-                        &ToolError::new("not_found", format!("there is no job `{t}`"), "use a job_id a call returned; server_status lists the jobs")
+                        &ToolError::new(code::NOT_FOUND, format!("there is no job `{t}`"), "use a job_id a call returned; list_jobs lists the jobs")
                             .with("closest", json!(contract::closest(&t, ids.iter().map(String::as_str), 5))),
                     )
                 }
@@ -393,13 +463,18 @@ impl Shared {
         }
     }
 
-    fn job_status(&self, args: &Value) -> ToolResult {
+    fn list_jobs(&self) -> ToolResult {
         let jobs = lock(&self.jobs);
+        let list: Vec<Value> =
+            jobs.map.iter().filter(|(_, x)| x.handed_off || x.state == JobState::Running).map(|(n, x)| self.job_summary(*n, x)).collect();
+        ToolResult::json(&json!({"jobs": list}))
+    }
+
+    fn job_status(&self, args: &Value) -> ToolResult {
         let Some(asked) = args.get("job_id").or(args.get("id")).or(args.get("job")) else {
-            let list: Vec<Value> =
-                jobs.map.iter().filter(|(_, x)| x.handed_off || x.state == JobState::Running).map(|(n, x)| self.job_summary(*n, x)).collect();
-            return ToolResult::json(&json!({"jobs": list}));
+            return self.list_jobs();
         };
+        let jobs = lock(&self.jobs);
         let text = match asked {
             Value::String(s) => s.clone(),
             other => other.to_string(),
@@ -407,29 +482,80 @@ impl Shared {
         let Some((n, j)) = parse_job(&text).and_then(|n| jobs.map.get(&n).map(|j| (n, j))) else {
             let ids: Vec<String> = jobs.map.keys().map(|n| job_name(*n)).collect();
             return ToolResult::failure(
-                &ToolError::new("not_found", format!("there is no job `{text}`"), "use a job_id a call returned; server_status lists the jobs")
+                &ToolError::new(code::NOT_FOUND, format!("there is no job `{text}`"), "use a job_id a call returned; list_jobs lists the jobs")
                     .with("closest", json!(contract::closest(&text, ids.iter().map(String::as_str), 5))),
             );
         };
         let mut v = self.job_summary(n, j);
+        let mut pictures = Vec::new();
         match (&j.state, &j.result) {
             (JobState::Running, _) => {
                 let elapsed = j.started.elapsed().as_millis() as u64;
                 v["retry_after_ms"] = json!(retry_after(elapsed));
+                v["cancelling"] = json!(gridcraft_engine::core::cancel::pending());
                 v["next_step"] = json!(format!("the job is still running; call job_status with job_id \"{}\" again", job_name(n)));
             }
-            (_, Some(r)) => {
-                v["is_error"] = r["isError"].clone();
+            (state, Some(r)) => {
                 let s = r["structuredContent"].clone();
                 if r["isError"] == true {
                     v["error"] = s["error"].clone();
+                    v["next_step"] = json!(if *state == JobState::Cancelled {
+                        "the job was cancelled at a safe point; the workbook is as it was before it"
+                    } else {
+                        "the job failed; see error.next_step"
+                    });
                 } else {
                     v["result"] = s;
+                    v["next_step"] = json!("the job is finished; its result is in `result`");
                 }
+                pictures = r["content"].as_array().map(|c| c.iter().filter(|b| b["type"] != "text").cloned().collect()).unwrap_or_default();
             }
             _ => {}
         }
-        ToolResult::json(&v)
+        let mut out = ToolResult::json(&v);
+        out.content.extend(pictures);
+        out
+    }
+}
+
+/// The progress fields every craft app reports for a call or job: `progress` (0..1, never
+/// going back, 1 only once done), `stage`, `steps` `{done, total}` and the `stages` passed.
+fn progress_fields(p: Option<&gridcraft_engine::core::progress::Progress>, tool: &str, done: bool) -> Value {
+    let p = p.cloned().unwrap_or_default();
+    let stage = if p.stage.is_empty() { tool.to_string() } else { p.stage.clone() };
+    let mut stages = p.stages.clone();
+    if stages.is_empty() {
+        stages.push(stage.clone());
+    }
+    let progress = if done { 1.0 } else { (p.overall.min(0.99) * 1000.0).round() / 1000.0 };
+    json!({
+        "progress": progress,
+        "stage": stage,
+        "steps": {"done": if done && p.total > 0 { p.total } else { p.done }, "total": p.total},
+        "stages": stages,
+    })
+}
+
+fn job_state_name(s: &JobState) -> &'static str {
+    match s {
+        JobState::Running => "running",
+        JobState::Done => "done",
+        JobState::Failed => "failed",
+        JobState::Cancelled => "cancelled",
+    }
+}
+
+/// A recovered file as every craft app reports it: `{path, reason, original, at}`.
+fn recovered_entry(path: &str, reason: &str, original: Option<&str>) -> Value {
+    json!({"path": path, "reason": reason, "original": original, "at": rfc3339_now()})
+}
+
+/// `2026-10-17T18:45:12Z` (UTC).
+fn rfc3339_now() -> String {
+    let s = stamp();
+    match (s.get(0..4), s.get(4..6), s.get(6..8), s.get(9..11), s.get(11..13), s.get(13..15)) {
+        (Some(y), Some(mo), Some(d), Some(h), Some(mi), Some(se)) => format!("{y}-{mo}-{d}T{h}:{mi}:{se}Z"),
+        _ => s,
     }
 }
 
@@ -437,7 +563,8 @@ fn retry_after(elapsed_ms: u64) -> u64 {
     (elapsed_ms / 4).clamp(250, 5000)
 }
 
-/// `20261017-184512-123` (UTC) for recovered file names.
+/// `20261017-184512` (UTC) for recovered file names: `<name>.recovered-<stamp>.xlsx`, the same
+/// form in every craft app.
 fn stamp() -> String {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     let secs = now.as_secs() as i64;
@@ -453,21 +580,30 @@ fn stamp() -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}-{:03}", rem / 3600, rem % 3600 / 60, rem % 60, now.subsec_millis())
+    format!("{y:04}{m:02}{d:02}-{:02}{:02}{:02}", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
-/// Recovered files already in `dir` (from an earlier process).
-fn find_recovered(dir: &Path) -> Vec<String> {
+/// Recovered files already in `dir` (from an earlier process), as entries with reason `found`.
+fn find_recovered(dir: &Path) -> Vec<Value> {
     let mut v: Vec<String> = std::fs::read_dir(dir)
         .map(|it| {
             it.filter_map(|e| e.ok())
-                .filter(|e| e.file_name().to_string_lossy().contains(".recovered-"))
+                .filter(|e| {
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    n.contains(".recovered-") && !n.starts_with("OLD_") && e.path().is_file()
+                })
                 .map(|e| e.path().display().to_string())
                 .collect()
         })
         .unwrap_or_default();
     v.sort();
-    v
+    v.into_iter()
+        .map(|p| {
+            let mut e = recovered_entry(&p, "found", None);
+            e["at"] = Value::Null;
+            e
+        })
+        .collect()
 }
 
 /// A backend that only describes itself: the stdio loop's own server answers the protocol
@@ -504,7 +640,11 @@ pub fn serve(
         busy: Mutex::new(None),
         snapshot: Mutex::new(None),
         recovered: Mutex::new(config.write_root.as_deref().map(find_recovered).unwrap_or_default()),
+        unannounced: Mutex::new(config.write_root.as_deref().map(find_recovered).unwrap_or_default()),
         evicted: Mutex::new(None),
+        calls: std::sync::atomic::AtomicU64::new(0),
+        busy_replies: std::sync::atomic::AtomicU64::new(0),
+        backend: describe.clone(),
         last_activity: Mutex::new(Instant::now()),
         idle_done: AtomicBool::new(false),
         worker: Mutex::new(None),
@@ -515,7 +655,7 @@ pub fn serve(
     if config.handle_signals {
         let s = shared.clone();
         let installed = ctrlc::set_handler(move || {
-            s.autosave_latest("stopped by a signal");
+            s.autosave_latest("signal");
             std::process::exit(143);
         });
         if let Err(e) = installed {
@@ -529,14 +669,8 @@ pub fn serve(
     let settings = config.settings.clone();
     let worker = std::thread::Builder::new().name("gridcraft-worker".into()).spawn(move || {
         *lock(&ws.worker) = Some(std::thread::current().id());
+        gridcraft_engine::core::progress::watch_this_thread();
         let mut server = Server::with_settings(factory(), settings);
-        let found = lock(&ws.recovered).clone();
-        if !found.is_empty() {
-            server.state_mut().notices.push(format!(
-                "work from an earlier session was auto-saved and is waiting to be reopened: {} (open_workbook it to continue)",
-                found.join(", ")
-            ));
-        }
         let snap = server.backend().snapshot();
         ws.note_call(snap.as_ref());
         *lock(&ws.snapshot) = snap;
@@ -631,28 +765,43 @@ pub fn serve(
                     Some(name) if CONTROL_TOOLS.contains(&name.as_str()) => {
                         let r = match name.as_str() {
                             "server_status" => ToolResult::json(&shared.status()),
-                            "cancel" => shared.cancel(&args),
+                            "cancel" => {
+                                let mut r = shared.cancel(&args);
+                                // Nothing waits in a queue here (a waiting call is answered busy).
+                                if args.get("queued").is_some_and(|q| q == true || q == "true")
+                                    && let Some(sc) = r.structured.as_mut()
+                                {
+                                    sc["dropped_from_queue"] = json!(0);
+                                }
+                                r
+                            }
+                            "list_jobs" => shared.list_jobs(),
                             _ => shared.job_status(&args),
                         };
                         shared.write(&json!({"jsonrpc": "2.0", "id": id, "result": r.to_value()}));
                     }
                     Some(name) => submit(&shared, &work_tx, msg, id, &name, &args),
+                    // An unknown tool: an answer the agent sees, with the closest names.
                     None => {
-                        if let Some(r) = local.handle(msg) {
-                            shared.write(&r);
-                        }
+                        let near = contract::closest(&asked, names.iter().map(String::as_str), 3);
+                        let e =
+                            ToolError::new(code::NOT_FOUND, format!("unknown tool `{asked}`"), "call tools/list; the closest tools are in `closest`")
+                                .with("closest", json!(near));
+                        shared.write(&json!({"jsonrpc": "2.0", "id": id, "result": ToolResult::failure(&e).to_value()}));
                     }
                 }
             }
             ("resources/read", Some(id)) => submit(&shared, &work_tx, msg, id, "resources/read", &Value::Null),
-            // The client gave up on a request: stop it when it is the call in progress.
+            // The client gave up on a request (clients also send this on their own timeouts): the
+            // call carries on as a job, its result kept for job_status (`cancel` stops work).
             ("notifications/cancelled", None) => {
                 let asked = msg["params"]["requestId"].clone();
                 let busy = lock(&shared.busy);
-                if busy.as_ref().is_some_and(|b| !asked.is_null() && b.id == asked)
-                    && let Some(t) = *lock(&shared.worker)
+                if let Some(b) = busy.as_ref().filter(|b| !asked.is_null() && b.id == asked)
+                    && let Some(j) = lock(&shared.jobs).map.get_mut(&b.job)
                 {
-                    gridcraft_engine::core::cancel::request(t);
+                    j.handed_off = true;
+                    j.client_cancelled = true;
                 }
             }
             _ => {
@@ -671,13 +820,13 @@ pub fn serve(
     if lock(&shared.busy).is_none() {
         let _ = worker.join();
     }
-    shared.autosave_latest("the client closed the connection");
+    shared.autosave_latest("disconnect");
     Ok(())
 }
 
 /// Should this call run as a job from the start?
 fn starts_as_job(shared: &Shared, name: &str, args: &Value) -> bool {
-    match args.get("async") {
+    match args.get("async").or_else(|| args.get("background")) {
         Some(Value::Bool(b)) => return *b,
         Some(Value::String(s)) if s.eq_ignore_ascii_case("true") => return true,
         Some(Value::String(s)) if s.eq_ignore_ascii_case("false") => return false,
@@ -688,7 +837,7 @@ fn starts_as_job(shared: &Shared, name: &str, args: &Value) -> bool {
         "open_workbook" => {
             let Some(p) = args.get("path").and_then(Value::as_str) else { return false };
             let p = gridcraft_engine::file_access::resolve_relative(p, gridcraft_engine::file_access::Access::Read);
-            gridcraft_engine::file_access::check_read(&p).is_ok() && std::fs::metadata(&p).is_ok_and(|m| m.len() > shared.config.job_open_bytes)
+            gridcraft_engine::file_access::check_read(&p).is_ok() && std::fs::metadata(&p).is_ok_and(|m| m.len() >= shared.config.job_open_bytes)
         }
         "recalculate" | "export_pdf" | "render_sheet" => cells > shared.config.job_cells,
         "build_workbook" => {
@@ -717,8 +866,10 @@ fn submit(shared: &Arc<Shared>, work_tx: &mpsc::Sender<Work>, msg: Value, id: Va
                 format!("retry after {} ms; server_status and job_status answer meanwhile", retry_after(elapsed)),
             )
             .with("retry_after_ms", json!(retry_after(elapsed)))
-            .with("job_id", json!(job_name(r.job)));
+            .with("job_id", json!(job_name(r.job)))
+            .with("running", json!(r.tool));
             drop(busy);
+            shared.busy_replies.fetch_add(1, Ordering::Relaxed);
             let reply = if name == "resources/read" {
                 error_with(id, -32000, &e)
             } else {
@@ -732,7 +883,16 @@ fn submit(shared: &Arc<Shared>, work_tx: &mpsc::Sender<Work>, msg: Value, id: Va
         let n = jobs.next;
         jobs.map.insert(
             n,
-            Job { tool: name.to_string(), state: JobState::Running, started: Instant::now(), finished: None, result: None, handed_off: false },
+            Job {
+                tool: name.to_string(),
+                state: JobState::Running,
+                started: Instant::now(),
+                finished: None,
+                result: None,
+                handed_off: false,
+                client_cancelled: false,
+                progress: None,
+            },
         );
         // Old finished jobs are forgotten (the newest 200 stay).
         while jobs.map.len() > 200 {
@@ -740,14 +900,15 @@ fn submit(shared: &Arc<Shared>, work_tx: &mpsc::Sender<Work>, msg: Value, id: Va
             jobs.map.remove(&oldest);
         }
         *busy = Some(Running { tool: name.to_string(), job: n, started: Instant::now(), id: id.clone() });
+        shared.calls.fetch_add(1, Ordering::Relaxed);
         n
     };
     let as_job = name != "resources/read" && starts_as_job(shared, name, args);
     let (done_tx, done_rx) = mpsc::channel::<Value>();
     if work_tx.send(Work::Call { msg, job, done: done_tx }).is_err() {
         *lock(&shared.busy) = None;
-        let saved = shared.autosave_latest("the document worker stopped");
-        let mut e = ToolError::new("internal_error", "the document worker stopped", "restart the server and open the recovered file");
+        let saved = shared.autosave_latest("panic");
+        let mut e = ToolError::new(code::INTERNAL, "the document worker stopped", "restart the server and open the recovered file");
         if let Some(p) = saved {
             e = e.with("recovered_path", json!(p.display().to_string()));
         }
@@ -765,14 +926,18 @@ fn submit(shared: &Arc<Shared>, work_tx: &mpsc::Sender<Work>, msg: Value, id: Va
     let tool = name.to_string();
     let timeout = shared.config.call_timeout;
     let _ = std::thread::Builder::new().name("gridcraft-wait".into()).spawn(move || match done_rx.recv_timeout(timeout) {
-        Ok(reply) => {
+        Ok(mut reply) => {
             // A job someone asked about (cancel names it) keeps its record for job_status.
             let mut jobs = lock(&s.jobs);
+            let quiet = jobs.map.get(&job).is_some_and(|j| j.client_cancelled);
             if !jobs.map.get(&job).is_some_and(|j| j.handed_off) {
                 jobs.map.remove(&job);
             }
             drop(jobs);
-            s.write(&reply);
+            if !quiet {
+                s.announce(&mut reply);
+                s.write(&reply);
+            }
         }
         Err(_) => {
             let mut jobs = lock(&s.jobs);
@@ -781,14 +946,19 @@ fn submit(shared: &Arc<Shared>, work_tx: &mpsc::Sender<Work>, msg: Value, id: Va
                 Some((r, _)) => {
                     jobs.map.remove(&job);
                     drop(jobs);
-                    s.write(&json!({"jsonrpc": "2.0", "id": id, "result": r}));
+                    let mut reply = json!({"jsonrpc": "2.0", "id": id, "result": r});
+                    s.announce(&mut reply);
+                    s.write(&reply);
                 }
                 None => {
+                    let quiet = jobs.map.get(&job).is_some_and(|j| j.client_cancelled);
                     if let Some(j) = jobs.map.get_mut(&job) {
                         j.handed_off = true;
                     }
                     drop(jobs);
-                    handoff(&s, id, job, &tool, "the call is taking longer than the call timeout; it carries on as a job");
+                    if !quiet {
+                        handoff(&s, id, job, &tool, "the call is taking longer than --job-after-ms; it carries on as a job");
+                    }
                 }
             }
         }
@@ -803,7 +973,7 @@ fn handoff(shared: &Shared, id: Value, job: u64, name: &str, why: &str) {
         "tool": name,
         "reason": why,
         "retry_after_ms": 1000,
-        "next_step": format!("poll job_status with job_id \"{}\" until status is done; the result will be there", job_name(job)),
+        "next_step": format!("poll job_status with job_id \"{}\" until status is not \"running\"; the result will be there", job_name(job)),
     });
     shared.write(&json!({"jsonrpc": "2.0", "id": id, "result": ToolResult::json(&v).to_value()}));
 }
@@ -813,20 +983,42 @@ fn worker_loop(server: &mut Server, shared: &Shared, rx: mpsc::Receiver<Work>) {
         match work {
             Work::Call { msg, job, done } => {
                 let id = msg.get("id").cloned().unwrap_or(Value::Null);
-                let call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| server.handle(msg)));
+                let tool = lock(&shared.jobs).map.get(&job).map(|j| j.tool.clone()).unwrap_or_default();
+                gridcraft_engine::core::progress::reset(&tool);
+                // `evict` (for a supervisor) works on the worker's document like an eviction.
+                let call = if tool == "evict" {
+                    let reason = msg["params"]["arguments"]["reason"].as_str().unwrap_or("evicted by the supervisor").to_string();
+                    let before = lock(&shared.evicted).clone();
+                    evict(server, shared, reason);
+                    let ev = lock(&shared.evicted).clone().filter(|e| Some(e) != before.as_ref());
+                    let list: Vec<Value> = ev
+                        .map(|e| vec![json!({"reason": e.reason, "recovered_path": e.recovered.map(|p| p.display().to_string()), "original_path": e.original})])
+                        .unwrap_or_default();
+                    Ok(Some(json!({"jsonrpc": "2.0", "id": id, "result": ToolResult::json(&json!({"evicted": list})).to_value()})))
+                } else {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| server.handle(msg)))
+                };
                 let reply = match call {
                     Ok(Some(r)) => r,
                     Ok(None) => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
                     // Stopped by `cancel` between commands: each command is whole, nothing half done.
                     Err(p) if gridcraft_engine::core::cancel::is_cancelled(&*p) => {
-                        let e =
-                            ToolError::new("cancelled", "the call was stopped as asked", "run it again when you need it; the workbook is consistent");
+                        let e = ToolError::new(
+                            code::CANCELLED,
+                            "the call was stopped as asked",
+                            "the workbook is as it was before the call; run it again when you need it",
+                        );
                         json!({"jsonrpc": "2.0", "id": id, "result": ToolResult::failure(&e).to_value()})
                     }
                     Err(_) => {
-                        let saved = shared.autosave_latest("a call panicked");
+                        let saved = shared.autosave_latest("panic");
+                        if let Some(p) = &saved {
+                            // The answer names the file: no separate announcement.
+                            let text = p.display().to_string();
+                            lock(&shared.unannounced).retain(|r| r["path"] != text.as_str());
+                        }
                         let mut e = ToolError::new(
-                            "internal_error",
+                            code::INTERNAL,
                             "the call failed inside GridCraft (a bug); the workbook is kept as it was before this call",
                             match &saved {
                                 Some(p) => format!("carry on; a copy of the work is also auto-saved at {}", p.display()),
@@ -856,10 +1048,14 @@ fn worker_loop(server: &mut Server, shared: &Shared, rx: mpsc::Receiver<Work>) {
                             JobState::Done
                         };
                         j.finished = Some(Instant::now());
+                        if j.state == JobState::Done {
+                            gridcraft_engine::core::progress::finish();
+                        }
+                        j.progress = gridcraft_engine::core::progress::current();
                         j.result = Some(match reply.get("result") {
                             Some(r) => r.clone(),
                             None => {
-                                let e = ToolError::new("failed", reply["error"]["message"].as_str().unwrap_or("failed"), "check the request");
+                                let e = ToolError::new(code::FAILED, reply["error"]["message"].as_str().unwrap_or("failed"), "check the request");
                                 ToolResult::failure(&e).to_value()
                             }
                         });
@@ -893,7 +1089,19 @@ fn worker_loop(server: &mut Server, shared: &Shared, rx: mpsc::Receiver<Work>) {
 
 fn evict(server: &mut Server, shared: &Shared, reason: String) {
     let snap = server.backend().snapshot();
-    let recovered = snap.as_ref().filter(|s| s.dirty).and_then(|s| shared.autosave(s, "evicted"));
+    let kind = if reason.contains(" MB") {
+        "memory"
+    } else if reason.contains("without calls") {
+        "idle"
+    } else {
+        "evict"
+    };
+    let recovered = snap.as_ref().filter(|s| s.dirty).and_then(|s| shared.autosave(s, kind));
+    if let Some(p) = &recovered {
+        // The `evicted` answer names it: no separate announcement.
+        let text = p.display().to_string();
+        lock(&shared.unannounced).retain(|r| r["path"] != text.as_str());
+    }
     server.backend().reset();
     let ev = Eviction { reason, recovered, original: snap.and_then(|s| s.path) };
     eprintln!("gridcraft-cli: {}", ev.reason);
@@ -910,7 +1118,8 @@ mod tests {
     #[test]
     fn stamps_and_job_ids() {
         let s = stamp();
-        assert_eq!(s.len(), "20261017-184512-123".len(), "{s}");
+        assert_eq!(s.len(), "20261017-184512".len(), "{s}");
+        assert_eq!(rfc3339_now().len(), "2026-10-17T18:45:12Z".len());
         assert!(s.starts_with("20"));
         assert_eq!(parse_job("job-12"), Some(12));
         assert_eq!(parse_job("12"), Some(12));

@@ -124,11 +124,23 @@ fn tool(name: &str, title: &str, desc: &str, schema: Value, hints: Hints) -> Val
 pub(crate) const WRITES_FILES: &[&str] = &["save_workbook", "export_pdf", "render_range", "render_sheet", "build_workbook", "screenshot"];
 
 /// Tools that work without an open document (they stay available after an eviction).
-const NEEDS_NO_DOCUMENT: &[&str] =
-    &["open_workbook", "new_workbook", "build_workbook", "server_status", "job_status", "list_commands", "list_functions", "debug_sleep", "cancel"];
+const NEEDS_NO_DOCUMENT: &[&str] = &[
+    "open_workbook",
+    "new_workbook",
+    "build_workbook",
+    "server_status",
+    "job_status",
+    "list_jobs",
+    "list_commands",
+    "list_functions",
+    "debug_sleep",
+    "cancel",
+    "evict",
+    "roundtrip_check",
+];
 
 /// Tools that run on the dispatcher thread, never queued behind document work.
-pub const CONTROL_TOOLS: &[&str] = &["server_status", "job_status", "cancel"];
+pub const CONTROL_TOOLS: &[&str] = &["server_status", "job_status", "list_jobs", "cancel"];
 
 /// The WHIQ tools (definitions only; the global arguments are added by [`with_globals`]).
 pub fn definitions() -> Vec<Value> {
@@ -147,17 +159,49 @@ pub fn definitions() -> Vec<Value> {
             "Cancel",
             "Stop the call in progress (no job_id) or a running job (job_id). It stops at the next safe point — between \
              formulas of a recalculation, rows being read, written or drawn, steps of a build — and the workbook is left exactly \
-             as it was before that call. Answers at once; the stopped call or job then ends with code `cancelled`.",
-            obj(json!({"job_id": string("The job to stop (from a call's answer or server_status); default: the call in progress")}), &[]),
-            crate::tools::ANY,
+             as it was before that call. Answers at once ({cancelled, status}); the stopped call or job then ends with code \
+             `cancelled` (job status `cancelled`). queued: true also drops calls waiting behind it.",
+            obj(
+                json!({
+                    "job_id": string("The job to stop (from a call's answer or server_status); default: the call in progress"),
+                    "queued": boolean("Also drop the calls waiting behind the running one (each answers `cancelled`)"),
+                }),
+                &[],
+            ),
+            crate::tools::SET,
         ),
         tool(
             "job_status",
             "Job status",
-            "Progress and result of a job. Long work (opening a very large file, a full recalculation, exporting or rendering many \
-             pages, or any call that runs past the call timeout) answers with a job_id at once; poll this tool with it. When the \
-             job is done the result is here (it survives client timeouts). Without job_id: every job this server knows.",
+            "Progress and result of a job: status (running, done, failed, cancelled), progress 0..1, stage, steps and the stages \
+             passed, then its result (or error). Long work (opening a very large file, a full recalculation, exporting or \
+             rendering many pages, or any call that runs past --job-after-ms) answers with a job_id at once; poll this tool \
+             with it. The result survives client timeouts. Without job_id: every job this server knows, like list_jobs.",
             obj(json!({"job_id": string("The job id a call returned, e.g. \"job-3\"")}), &[]),
+            crate::tools::READ,
+        ),
+        tool(
+            "list_jobs",
+            "List jobs",
+            "Every job this server knows (running and finished, newest 200): job_id, tool, status, progress, stage, elapsed time.",
+            obj(json!({}), &[]),
+            crate::tools::READ,
+        ),
+        tool(
+            "evict",
+            "Evict",
+            "For a supervisor: auto-save the open workbook's unsaved work to a recovered file inside the write root and close it. \
+             The next call that needs it answers `evicted` with the file to reopen.",
+            obj(json!({"reason": string("Why (shown to the agent)")}), &[]),
+            crate::tools::SET,
+        ),
+        tool(
+            "roundtrip_check",
+            "Round-trip check",
+            "Open and save an .xlsx/.xlsm in memory (without touching the open workbook or the file) and report whether anything \
+             would be dropped: parts, relationships, binary parts, and the elements of every XML part. Use it on a customer's file \
+             before editing it.",
+            obj(json!({"path": string("The .xlsx or .xlsm file")}), &["path"]),
             crate::tools::READ,
         ),
     ];
@@ -380,6 +424,21 @@ pub(crate) fn dispatch_extra(b: &mut dyn Backend, name: &str, a: &Args) -> Resul
             Ok(v)
         }
         "recalculate" => exec(b, "formulas.recalculate", json!({})),
+        "roundtrip_check" => {
+            let path = a.get("path").and_then(Value::as_str).unwrap_or("");
+            gridcraft_engine::core::progress::step_in("round trip: reading", 0, 2);
+            let bytes = gridcraft_engine::io::read_file(path).map_err(|e| e.to_string())?;
+            gridcraft_engine::core::progress::step_in("round trip: saving and comparing", 1, 2);
+            let (wb, _) = gridcraft_engine::io::open_bytes(path, &bytes).map_err(|e| format!("{path}: {e}"))?;
+            let saved = gridcraft_engine::io::save_bytes(&wb, path).map_err(|e| format!("{path}: {e}"))?;
+            let mut v = crate::roundtrip::compare(&bytes, &saved).map_err(|e| format!("{path}: {e}"))?;
+            v["path"] = json!(path);
+            if v["lossless"] != true {
+                v["next_step"] =
+                    json!("the parts listed under problems would change on save: tell the owner before editing, or keep the original file");
+            }
+            Ok(v)
+        }
         "insert_rows" => with_sheet(b, a, |b| exec(b, "home.insertRows", json!({"rows": span(a, "rows")}))),
         "insert_columns" => with_sheet(b, a, |b| exec(b, "home.insertColumns", json!({"cols": span(a, "cols")}))),
         "delete_rows" => with_sheet(b, a, |b| exec(b, "home.deleteRows", json!({"rows": span(a, "rows")}))),
@@ -558,6 +617,10 @@ pub fn with_globals(mut tools: Vec<Value>) -> Vec<Value> {
         if !CONTROL_TOOLS.contains(&name.as_str()) {
             props
                 .insert("async".into(), boolean("Run as a job: answer at once with a job_id and poll job_status (default: automatic for long work)"));
+            if name != "read_range" {
+                props.entry("continue_from").or_insert(int("Where to resume a trimmed result (its continue_from)"));
+            }
+            props.entry("max_bytes").or_insert(int("Largest result to return before trimming (default --max-result-bytes)"));
         }
         if WRITES_FILES.contains(&name.as_str()) {
             props.insert(
@@ -607,8 +670,15 @@ pub fn run_tool(b: &mut dyn Backend, st: &mut CallState, name: &str, args: &Valu
             ));
         }
     };
-    let (a, mut fixes) = contract::normalize_args(&def["inputSchema"], raw);
+    let (mut a, mut fixes) = contract::normalize_args(&def["inputSchema"], raw);
     warnings.append(&mut fixes);
+    // `continue_from` (the shared continuation) on a tool that pages with `offset`.
+    if def["inputSchema"]["properties"]["offset"].is_object()
+        && !a.contains_key("offset")
+        && let Some(n) = raw.get("continue_from").and_then(Value::as_u64)
+    {
+        a.insert("offset".into(), json!(n));
+    }
     if let Err(e) = check_arguments(name, &Value::Object(a.clone())) {
         return ToolResult::failure(&invalid_argument(def, &e));
     }
@@ -638,16 +708,21 @@ pub fn run_tool(b: &mut dyn Backend, st: &mut CallState, name: &str, args: &Valu
             if matches!(name, "open_workbook" | "new_workbook" | "build_workbook") {
                 st.evicted = None;
             }
-            let mut v = contract::trim_result(v, st.settings.max_result_bytes);
+            let max = raw.get("max_bytes").and_then(Value::as_u64).map_or(st.settings.max_result_bytes, |m| (m as usize).clamp(1024, 64 << 20));
+            let from =
+                raw.get("continue_from").and_then(Value::as_u64).filter(|_| !def["inputSchema"]["properties"]["offset"].is_object()).unwrap_or(0);
+            let mut v = contract::trim_from(v, from as usize, max);
             warnings.append(&mut st.notices);
-            if !v.is_object() && (!reports.is_empty() || !warnings.is_empty()) {
+            if !v.is_object() && (reports.iter().any(|r| r.previous_renamed_to.is_some()) || !warnings.is_empty()) {
                 v = json!({"result": v});
             }
-            if !reports.is_empty() {
-                let saved: Vec<Value> = reports
-                    .iter()
-                    .map(|r| json!({"path": r.path.display().to_string(), "previous_renamed_to": r.previous_renamed_to.as_ref().map(|p| p.display().to_string())}))
-                    .collect();
+            let renamed: Vec<Value> = reports
+                .iter()
+                .filter_map(|r| {
+                    r.previous_renamed_to.as_ref().map(|old| json!({"path": r.path.display().to_string(), "previous": old.display().to_string()}))
+                })
+                .collect();
+            if !renamed.is_empty() {
                 for r in &reports {
                     if let Some(old) = &r.previous_renamed_to {
                         warnings.push(format!(
@@ -657,7 +732,11 @@ pub fn run_tool(b: &mut dyn Backend, st: &mut CallState, name: &str, args: &Valu
                         ));
                     }
                 }
-                v["saved"] = Value::Array(saved);
+                v["notice"] = json!(format!(
+                    "an existing file was kept: {} (pass overwrite: true to replace instead)",
+                    renamed.iter().filter_map(|r| r["previous"].as_str()).collect::<Vec<_>>().join(", ")
+                ));
+                v["previous_files_renamed"] = Value::Array(renamed);
             }
             if !warnings.is_empty() {
                 match v.get_mut("warnings").and_then(Value::as_array_mut) {
@@ -709,7 +788,10 @@ fn invalid_argument(def: &Value, msg: &str) -> ToolError {
 
 fn dispatch(b: &mut dyn Backend, st: &mut CallState, name: &str, a: &Args, warnings: &mut Vec<String>) -> Result<Value, ToolError> {
     match name {
-        "server_status" => Ok(status_value(b.snapshot().as_ref(), b.roots(), &st.settings, json!({"mode": "synchronous", "jobs": []}))),
+        "server_status" => Ok(status_value(b.snapshot().as_ref(), b.roots(), &st.settings, json!({"jobs": []}))),
+        "list_jobs" => Ok(json!({"jobs": []})),
+        "evict" => Ok(json!({"evicted": [], "note": "eviction exists under `gridcraft-cli mcp`"})),
+        "job_status" if a.get("job_id").is_none() => Ok(json!({"jobs": []})),
         "job_status" => Err(ToolError::new(
             "not_found",
             "this server runs calls synchronously and has no jobs",
@@ -724,11 +806,7 @@ fn dispatch(b: &mut dyn Backend, st: &mut CallState, name: &str, a: &Args, warni
             }
             Ok(json!({"slept_ms": ms}))
         }
-        "cancel" => Err(ToolError::new(
-            "not_found",
-            "this server runs calls synchronously: there is nothing to cancel while you wait for an answer",
-            "cancel exists under `gridcraft-cli mcp`",
-        )),
+        "cancel" => Ok(json!({"cancelled": false, "status": "not_running", "next_step": "no call is running: nothing to stop"})),
         "debug_panic" => provoked_panic(),
         "read_range" => read_range(b, st, a),
         "list_commands" => {
@@ -927,7 +1005,11 @@ pub fn classify(b: &mut dyn Backend, tool: &str, a: &Args, msg: &str) -> ToolErr
         return ToolError::new("cancelled", msg, "the call was stopped as asked and changed nothing; run it again when you need it");
     }
     if m.contains("no ui in headless mode") {
-        return ToolError::new("no_ui", msg, "use render_range or render_sheet for a picture of the cells, or connect to the desktop app");
+        return ToolError::new(
+            contract::code::UNSUPPORTED,
+            msg,
+            "use render_range or render_sheet for a picture of the cells, or connect to the desktop app",
+        );
     }
     if m.contains(&gridcraft_engine::io::WRONG_PASSWORD.to_ascii_lowercase()) {
         return ToolError::new("wrong_password", msg, "call open_workbook again with the right `password`");
@@ -997,15 +1079,22 @@ pub fn classify(b: &mut dyn Backend, tool: &str, a: &Args, msg: &str) -> ToolErr
     if m.contains("too large") || m.contains("too many") || m.contains("too tall") || m.contains("larger than") || m.contains("read it in parts") {
         return ToolError::new("too_large", msg, "ask for a smaller part: a range like A1:D500, fewer rows, or fewer pages");
     }
+    if m.contains("out of range") || m.contains("beyond the last") || m.contains("no page ") {
+        return ToolError::new(
+            contract::code::OUT_OF_RANGE,
+            msg,
+            "ask for rows, columns or pages that exist (inspect_workbook shows the used range)",
+        );
+    }
     if m.contains("internal error") {
         return ToolError::new(
-            "internal_error",
+            contract::code::INTERNAL,
             msg,
             "the workbook was kept as it was before this call; try again with simpler input or another way",
         );
     }
     if m.contains("not reachable") || m.contains("control channel closed") {
-        return ToolError::new("unavailable", msg, "start the app with `gridcraft --control PORT`, or use the headless server");
+        return ToolError::new(contract::code::NOT_AVAILABLE, msg, "start the app with `gridcraft --control PORT`, or use the headless server");
     }
     if m.contains("invalid parameters")
         || m.contains("missing")
@@ -1064,7 +1153,8 @@ pub fn rss_bytes() -> Option<u64> {
     Some(pages.saturating_mul(4096))
 }
 
-/// The fonts exports embed (craft-fonts): how many faces, and the families.
+/// The fonts exports embed (craft-fonts), in the shape every craft app reports: how many faces,
+/// the families, the default Latin family and the Arabic fallback.
 fn fonts_value() -> Value {
     let faces = gridcraft_engine::text::faces();
     let mut families: Vec<&str> = Vec::new();
@@ -1073,30 +1163,57 @@ fn fonts_value() -> Value {
             families.push(f.family);
         }
     }
-    json!({"faces": faces.len(), "families": families, "default": gridcraft_engine::text::resolve_family("Calibri")})
+    let arabic = families.iter().find(|f| f.to_ascii_lowercase().contains("arabic")).copied();
+    json!({"source": "craft-fonts", "faces": faces.len(), "families": families, "default": gridcraft_engine::text::resolve_family("Calibri"), "arabic": arabic})
+}
+
+/// The committed (virtual) size of this process as the operating system counts it.
+fn committed_bytes() -> Option<u64> {
+    memory_stats::memory_stats().map(|m| m.virtual_mem as u64).filter(|b| *b > 0)
+}
+
+/// Where the memory figures come from (the same words in every craft app).
+fn memory_source() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "GetProcessMemoryInfo: WorkingSetSize (rss), PagefileUsage (committed)"
+    } else if cfg!(target_os = "macos") {
+        "task_info(MACH_TASK_BASIC_INFO): resident_size (rss), virtual_size (committed)"
+    } else if cfg!(target_os = "linux") {
+        "/proc/self: resident set size (rss), virtual size (committed)"
+    } else {
+        "memory-stats"
+    }
 }
 
 /// What server_status answers. `extra` adds the runtime's part (jobs, busy, limits).
 pub fn status_value(snap: Option<&DocSnapshot>, roots: (Option<PathBuf>, Option<PathBuf>), settings: &Settings, extra: Value) -> Value {
     let doc = snap.map(|s| {
         json!({
+            "name": Path::new(&s.title).file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| s.title.clone()),
             "title": s.title,
             "path": s.path,
-            "unsaved_changes": s.dirty,
+            "dirty": s.dirty,
+            "active": true,
             "sheets": s.sheets,
             "cells": s.cells,
         })
     });
     let (read, write) = roots;
+    let rss = rss_bytes();
     let mut v = json!({
         "server": "gridcraft",
         "version": env!("CARGO_PKG_VERSION"),
-        "whiq": true,
-        "memory": {"rss_bytes": rss_bytes()},
+        "protocol": crate::server::PROTOCOL_VERSION,
+        "pid": std::process::id(),
+        "memory": {"rss_bytes": rss, "committed_bytes": committed_bytes(), "limit_bytes": Value::Null, "measured": rss.is_some(), "source": memory_source()},
         "fonts": fonts_value(),
-        "document": doc,
+        "documents": doc.into_iter().collect::<Vec<_>>(),
         "roots": {"read": read.map(|p| p.display().to_string()), "write": write.map(|p| p.display().to_string())},
         "author": settings.author,
+        "current_call": Value::Null,
+        "jobs": [],
+        "recovered_files": [],
+        "evicted": [],
         "limits": {"max_result_bytes": settings.max_result_bytes, "max_read_cells": settings.max_read_cells},
     });
     if let (Some(o), Value::Object(e)) = (v.as_object_mut(), extra) {

@@ -38,6 +38,11 @@ pub fn clear() {
     PENDING.store(false, Ordering::SeqCst);
 }
 
+/// Is a stop pending (for whichever thread)? For status reports.
+pub fn pending() -> bool {
+    PENDING.load(Ordering::Relaxed)
+}
+
 /// Has a stop been asked for on this thread?
 pub fn requested() -> bool {
     PENDING.load(Ordering::Relaxed) && *target() == Some(std::thread::current().id())

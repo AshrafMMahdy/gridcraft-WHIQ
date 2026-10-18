@@ -136,7 +136,10 @@ fn malformed_input_never_panics() {
     assert_eq!(err_code(&rpc(&mut s, 1, "nope/nothing", json!({}))), -32601);
     // Bad tools/call params.
     assert_eq!(err_code(&rpc(&mut s, 2, "tools/call", json!({}))), -32602);
-    assert_eq!(err_code(&rpc(&mut s, 3, "tools/call", json!({"name": "no_such_tool"}))), -32602);
+    // WHIQ parity pass: an unknown tool is a tool result the agent sees (`not_found`), as in every
+    // craft app.
+    let r = rpc(&mut s, 3, "tools/call", json!({"name": "no_such_tool"}));
+    assert_eq!(r["result"]["structuredContent"]["error"]["code"], "not_found", "{r}");
     assert_eq!(err_code(&rpc(&mut s, 4, "tools/call", json!({"name": "set_cell", "arguments": "x"}))), -32602);
     // WHIQ: argument problems are tool results the model sees, with a code and a next step;
     // unknown arguments are warnings on a successful call.

@@ -1636,7 +1636,9 @@ dependencies = [
  "gridcraft-engine",
  "log",
  "memory-stats",
+ "quick-xml",
  "serde_json",
+ "zip",
 ]
 
 [[package]]

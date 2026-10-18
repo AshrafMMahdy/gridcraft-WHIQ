@@ -460,6 +460,7 @@ impl PassHost<'_> {
     fn compute(&mut self, k: Key) -> Value {
         // WHIQ: a safe point for cancelling a long recalculation (the runner restores the workbook).
         gridcraft_core::cancel::checkpoint();
+        gridcraft_core::progress::step_in("recalculating formulas", self.results.len() as u64, self.exprs.len() as u64);
         if let Some(v) = self.results.get(&k) {
             let v = v.clone();
             if self.iterate && self.tainted.contains(&k) {
