@@ -800,8 +800,10 @@ fn dispatch(b: &mut dyn Backend, st: &mut CallState, name: &str, a: &Args, warni
         "debug_sleep" => {
             let ms = a.get("ms").and_then(Value::as_u64).unwrap_or(1000).min(600_000);
             // Sleeps in 5 ms steps, each a safe point for `cancel` (no clock: wasm-safe).
-            for _ in 0..ms.div_ceil(5) {
+            let steps = ms.div_ceil(5);
+            for k in 0..steps {
                 gridcraft_engine::core::cancel::checkpoint();
+                gridcraft_engine::core::progress::step_in("sleeping", k, steps);
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             Ok(json!({"slept_ms": ms}))

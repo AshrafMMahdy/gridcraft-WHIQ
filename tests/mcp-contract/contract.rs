@@ -546,3 +546,19 @@ fn roundtrip_check_reports_what_a_save_would_keep() {
     let e = m.err("roundtrip_check", json!({"path": "missing.xlsx"}));
     assert_eq!(e["code"], "not_found", "{e}");
 }
+
+// Progress notifications for a call that asks for them (`_meta.progressToken`), as in every craft
+// app: the value only grows; the message names the stage.
+#[test]
+fn a_call_with_a_progress_token_gets_progress_notifications() {
+    let dir = folder("progress");
+    let mut m = start(&dir, &[]);
+    let id = m.begin("tools/call", json!({"name": "debug_sleep", "arguments": {"ms": 1500}, "_meta": {"progressToken": "tok-1"}}));
+    let r = m.wait(&id);
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let notes: Vec<&Value> = m.notifications.iter().filter(|n| n["params"]["progressToken"] == "tok-1").collect();
+    assert!(notes.len() >= 2, "{:?}", m.notifications);
+    let values: Vec<f64> = notes.iter().map(|n| n["params"]["progress"].as_f64().unwrap()).collect();
+    assert!(values.windows(2).all(|w| w[1] > w[0]), "progress only grows: {values:?}");
+    assert!(notes.last().unwrap()["params"]["message"].as_str().unwrap().contains("sleeping"), "{:?}", notes);
+}

@@ -51,6 +51,8 @@ pub struct Mcp {
     replies: mpsc::Receiver<Value>,
     pending: HashMap<String, Value>,
     next: u64,
+    /// Notifications the server sent (progress), in order.
+    pub notifications: Vec<Value>,
     pub stderr_path: PathBuf,
 }
 
@@ -83,7 +85,7 @@ impl Mcp {
             }
         });
         let stdin = child.stdin.take();
-        let mut m = Mcp { child, stdin, replies: rx, pending: HashMap::new(), next: 100, stderr_path };
+        let mut m = Mcp { child, stdin, replies: rx, pending: HashMap::new(), next: 100, stderr_path, notifications: Vec::new() };
         let init =
             m.request("initialize", json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "contract", "version": "1"}}));
         assert_eq!(init["result"]["serverInfo"]["name"], "gridcraft", "{init}");
@@ -123,6 +125,10 @@ impl Mcp {
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             let v = self.replies.recv_timeout(left).unwrap_or_else(|_| panic!("no reply to {id} within {secs} s; stderr:\n{}", self.stderr()));
+            if v.get("id").is_none() && v.get("method").is_some() {
+                self.notifications.push(v);
+                continue;
+            }
             let got = v["id"].as_str().unwrap_or("").to_string();
             if got == id {
                 return v;

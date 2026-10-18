@@ -124,6 +124,9 @@ struct Running {
     started: Instant,
     /// The JSON-RPC id of the call (`notifications/cancelled` names it).
     id: Value,
+    /// The request's `_meta.progressToken` (`notifications/progress`, as WordCraft and
+    /// DeckCraft send).
+    token: Option<Value>,
 }
 
 enum Work {
@@ -161,6 +164,8 @@ struct Shared {
     busy_replies: std::sync::atomic::AtomicU64,
     /// The backend's description (server_status).
     backend: String,
+    /// The progress last notified for the running call (job), and when.
+    note: Mutex<(u64, f64, Option<Instant>)>,
     last_activity: Mutex<Instant>,
     idle_done: AtomicBool,
     /// The worker thread (what `cancel` stops).
@@ -205,6 +210,42 @@ impl Shared {
         if let Some(content) = reply.pointer_mut("/result/content").and_then(Value::as_array_mut) {
             content.push(json!({"type": "text", "text": note}));
         }
+    }
+
+    /// A `notifications/progress` for the running call when its request carries a progress token
+    /// and there is news (a step done, or a second gone by): the value only ever grows, `total`
+    /// when the steps are counted, a message with the stage and the time (as in every craft app).
+    fn progress_notification(&self) -> Option<Value> {
+        let (job, token, tool, started) = {
+            let b = lock(&self.busy);
+            let r = b.as_ref()?;
+            (r.job, r.token.clone()?, r.tool.clone(), r.started)
+        };
+        let p = gridcraft_engine::core::progress::current().unwrap_or_default();
+        let mut note = lock(&self.note);
+        if note.0 != job {
+            *note = (job, 0.0, None);
+        }
+        let now = Instant::now();
+        let counted = p.total > 0 && (p.done as f64) > note.1;
+        let beat = note.2.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1));
+        if !counted && !beat {
+            return None;
+        }
+        let value = if counted { p.done as f64 } else { note.1 + 0.001 };
+        note.1 = value;
+        note.2 = Some(now);
+        let stage = if p.stage.is_empty() { tool } else { p.stage.clone() };
+        let secs = started.elapsed().as_secs();
+        let mut params = json!({"progressToken": token, "progress": value, "message": if p.total > 0 {
+            format!("{stage}: {} of {} ({secs} s)", p.done, p.total)
+        } else {
+            format!("{stage} ({secs} s)")
+        }});
+        if p.total > 0 {
+            params["total"] = json!(p.total);
+        }
+        Some(json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": params}))
     }
 
     fn touch(&self) {
@@ -590,7 +631,8 @@ fn find_recovered(dir: &Path) -> Vec<Value> {
             it.filter_map(|e| e.ok())
                 .filter(|e| {
                     let n = e.file_name().to_string_lossy().into_owned();
-                    n.contains(".recovered-") && !n.starts_with("OLD_") && e.path().is_file()
+                    // Not an atomic write's temporary file a crash left (`<name>.sctmp`).
+                    n.contains(".recovered-") && !n.starts_with("OLD_") && !n.ends_with(".sctmp") && e.path().is_file()
                 })
                 .map(|e| e.path().display().to_string())
                 .collect()
@@ -645,6 +687,7 @@ pub fn serve(
         calls: std::sync::atomic::AtomicU64::new(0),
         busy_replies: std::sync::atomic::AtomicU64::new(0),
         backend: describe.clone(),
+        note: Mutex::new((0, 0.0, None)),
         last_activity: Mutex::new(Instant::now()),
         idle_done: AtomicBool::new(false),
         worker: Mutex::new(None),
@@ -708,6 +751,19 @@ pub fn serve(
             loop {
                 std::thread::sleep(Duration::from_millis(200));
                 s.checkpoint_if_due();
+            }
+        });
+    }
+
+    // WHIQ parity pass: progress notifications for a call whose request asked for them.
+    {
+        let s = shared.clone();
+        let _ = std::thread::Builder::new().name("gridcraft-progress".into()).spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis(100));
+                if let Some(n) = s.progress_notification() {
+                    s.write(&n);
+                }
             }
         });
     }
@@ -899,7 +955,8 @@ fn submit(shared: &Arc<Shared>, work_tx: &mpsc::Sender<Work>, msg: Value, id: Va
             let Some(oldest) = jobs.map.iter().find(|(_, j)| j.state != JobState::Running).map(|(k, _)| *k) else { break };
             jobs.map.remove(&oldest);
         }
-        *busy = Some(Running { tool: name.to_string(), job: n, started: Instant::now(), id: id.clone() });
+        let token = msg.pointer("/params/_meta/progressToken").filter(|t| t.is_string() || t.is_number()).cloned();
+        *busy = Some(Running { tool: name.to_string(), job: n, started: Instant::now(), id: id.clone(), token });
         shared.calls.fetch_add(1, Ordering::Relaxed);
         n
     };
