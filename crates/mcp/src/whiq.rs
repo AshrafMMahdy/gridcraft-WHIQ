@@ -72,6 +72,8 @@ pub struct Eviction {
     pub reason: String,
     /// The auto-saved copy (`<name>.recovered-<stamp>.xlsx`), when there was unsaved work.
     pub recovered: Option<PathBuf>,
+    /// WHIQ: the recovered files of the other open workbooks that had unsaved work.
+    pub others: Vec<PathBuf>,
     /// The file the document came from, if any.
     pub original: Option<String>,
 }
@@ -86,9 +88,21 @@ impl Eviction {
             (None, Some(o)) => (format!("{}; it had no unsaved changes", self.reason), format!("call open_workbook with path \"{o}\" and carry on")),
             (None, None) => (format!("{}; it had no unsaved changes", self.reason), "call new_workbook or open_workbook to carry on".to_string()),
         };
+        let reason = if self.others.is_empty() {
+            reason
+        } else {
+            format!(
+                "{reason}; the other open workbooks' unsaved work is auto-saved at {}",
+                self.others.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+            )
+        };
         let mut e = ToolError::new("evicted", reason, next);
         if let Some(r) = &self.recovered {
             e = e.with("recovered_path", json!(r.display().to_string()));
+        }
+        if !self.others.is_empty() {
+            let all: Vec<String> = self.recovered.iter().chain(self.others.iter()).map(|p| p.display().to_string()).collect();
+            e = e.with("recovered_paths", json!(all));
         }
         if let Some(o) = &self.original {
             e = e.with("original_path", json!(o));

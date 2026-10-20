@@ -22,6 +22,16 @@ pub struct DocSnapshot {
     pub handle: String,
     /// WHIQ: every open document (the active one included), for server_status.
     pub open: Vec<OpenDoc>,
+    /// WHIQ: the other open documents as they stand (their own `others` empty), so auto-save
+    /// covers every workbook with unsaved work, not only the active one.
+    pub others: Vec<DocSnapshot>,
+}
+
+impl DocSnapshot {
+    /// The active document and every other open one.
+    pub fn all(&self) -> impl Iterator<Item = &DocSnapshot> {
+        std::iter::once(self).chain(self.others.iter())
+    }
 }
 
 /// WHIQ: an open document as server_status lists it.

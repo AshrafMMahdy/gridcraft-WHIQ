@@ -484,7 +484,16 @@ engine. Without the new arguments everything behaves as before.
   active one first, with sheets and cells). New tool **`close_workbook {document?, discard?}`**
   (refuses unsaved changes without `discard: true`). An unknown handle is `not_found` with
   `open_documents` and `closest`; with `--connect` (a running app) a handle is `not_available`.
-  Auto-save on eviction, signals and hang-up still covers the active workbook only.
+  **Every open workbook's unsaved work is kept**: the document snapshot published after each call
+  holds every open workbook (`DocSnapshot::others`), and eviction, SIGTERM / SIGINT / SIGHUP, the
+  client hanging up and a call that panics auto-save each dirty workbook to its own
+  `<name>.recovered-<stamp>.xlsx` (the `evicted` error and `evict` answer list them all in
+  `recovered_paths`; `recovered_path` stays the active one's). Periodic checkpoints are per
+  document too (`server_status.checkpoints.files[]` with `document` and `handle`), and a workbook
+  first seen with unsaved work (just built) is checkpointed without waiting for another edit.
+  Test: contract `every_dirty_workbook_is_recovered` (two dirty workbooks → two recovered files on
+  SIGTERM, on stdin EOF, on `evict`, and after `kill -9` from their checkpoints; a saved one is
+  not copied).
 - **`--automation-no-old-copies`** (the name WordCraft and DeckCraft take): saves and exports
   replace files in place, no `OLD_` copies (the supervisor keeps backups);
   `server_status.limits.old_copies` says which (true by default).

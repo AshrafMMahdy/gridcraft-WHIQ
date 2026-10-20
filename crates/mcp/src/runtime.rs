@@ -21,7 +21,7 @@
 //! is read freely here.
 #![allow(clippy::disallowed_methods)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -147,7 +147,6 @@ struct Checkpoint {
     edits: u64,
     /// When the unsaved changes not yet written began.
     since: Option<Instant>,
-    writes: u64,
 }
 
 struct Shared {
@@ -170,7 +169,10 @@ struct Shared {
     idle_done: AtomicBool,
     /// The worker thread (what `cancel` stops).
     worker: Mutex<Option<std::thread::ThreadId>>,
-    checkpoint: Mutex<Checkpoint>,
+    /// One checkpoint per open document (by uid): every workbook with unsaved work has its own.
+    checkpoint: Mutex<HashMap<u64, Checkpoint>>,
+    /// Checkpoint files written in all.
+    checkpoint_writes: std::sync::atomic::AtomicU64,
     config: RuntimeConfig,
     started: Instant,
 }
@@ -265,10 +267,7 @@ impl Shared {
         let stem: String = stem.chars().map(|c| if c.is_alphanumeric() || " -_.()".contains(c) { c } else { '_' }).collect();
         // The document's checkpoint file, when it has one, is brought up to date rather than
         // joined by another file.
-        let existing = {
-            let cp = lock(&self.checkpoint);
-            cp.path.clone().filter(|_| cp.uid == snap.uid)
-        };
+        let existing = lock(&self.checkpoint).get(&snap.uid).and_then(|cp| cp.path.clone());
         let path = existing.clone().unwrap_or_else(|| {
             let base = format!("{}.recovered-{}", stem.trim(), stamp());
             let mut p = dir.join(format!("{base}.xlsx"));
@@ -287,13 +286,13 @@ impl Shared {
             Ok(()) => {
                 eprintln!("gridcraft-cli: {why}: unsaved work auto-saved to {text}");
                 {
-                    let mut cp = lock(&self.checkpoint);
-                    if cp.uid == snap.uid {
-                        cp.path = Some(path.clone());
-                        cp.written = Arc::as_ptr(&snap.wb) as usize;
-                        cp.edits = 0;
-                        cp.since = None;
-                    }
+                    let mut map = lock(&self.checkpoint);
+                    let cp = map.entry(snap.uid).or_insert_with(|| Checkpoint { uid: snap.uid, ..Checkpoint::default() });
+                    cp.path = Some(path.clone());
+                    cp.written = Arc::as_ptr(&snap.wb) as usize;
+                    cp.seen = cp.written;
+                    cp.edits = 0;
+                    cp.since = None;
                 }
                 // A checkpoint is listed under server_status.checkpoints; any other auto-save is
                 // work the agent must hear about.
@@ -315,62 +314,77 @@ impl Shared {
         }
     }
 
-    /// Notes the document after a call: counts changes, forgets the checkpoint once saved.
+    /// Notes every open document after a call: counts changes, forgets a checkpoint once its
+    /// document is saved.
     fn note_call(&self, snap: Option<&DocSnapshot>) {
-        let Some(s) = snap else { return };
-        let ptr = Arc::as_ptr(&s.wb) as usize;
-        let mut cp = lock(&self.checkpoint);
-        if cp.uid != s.uid {
-            // Another document: the old checkpoint file stays (it holds that document's work).
-            *cp = Checkpoint { uid: s.uid, seen: ptr, written: ptr, ..Checkpoint::default() };
-        }
-        if ptr != cp.seen {
-            cp.seen = ptr;
-            if s.dirty {
-                cp.edits += 1;
-                cp.since.get_or_insert_with(Instant::now);
-            }
-        }
-        if !s.dirty {
-            // Saved (or untouched): the checkpoint is out of date and the file on disk is newer.
-            if let Some(p) = cp.path.take() {
-                let text = p.to_string_lossy().into_owned();
-                // Only a checkpoint nobody was told about goes; a reported recovered file stays.
-                if !lock(&self.recovered).iter().any(|r| r["path"] == text.as_str()) {
-                    let _ = std::fs::remove_file(&p);
+        let Some(snap) = snap else { return };
+        let mut map = lock(&self.checkpoint);
+        // A closed document's entry goes (its checkpoint file stays: it holds that work).
+        map.retain(|uid, _| snap.all().any(|d| d.uid == *uid));
+        for s in snap.all() {
+            let ptr = Arc::as_ptr(&s.wb) as usize;
+            // A document first seen with unsaved work (built or opened by the call) counts as one
+            // change not yet written.
+            let cp = map.entry(s.uid).or_insert_with(|| {
+                let fresh = s.dirty.then(Instant::now);
+                Checkpoint {
+                    uid: s.uid,
+                    seen: ptr,
+                    written: if fresh.is_some() { 0 } else { ptr },
+                    edits: u64::from(fresh.is_some()),
+                    since: fresh,
+                    ..Checkpoint::default()
+                }
+            });
+            if ptr != cp.seen {
+                cp.seen = ptr;
+                if s.dirty {
+                    cp.edits += 1;
+                    cp.since.get_or_insert_with(Instant::now);
                 }
             }
-            cp.edits = 0;
-            cp.since = None;
-            cp.written = ptr;
+            if !s.dirty {
+                // Saved (or untouched): the checkpoint is out of date and the file on disk is newer.
+                if let Some(p) = cp.path.take() {
+                    let text = p.to_string_lossy().into_owned();
+                    // Only a checkpoint nobody was told about goes; a reported recovered file stays.
+                    if !lock(&self.recovered).iter().any(|r| r["path"] == text.as_str()) {
+                        let _ = std::fs::remove_file(&p);
+                    }
+                }
+                cp.edits = 0;
+                cp.since = None;
+                cp.written = ptr;
+            }
         }
     }
 
-    /// Writes the checkpoint when it is due: `checkpoint_edits` changing calls, or unsaved
-    /// changes older than `checkpoint_interval`, not yet written.
+    /// Writes each document's checkpoint when it is due: `checkpoint_edits` changing calls, or
+    /// unsaved changes older than `checkpoint_interval`, not yet written.
     fn checkpoint_if_due(&self) {
         let snap = lock(&self.snapshot).clone();
-        let Some(snap) = snap.filter(|s| s.dirty) else { return };
-        let due = {
-            let cp = lock(&self.checkpoint);
-            let n = self.config.checkpoint_edits;
-            cp.uid == snap.uid
-                && Arc::as_ptr(&snap.wb) as usize != cp.written
-                && cp.edits > 0
-                && ((n > 0 && cp.edits >= n) || self.config.checkpoint_interval.is_some_and(|i| cp.since.is_some_and(|t| t.elapsed() >= i)))
-        };
-        if due && self.autosave(&snap, "checkpoint").is_some() {
-            lock(&self.checkpoint).writes += 1;
+        let Some(snap) = snap else { return };
+        for doc in snap.all().filter(|d| d.dirty) {
+            let due = {
+                let map = lock(&self.checkpoint);
+                let n = self.config.checkpoint_edits;
+                map.get(&doc.uid).is_some_and(|cp| {
+                    Arc::as_ptr(&doc.wb) as usize != cp.written
+                        && cp.edits > 0
+                        && ((n > 0 && cp.edits >= n) || self.config.checkpoint_interval.is_some_and(|i| cp.since.is_some_and(|t| t.elapsed() >= i)))
+                })
+            };
+            if due && self.autosave(doc, "checkpoint").is_some() {
+                self.checkpoint_writes.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
-    /// Auto-saves the latest snapshot when it has unsaved changes.
-    fn autosave_latest(&self, why: &str) -> Option<PathBuf> {
-        let snap = lock(&self.snapshot).clone()?;
-        if !snap.dirty {
-            return None;
-        }
-        self.autosave(&snap, why)
+    /// Auto-saves every open workbook with unsaved changes (the active one first), each to its
+    /// own recovered file. The paths written, in that order.
+    fn autosave_all(&self, why: &str) -> Vec<PathBuf> {
+        let Some(snap) = lock(&self.snapshot).clone() else { return vec![] };
+        snap.all().filter(|d| d.dirty).filter_map(|d| self.autosave(d, why)).collect()
     }
 
     fn job_summary(&self, n: u64, j: &Job) -> Value {
@@ -394,13 +408,22 @@ impl Shared {
         };
         let evicted = lock(&self.evicted).clone();
         let checkpoint = {
-            let cp = lock(&self.checkpoint);
+            let map = lock(&self.checkpoint);
+            let mut files: Vec<(u64, Value)> = map
+                .values()
+                .filter_map(|cp| {
+                    cp.path
+                        .as_ref()
+                        .map(|p| (cp.uid, json!({"path": p.display().to_string(), "document": cp.uid, "handle": crate::backend::handle_of(cp.uid)})))
+                })
+                .collect();
+            files.sort_by_key(|(uid, _)| *uid);
             json!({
                 "every_edits": self.config.checkpoint_edits,
                 "every_secs": self.config.checkpoint_interval.map(|d| d.as_secs()).unwrap_or(0),
-                "pending_edits": cp.edits,
-                "writes": cp.writes,
-                "files": cp.path.as_ref().map(|p| vec![json!({"path": p.display().to_string(), "document": cp.uid})]).unwrap_or_default(),
+                "pending_edits": map.values().map(|cp| cp.edits).sum::<u64>(),
+                "writes": self.checkpoint_writes.load(Ordering::Relaxed),
+                "files": files.into_iter().map(|(_, f)| f).collect::<Vec<_>>(),
             })
         };
         let current = busy.map(|b| {
@@ -421,7 +444,7 @@ impl Shared {
             "jobs": jobs,
             "recovered_files": lock(&self.recovered).clone(),
             "checkpoints": checkpoint,
-            "evicted": evicted.map(|e| vec![json!({"name": e.original.as_deref().and_then(|o| Path::new(o).file_stem()).map(|s| s.to_string_lossy().into_owned()), "reason": e.reason, "recovered_path": e.recovered.map(|p| p.display().to_string()), "original_path": e.original})]).unwrap_or_default(),
+            "evicted": evicted.map(|e| vec![json!({"name": e.original.as_deref().and_then(|o| Path::new(o).file_stem()).map(|s| s.to_string_lossy().into_owned()), "reason": e.reason, "recovered_path": e.recovered.as_ref().map(|p| p.display().to_string()), "recovered_paths": e.recovered.iter().chain(e.others.iter()).map(|p| p.display().to_string()).collect::<Vec<_>>(), "original_path": e.original})]).unwrap_or_default(),
             "idle_ms": idle.as_millis() as u64,
             "calls": self.calls.load(Ordering::Relaxed),
             "busy_replies": self.busy_replies.load(Ordering::Relaxed),
@@ -692,14 +715,15 @@ pub fn serve(
         last_activity: Mutex::new(Instant::now()),
         idle_done: AtomicBool::new(false),
         worker: Mutex::new(None),
-        checkpoint: Mutex::new(Checkpoint::default()),
+        checkpoint: Mutex::new(HashMap::new()),
+        checkpoint_writes: std::sync::atomic::AtomicU64::new(0),
         config: config.clone(),
         started: Instant::now(),
     });
     if config.handle_signals {
         let s = shared.clone();
         let installed = ctrlc::set_handler(move || {
-            s.autosave_latest("signal");
+            s.autosave_all("signal");
             std::process::exit(143);
         });
         if let Err(e) = installed {
@@ -877,7 +901,7 @@ pub fn serve(
     if lock(&shared.busy).is_none() {
         let _ = worker.join();
     }
-    shared.autosave_latest("disconnect");
+    shared.autosave_all("disconnect");
     Ok(())
 }
 
@@ -965,10 +989,13 @@ fn submit(shared: &Arc<Shared>, work_tx: &mpsc::Sender<Work>, msg: Value, id: Va
     let (done_tx, done_rx) = mpsc::channel::<Value>();
     if work_tx.send(Work::Call { msg, job, done: done_tx }).is_err() {
         *lock(&shared.busy) = None;
-        let saved = shared.autosave_latest("panic");
+        let saved = shared.autosave_all("panic");
         let mut e = ToolError::new(code::INTERNAL, "the document worker stopped", "restart the server and open the recovered file");
-        if let Some(p) = saved {
+        if let Some(p) = saved.first() {
             e = e.with("recovered_path", json!(p.display().to_string()));
+        }
+        if saved.len() > 1 {
+            e = e.with("recovered_paths", json!(saved.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()));
         }
         shared.write(&json!({"jsonrpc": "2.0", "id": id, "result": ToolResult::failure(&e).to_value()}));
         return;
@@ -1050,7 +1077,7 @@ fn worker_loop(server: &mut Server, shared: &Shared, rx: mpsc::Receiver<Work>) {
                     evict(server, shared, reason);
                     let ev = lock(&shared.evicted).clone().filter(|e| Some(e) != before.as_ref());
                     let list: Vec<Value> = ev
-                        .map(|e| vec![json!({"reason": e.reason, "recovered_path": e.recovered.map(|p| p.display().to_string()), "original_path": e.original})])
+                        .map(|e| vec![json!({"reason": e.reason, "recovered_path": e.recovered.as_ref().map(|p| p.display().to_string()), "recovered_paths": e.recovered.iter().chain(e.others.iter()).map(|p| p.display().to_string()).collect::<Vec<_>>(), "original_path": e.original})])
                         .unwrap_or_default();
                     Ok(Some(json!({"jsonrpc": "2.0", "id": id, "result": ToolResult::json(&json!({"evicted": list})).to_value()})))
                 } else {
@@ -1069,22 +1096,28 @@ fn worker_loop(server: &mut Server, shared: &Shared, rx: mpsc::Receiver<Work>) {
                         json!({"jsonrpc": "2.0", "id": id, "result": ToolResult::failure(&e).to_value()})
                     }
                     Err(_) => {
-                        let saved = shared.autosave_latest("panic");
-                        if let Some(p) = &saved {
-                            // The answer names the file: no separate announcement.
+                        let saved = shared.autosave_all("panic");
+                        for p in &saved {
+                            // The answer names the files: no separate announcement.
                             let text = p.display().to_string();
                             lock(&shared.unannounced).retain(|r| r["path"] != text.as_str());
                         }
                         let mut e = ToolError::new(
                             code::INTERNAL,
                             "the call failed inside GridCraft (a bug); the workbook is kept as it was before this call",
-                            match &saved {
-                                Some(p) => format!("carry on; a copy of the work is also auto-saved at {}", p.display()),
+                            match saved.first() {
+                                Some(_) => format!(
+                                    "carry on; a copy of the work is also auto-saved at {}",
+                                    saved.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+                                ),
                                 None => "carry on, or try the call another way".to_string(),
                             },
                         );
-                        if let Some(p) = &saved {
+                        if let Some(p) = saved.first() {
                             e = e.with("recovered_path", json!(p.display().to_string()));
+                        }
+                        if saved.len() > 1 {
+                            e = e.with("recovered_paths", json!(saved.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()));
                         }
                         json!({"jsonrpc": "2.0", "id": id, "result": ToolResult::failure(&e).to_value()})
                     }
@@ -1154,14 +1187,17 @@ fn evict(server: &mut Server, shared: &Shared, reason: String) {
     } else {
         "evict"
     };
+    // Every open workbook with unsaved work, each to its own recovered file.
     let recovered = snap.as_ref().filter(|s| s.dirty).and_then(|s| shared.autosave(s, kind));
-    if let Some(p) = &recovered {
-        // The `evicted` answer names it: no separate announcement.
+    let others: Vec<PathBuf> =
+        snap.as_ref().map(|s| s.others.iter().filter(|d| d.dirty).filter_map(|d| shared.autosave(d, kind)).collect()).unwrap_or_default();
+    for p in recovered.iter().chain(others.iter()) {
+        // The `evicted` answer names them: no separate announcement.
         let text = p.display().to_string();
         lock(&shared.unannounced).retain(|r| r["path"] != text.as_str());
     }
     server.backend().reset();
-    let ev = Eviction { reason, recovered, original: snap.and_then(|s| s.path) };
+    let ev = Eviction { reason, recovered, others, original: snap.and_then(|s| s.path) };
     eprintln!("gridcraft-cli: {}", ev.reason);
     server.state_mut().evicted = Some(ev.clone());
     *lock(&shared.evicted) = Some(ev);

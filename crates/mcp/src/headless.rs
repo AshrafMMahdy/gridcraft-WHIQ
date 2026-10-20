@@ -90,28 +90,21 @@ impl Backend for Headless {
 
     fn snapshot(&self) -> Option<crate::backend::DocSnapshot> {
         let d = self.session.active()?;
-        Some(crate::backend::DocSnapshot {
-            uid: d.uid,
-            wb: d.wb.clone(),
-            title: d.display_title(),
-            path: d.path.clone(),
-            dirty: d.is_dirty(),
-            cells: d.wb.sheets.iter().map(|s| s.cells.len() as u64).sum(),
-            sheets: d.wb.sheets.iter().map(|s| s.name.clone()).collect(),
-            handle: crate::backend::handle_of(d.uid),
-            open: self
-                .session
-                .documents()
-                .iter()
-                .map(|o| crate::backend::OpenDoc {
-                    handle: crate::backend::handle_of(o.uid),
-                    title: o.display_title(),
-                    path: o.path.clone(),
-                    dirty: o.is_dirty(),
-                    active: o.uid == d.uid,
-                })
-                .collect(),
-        })
+        let open = self
+            .session
+            .documents()
+            .iter()
+            .map(|o| crate::backend::OpenDoc {
+                handle: crate::backend::handle_of(o.uid),
+                title: o.display_title(),
+                path: o.path.clone(),
+                dirty: o.is_dirty(),
+                active: o.uid == d.uid,
+            })
+            .collect();
+        // WHIQ: every other open workbook too, so auto-save covers all unsaved work.
+        let others = self.session.documents().iter().filter(|o| o.uid != d.uid).map(|o| doc_snapshot(o, vec![], vec![])).collect();
+        Some(doc_snapshot(d, open, others))
     }
 
     fn has_handles(&self) -> bool {
@@ -186,5 +179,25 @@ impl Headless {
             m if gridcraft_engine::find_command(m).is_some() => self.execute(m, params),
             other => Err(format!("unknown method `{other}`")),
         }
+    }
+}
+
+/// One document's snapshot.
+fn doc_snapshot(
+    d: &gridcraft_engine::DocState,
+    open: Vec<crate::backend::OpenDoc>,
+    others: Vec<crate::backend::DocSnapshot>,
+) -> crate::backend::DocSnapshot {
+    crate::backend::DocSnapshot {
+        uid: d.uid,
+        wb: d.wb.clone(),
+        title: d.display_title(),
+        path: d.path.clone(),
+        dirty: d.is_dirty(),
+        cells: d.wb.sheets.iter().map(|s| s.cells.len() as u64).sum(),
+        sheets: d.wb.sheets.iter().map(|s| s.name.clone()).collect(),
+        handle: crate::backend::handle_of(d.uid),
+        open,
+        others,
     }
 }

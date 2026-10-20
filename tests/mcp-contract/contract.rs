@@ -289,6 +289,66 @@ fn memory_limit_evicts_with_recovery() {
 }
 
 // 3. SIGTERM: the open document is auto-saved; the next process names the file.
+/// WHIQ (owner rule: never lose user work): every open workbook with unsaved changes is
+/// auto-saved, each to its own recovered file, on SIGTERM, on hang-up and on eviction.
+#[cfg(unix)]
+#[test]
+fn every_dirty_workbook_is_recovered() {
+    let two = |m: &mut Mcp| {
+        let a = m.ok("build_workbook", json!({"sheets": [{"name": "A", "rows": [["work A"]]}]}))["document"].as_str().unwrap().to_string();
+        m.ok("build_workbook", json!({"sheets": [{"name": "B", "rows": [["work B"]]}]}));
+        m.ok("set_cell", json!({"cell": "B1", "input": "more A", "document": a}));
+    };
+    let recovered = |dir: &std::path::Path| -> Vec<Value> {
+        let mut v: Vec<Value> = files_in(dir).into_iter().filter(|f| f.contains(".recovered-")).map(|f| cells_of(&dir.join(f), "A1:B1")).collect();
+        v.sort_by_key(|x| x.to_string());
+        v
+    };
+    let both = json!([[["work A", "more A"]], [["work B", null]]]);
+    // SIGTERM: two workbooks, two recovered files.
+    let dir = folder("sigterm-two");
+    let mut m = start(&dir, &[]);
+    two(&mut m);
+    let st = m.terminate();
+    assert!(!st.success() || st.code() == Some(143), "{st:?}");
+    assert_eq!(Value::Array(recovered(&dir)), both, "{:?}", files_in(&dir));
+    // The client hangs up (stdin EOF): the same.
+    let dir = folder("hangup-two");
+    let mut m = start(&dir, &[]);
+    two(&mut m);
+    m.close();
+    assert_eq!(Value::Array(recovered(&dir)), both, "{:?}", files_in(&dir));
+    // Eviction names every file it wrote.
+    let dir = folder("evict-two");
+    let mut m = start(&dir, &[]);
+    two(&mut m);
+    let r = m.ok("evict", json!({}));
+    let paths = r["evicted"][0]["recovered_paths"].as_array().unwrap().clone();
+    assert_eq!(paths.len(), 2, "{r}");
+    assert_eq!(Value::Array(recovered(&dir)), both);
+    let e = m.err("read_range", json!({"range": "A1"}));
+    assert_eq!(e["code"], "evicted");
+    assert_eq!(e["recovered_paths"].as_array().map(Vec::len), Some(2), "{e}");
+    // A saved workbook is not auto-saved: only the dirty one is.
+    let dir = folder("hangup-one-saved");
+    let mut m = start(&dir, &[]);
+    two(&mut m);
+    m.ok("save_workbook", json!({"path": "b.xlsx"}));
+    m.close();
+    assert_eq!(Value::Array(recovered(&dir)), json!([[["work A", "more A"]]]), "{:?}", files_in(&dir));
+    // A hard kill (no handler runs): each workbook's checkpoint file holds its work.
+    let dir = folder("kill-two");
+    let mut m = start(&dir, &["--checkpoint-edits", "1"]);
+    two(&mut m);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while m.ok("server_status", json!({}))["checkpoints"]["files"].as_array().map_or(0, Vec::len) < 2 {
+        assert!(Instant::now() < deadline, "two checkpoint files");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    m.kill();
+    assert_eq!(Value::Array(recovered(&dir)), both, "{:?}", files_in(&dir));
+}
+
 #[cfg(unix)]
 #[test]
 fn sigterm_autosaves_and_the_next_start_names_it() {
