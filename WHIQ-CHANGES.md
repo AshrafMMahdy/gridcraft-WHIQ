@@ -385,6 +385,20 @@ upstream CI) or by major (upload/download-artifact); no signing; no secrets (the
 script reads: a list of `{app, tag, file, sha256}`, one per archive; the release's `engines.lock`
 is that file with the real hashes.
 
+Hardened 2026-10-20 (as the P6 clone's workflow, p6-clone de992a2):
+- **A published asset is never replaced** (the platform pins each by sha256): `--clobber` is
+  gone; a release that already has files makes the publish job fail with a clear error (publish a
+  new tag); a release made empty on the Releases page still gets its files.
+- **What is built**: a `plan` job resolves the ref. A dispatch naming a tag that already exists
+  builds that tag; a new tag builds the dispatched commit, and the release creates the tag there.
+  Every checkout uses the resolved ref; the release `--target` and `BUILD.txt` name the checked-out
+  commit (`git rev-parse HEAD`), never the dispatched branch head.
+- **Reproducible archives**: the Linux `.tar.gz` is `tar --sort=name --mtime=@<commit time>
+  --owner=0 --group=0 --numeric-owner | gzip -n`; the Windows `.zip` is written by an inline
+  Python `zipfile` script (entries sorted, every date the commit's time in UTC, fixed modes and
+  host, deflate level 9) in place of `Compress-Archive`. Checked locally: the same files packed
+  twice, with different file times in between, give byte-identical `.zip` and `.tar.gz`.
+
 
 ### Test status after the parity pass (Linux x86_64, 2026-10-18, craft-fonts 43913056, `CRAFT_FONTS_REQUIRED=1`)
 
