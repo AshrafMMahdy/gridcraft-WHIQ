@@ -352,7 +352,7 @@ fn fill_color(s: &mut Session, p: &Json) -> Result<Json> {
     apply_style(s, p, |st| st.fill = if c == Color::Auto { Fill::default() } else { Fill::solid(c) })
 }
 
-fn border_style(name: &str) -> BorderStyle {
+pub(crate) fn border_style(name: &str) -> BorderStyle {
     match name {
         "medium" => BorderStyle::Medium,
         "thick" => BorderStyle::Thick,

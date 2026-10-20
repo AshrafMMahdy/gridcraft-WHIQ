@@ -434,6 +434,7 @@ impl Shared {
                 "open_job_bytes": self.config.job_open_bytes,
                 "job_cells": self.config.job_cells,
                 "idle_evict_secs": self.config.idle_evict.map(|d| d.as_secs()),
+                "old_copies": self.config.settings.old_copies,
             },
         });
         let mut v = status_value(snap.as_ref(), (self.config.read_root.clone(), self.config.write_root.clone()), &self.config.settings, extra);

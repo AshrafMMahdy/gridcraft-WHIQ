@@ -51,6 +51,7 @@ Legend: **WC** WordCraft, **GC** GridCraft, **DC** DeckCraft. "was → now" wher
 | Bidi default | = | = | = | a paragraph or cell with no direction takes its base direction from its first strong character (Arabic: RTL, right-aligned) |
 | Fonts | `CRAFT_FONTS_DIR`, `CRAFT_FONTS_REQUIRED`; pin 8dcdacd → 43913056; `.cargo/config.toml` default added | pin abb8331 (release.yml) / 43913056 (recipe) → 43913056 | = 43913056 | craft-fonts **43913056ce82a3fdad0ef69f6b88d1dc922a8104** in every recipe and `whiq-release.yml`; `CRAFT_FONTS_DIR` (local default `../craft-fonts`), `CRAFT_FONTS_REQUIRED=1` for releases |
 | Release | upstream `release.yml` (signed, secrets) | = | = | new `.github/workflows/whiq-release.yml`: tags `whiq-v*` or dispatch; `<app>-cli` only, Linux x86_64 musl (static) and Windows x86_64 (static CRT); contract tests and smoke against the built binary; release assets `<app>-cli-<tag>-linux-x86_64.tar.gz`, `<app>-cli-<tag>-windows-x86_64.zip`, `SHA256SUMS`, `engines.lock` (format: `engines.lock.example`) |
+| `_meta["whiq/files"]` (2026-10-20) | — | — | — | tools that read a file or open the document say so for a supervisor: `{"read": [argument names], "opens": bool}` (GC: `open_workbook` `{read: ["path"], opens: true}`, `new_workbook` and `build_workbook` `{read: [], opens: true}`, `roundtrip_check` `{read: ["path"], opens: false}`); `server_status.limits.old_copies` says whether OLD_ copies are made |
 | Test binary override | `WORDCRAFT_CLI` | `GRIDCRAFT_CLI` | none → `DECKCRAFT_CLI` | `<APP>_CLI=path` runs the contract suite against another binary (the release workflow's) |
 
 ## 2. The flags of `<app>-cli mcp` (the same names in the three)
@@ -66,6 +67,7 @@ Legend: **WC** WordCraft, **GC** GridCraft, **DC** DeckCraft. "was → now" wher
 | `--max-memory-mb N` | off | = | = | = (floored at 16) |
 | `--max-result-bytes N` | WC 100000, GC/DC 262144 | = | `--max-result-kb` | = |
 | `--checkpoint-edits N` / `--checkpoint-secs N` | 20 / 60 | = | = | = 10 / 30 |
+| `--automation-no-old-copies` (2026-10-20) | off (OLD_ copies kept) | — | — | — |
 | domain | | | `--job-cells`, `--max-read-cells` | `--export-job-slides`, `--sample` |
 
 The older GC names (`--call-timeout-ms`, `--evict-idle-secs`, `--job-open-mb`, `--max-result-kb`)
@@ -77,8 +79,11 @@ are still read.
   domain job thresholds (`--job-cells`, `--export-job-slides`).
 - GC `read_range` continues with a cell address: `continue_from` is the next cell and
   `next_range` the range to ask for (a 2-D range is not a list).
-- WC and GC hold one document per process; DC can hold several (`documents` lists them, one
-  `active`). DC opens and exports on job threads, so its document tools answer `busy` (with the
+- WC holds one document per process; DC and GC can hold several (`documents` lists them, one
+  `active`). GC (2026-10-20): `open_workbook` / `new_workbook` / `build_workbook` answer with a
+  `document` handle (`"doc-7"`), every document tool takes `document` (the handle, or its number)
+  and acts on that workbook, the active one coming back after the call; `close_workbook`
+  frees one. DC's `document` is the window index. DC opens and exports on job threads, so its document tools answer `busy` (with the
   `job_id`) while a presentation is still opening.
 - `--max-result-bytes` defaults: WC 100000, GC and DC 262144 (WC's answers carry rendered
   pages separately, capped at 16 MB of PNG).

@@ -446,6 +446,64 @@ The platform's Line-of-Balance chart needs one solid production line per trade. 
   round-capped `a:ln` per series (`w="28575"` and `w="38100"`, `symbol none` on the second);
   LibreOffice 24 (PDF export) and `gridcraft-cli render` both draw the two lines.
 
+## Formatted workbooks in one call, literal text, document handles (2026-10-20)
+
+What the platform worked around (`shared/chat-engine/server/engines/officeRender.ts`:
+`postFormat`, the `'` prefix, `dateFormats`, `serial()` per chat; `scheduleWorkbook.ts`: Gantt and
+Timeline bars as codes painted by conditional formats in ink the colour of the fill), now in the
+engine. Without the new arguments everything behaves as before.
+
+- **Cell looks in `build_workbook`** (`crates/engine/src/cmd/looks.rs`, `build.rs`): per sheet
+  `styles: [{range, …look}]` (`range` a cell, a range or a comma list; whole rows / columns are
+  refused) and per cell (a cell object). Look keys, any spelling (`font_color`, `fontColor`):
+  `bold`, `italic`, `underline`, `strike`, `font`, `font_size`, `font_color`, `fill` (`"#RRGGBB"`,
+  `"none"`, `{color, pattern}`), `align` (left / center / right / justify / general / fill /
+  center_across / distributed), `v_align` (top / middle / bottom…), `wrap`, `indent`, `rotation`,
+  `number_format`, `borders` (a preset `"all"`, `"outside"`, `"bottom"`, `"thickOutside"`…, or
+  `{preset, style, color}` run as Home › Borders, or per side `{top, bottom, left, right,
+  diagonal_down, diagonal_up: "thin" | {style, color}}`). Applied in one edit per sheet (one
+  interned style per distinct look); a later look wins where they overlap, a cell's own over a
+  range's; unknown keys are an error naming the accepted ones.
+- **`row_heights`** in points (`[{row: 3 | "3:5", height: 20}]` or `{"3": 20}`, 0–409),
+  **`freeze`** (`"C2"`: rows above and columns left; or `{rows, columns}`; wins over
+  `freeze_header`); column widths were already there (`columns[].width`, `column_widths`).
+- **Cell objects** in `rows` / `header`: `{text}`, `{formula}`, `{date}` (ISO, or a serial),
+  `{number}`, `{bool}`, or `{value, type: text|number|date|formula|boolean|auto}`, each with
+  look keys beside the value or in `style`. `{"value": "", "fill": "#3B82F6"}` is a Gantt bar: a
+  real fill, no code in the cell.
+- **`literal_strings: true`** (top level for every sheet, or per sheet): a string is stored as
+  the text it is (`"2.10"`, `"1,234"`, `"=x"`, `"+5"`, `"50%"`; no apostrophe needed), except an
+  ISO date (`2026-04-03`) or date-time (`2026-04-03T08:30[:ss][.sss][Z]`), which is a date shown
+  `yyyy-mm-dd` / `yyyy-mm-dd hh:mm[:ss]` (formats given by the spec still win);
+  `iso_dates: false` keeps those as text too. Without the flag strings stay typed input.
+- **Document handles** (`crates/mcp/src/backend.rs`, `headless.rs`, `whiq.rs`):
+  `open_workbook`, `new_workbook` and `build_workbook` answer with `document: "doc-<uid>"`; every
+  document tool takes `document` (the handle or its number) and acts on that workbook, after which
+  the workbook active before comes back, so two exports in one process never touch each other's
+  document. `server_status.documents` lists every open workbook with its `document` handle (the
+  active one first, with sheets and cells). New tool **`close_workbook {document?, discard?}`**
+  (refuses unsaved changes without `discard: true`). An unknown handle is `not_found` with
+  `open_documents` and `closest`; with `--connect` (a running app) a handle is `not_available`.
+  Auto-save on eviction, signals and hang-up still covers the active workbook only.
+- **`--automation-no-old-copies`** (the name WordCraft and DeckCraft take): saves and exports
+  replace files in place, no `OLD_` copies (the supervisor keeps backups);
+  `server_status.limits.old_copies` says which (true by default).
+- **`_meta["whiq/files"]`** on the tools that read a file or open the document, as in the other
+  forks: `open_workbook` `{read: ["path"], opens: true}`, `new_workbook` / `build_workbook`
+  `{read: [], opens: true}`, `roundtrip_check` `{read: ["path"], opens: false}`.
+- Errors: already one shape everywhere (`isError` with `structuredContent.error {code, reason,
+  next_step, …}`, `retry_after_ms` on `busy` / `locked`, the same object as JSON-RPC `error.data`);
+  now asserted for a `tools/call` without a name and for unknown handles too.
+- Tests: engine `build::tests::styles_row_heights_and_freeze_in_one_call` (looks by range and
+  per cell, Gantt fills, borders by side and preset, heights in points, freeze, the saved XML and
+  read-back), `build::tests::literal_strings_and_iso_dates` (text kept, dates and date-times,
+  leap day, invalid dates stay text, `iso_dates: false`, typed input unchanged, errors naming the
+  argument); contract `authoring::build_workbook_formats_in_one_call` (one MCP call, styles.xml,
+  `ht`, pane, text and date cells, `check`), `contract::document_handles_keep_two_exports_apart`,
+  `contract::old_copies_can_be_turned_off_for_a_supervisor`, and `contract::annotations` /
+  `errors_carry_code_reason_and_next_step` extended (`_meta`, `document` on document tools,
+  protocol errors).
+
 ## Tests
 
 - `cargo test` runs everything; the WHIQ-specific suites:

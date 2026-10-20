@@ -25,12 +25,39 @@ pub struct Settings {
     pub max_read_cells: u64,
     /// `GRIDCRAFT_MCP_TEST_HOOKS=1`: the `debug_sleep` / `debug_panic` tools exist (contract tests).
     pub test_hooks: bool,
+    /// A save over an existing file keeps it as `OLD_<name>` unless the call passes `overwrite:
+    /// true`. Off (`--automation-no-old-copies`): saves replace files, a supervisor keeps backups.
+    pub old_copies: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { author: None, max_result_bytes: contract::MAX_RESULT_BYTES, max_read_cells: 10_000, test_hooks: test_hooks_from_env() }
+        Self {
+            author: None,
+            max_result_bytes: contract::MAX_RESULT_BYTES,
+            max_read_cells: 10_000,
+            test_hooks: test_hooks_from_env(),
+            old_copies: true,
+        }
     }
+}
+
+/// WHIQ: tools that open or start a document (it becomes the active one; the result names its
+/// `document` handle).
+pub(crate) const OPENS_DOCUMENT: &[&str] = &["open_workbook", "new_workbook", "build_workbook"];
+
+/// WHIQ: the files a tool reads, for a supervisor that stages them (`_meta["whiq/files"]`, the
+/// same field WordCraft and DeckCraft carry): `read` lists the arguments naming existing files
+/// the call reads; `opens` says the call opens or starts the document the server works on (the
+/// file of the first `read` argument when one is given). Tools that read no file have no entry.
+pub(crate) fn files_meta(name: &str) -> Option<Value> {
+    let (read, opens): (&[&str], bool) = match name {
+        "open_workbook" => (&["path"], true),
+        "new_workbook" | "build_workbook" => (&[], true),
+        "roundtrip_check" => (&["path"], false),
+        _ => return None,
+    };
+    Some(json!({"read": read, "opens": opens}))
 }
 
 /// `GRIDCRAFT_MCP_TEST_HOOKS=1` turns on the tools the contract tests use to provoke a slow call
@@ -293,15 +320,23 @@ fn editing_definitions() -> Vec<Value> {
              (bar, column, line, pie, doughnut, area, scatter, combo with a secondary axis; title, axis titles, series by \
              range). Scatter series are solid straight lines with markers by default (`line: false` = markers only, \
              `markers: false` = the line alone, `line_width` in points, `color`; on the chart or per series), e.g. one \
-             production line per trade. Formulas are recalculated so the file opens with correct values. Example: {\"path\": \"report.xlsx\", \
+             production line per trade. Formatting in the same call: `styles` [{range, bold, italic, font_size, font_color, \
+             fill, borders, align, v_align, wrap, number_format}] per sheet, a cell object with its own look ({\"value\": \"\", \
+             \"fill\": \"#3B82F6\"} paints a Gantt bar), `row_heights` in points, `column_widths`, `freeze` (\"C2\"). \
+             `literal_strings: true` stores every string as the text it is (\"2.10\", \"1,234\", \"=x\", \"+5\"; no leading \
+             apostrophe needed) and ISO dates (\"2026-04-03\", \"2026-04-03T08:30\") as dates shown yyyy-mm-dd; a single cell \
+             can say {\"text\": \"2.10\"}, {\"date\": \"2026-04-03\"}, {\"formula\": \"=SUM(B2:B9)\"}. The result's \
+             `document` handle names this workbook in later calls. Formulas are recalculated so the file opens with correct values. Example: {\"path\": \"report.xlsx\", \
              \"sheets\": [{\"name\": \"Sales\", \"header\": [\"Region\", \"Units\"], \"rows\": [[\"North\", 10], [\"Total\", \"=SUM(B2:B2)\"]], \
              \"columns\": [{\"width\": 20}, {\"format\": \"#,##0\"}], \"freeze_header\": true, \"table\": \"TableStyleMedium2\", \
              \"charts\": [{\"type\": \"column\", \"title\": \"Units\", \"series\": [{\"name\": \"Units\", \"values\": \"B2:B2\", \"categories\": \"A2:A2\"}]}]}]}",
             obj(
                 json!({
-                    "sheets": {"type": "array", "description": "Sheets: {name, header?, rows, start?, columns?: [{header?, width?, format?}], number_formats?, column_widths?, freeze_header?, autofilter?, table?, header_style?, merges?, rtl?, charts?, conditional_formats?, validations?}", "items": {"type": "object"}},
+                    "sheets": {"type": "array", "description": "Sheets: {name, header?, rows (cells: a value, or {text | formula | date | number | value + type?, plus look keys or style: {…}}), start?, columns?: [{header?, width?, format?}], number_formats?, column_widths?, freeze_header?, freeze?: \"C2\" | {rows, columns}, autofilter?, table?, header_style?, merges?, rtl?, charts?, conditional_formats?, validations?, styles?: [{range, bold?, italic?, underline?, font?, font_size?, font_color?, fill?, align?, v_align?, wrap?, indent?, rotation?, number_format?, borders?: \"all\" | \"outside\" | {top?, bottom?, left?, right?: \"thin\" | {style, color}}}], row_heights?: [{row, height (points)}] | {\"3\": 20}, literal_strings?, iso_dates?}", "items": {"type": "object"}},
                     "charts": {"type": "array", "description": "Charts naming their sheet: {sheet, type|kind: bar|column|col|line|pie|doughnut|area|scatter|combo, title?, x_title|xTitle?, y_title|yTitle?, series: [{name, values|valRange, categories|catRange|xRange, type?, secondary?, color?, line?, markers?, line_width?}], lineSeries? (combo lines), data?: \"A1:C9\", scatter: line? (default true: solid straight lines), markers? (default true), line_width? (points, default 2.25), color? (\"#RRGGBB\", every series), at?: \"H2\" | anchor?: {fromCol, fromRow, toCol, toRow}, legend?, hideLegend?, data_labels?, stacked?, width?, height?} (also accepted per sheet)", "items": {"type": "object"}},
                     "path": string("Save the workbook here (inside the write root); without it the workbook stays open unsaved"),
+                    "literal_strings": boolean("Every sheet: strings are stored as the text they are, never read as numbers, formulas or dates (ISO dates excepted, see iso_dates). Default false: strings are typed input, as in Excel"),
+                    "iso_dates": boolean("With literal_strings: ISO dates and date-times are dates, shown yyyy-mm-dd (default true)"),
                     "title": string("Document title"),
                     "author": string("Document author (default: the caller)"),
                     "company": string("Company"),
@@ -309,6 +344,14 @@ fn editing_definitions() -> Vec<Value> {
                 }),
                 &["sheets"],
             ),
+            crate::tools::OVERWRITE,
+        ),
+        tool(
+            "close_workbook",
+            "Close workbook",
+            "Close an open workbook (by its `document` handle, default the active one) to free its memory. A workbook with \
+             unsaved changes stays open unless `discard: true`. The other open workbooks are untouched.",
+            obj(json!({"discard": boolean("Close even with unsaved changes (they are lost). Default false")}), &[]),
             crate::tools::OVERWRITE,
         ),
         tool(
@@ -426,6 +469,15 @@ pub(crate) fn dispatch_extra(b: &mut dyn Backend, name: &str, a: &Args) -> Resul
             Ok(v)
         }
         "recalculate" => exec(b, "formulas.recalculate", json!({})),
+        "close_workbook" => {
+            let handle = b.active_document();
+            let discard = a.get("discard").and_then(Value::as_bool).unwrap_or(false);
+            let r = exec(b, "file.close", json!({"force": discard}))?;
+            if r["closed"] != true {
+                return Err("the workbook has unsaved changes: save_workbook it first, or pass discard: true to close it anyway".into());
+            }
+            Ok(json!({"closed": handle, "active_document": b.active_document()}))
+        }
         "roundtrip_check" => {
             let path = a.get("path").and_then(Value::as_str).unwrap_or("");
             gridcraft_engine::core::progress::step_in("round trip: reading", 0, 2);
@@ -611,6 +663,9 @@ pub fn all_definitions() -> Vec<Value> {
 pub fn with_globals(mut tools: Vec<Value>) -> Vec<Value> {
     for t in &mut tools {
         let name = t["name"].as_str().unwrap_or("").to_string();
+        if let Some(files) = files_meta(&name) {
+            t["_meta"] = json!({"whiq/files": files});
+        }
         let Some(props) = t["inputSchema"]["properties"].as_object_mut() else { continue };
         props.insert(
             "caller".into(),
@@ -623,6 +678,14 @@ pub fn with_globals(mut tools: Vec<Value>) -> Vec<Value> {
                 props.entry("continue_from").or_insert(int("Where to resume a trimmed result (its continue_from)"));
             }
             props.entry("max_bytes").or_insert(int("Largest result to return before trimming (default --max-result-bytes)"));
+        }
+        if !CONTROL_TOOLS.contains(&name.as_str()) && !OPENS_DOCUMENT.contains(&name.as_str()) && !NEEDS_NO_DOCUMENT.contains(&name.as_str()) {
+            props.insert(
+                "document".into(),
+                string(
+                    "The workbook to act on: the `document` handle open_workbook / new_workbook / build_workbook returned (default: the active one)",
+                ),
+            );
         }
         if WRITES_FILES.contains(&name.as_str()) {
             props.insert(
@@ -689,8 +752,39 @@ pub fn run_tool(b: &mut dyn Backend, st: &mut CallState, name: &str, args: &Valu
     {
         return ToolResult::failure(&ev.error());
     }
+    // WHIQ: `document` names the workbook a call acts on; the active one is restored after.
+    let target = a.get("document").and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(crate::backend::handle_of)));
+    let restore = match &target {
+        None => None,
+        Some(h) => {
+            let before = b.active_document();
+            match b.select_document(h) {
+                Ok(()) => before,
+                Err(_) if !b.has_handles() => {
+                    return ToolResult::failure(&ToolError::new(
+                        "not_available",
+                        "document handles exist in the headless server only",
+                        "leave out `document`: the call acts on the app's active workbook",
+                    ));
+                }
+                Err(open) => {
+                    let near = contract::closest(h, open.iter().map(String::as_str), 3);
+                    return ToolResult::failure(
+                        &ToolError::new(
+                            "not_found",
+                            format!("no open workbook has the handle `{h}` (closed, evicted or never opened)"),
+                            "use a handle from server_status `documents`, or open the file again with open_workbook",
+                        )
+                        .with("closest", json!(near))
+                        .with("open_documents", json!(open)),
+                    );
+                }
+            }
+        }
+    };
     let caller = raw.get("caller").and_then(Value::as_str).map(str::to_string).or_else(|| st.settings.author.clone());
-    let overwrite = raw.get("overwrite").is_some_and(|v| v.as_bool() == Some(true) || v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("true")));
+    let overwrite = !st.settings.old_copies
+        || raw.get("overwrite").is_some_and(|v| v.as_bool() == Some(true) || v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("true")));
     let previous_user = caller.as_deref().and_then(|c| b.set_user(c));
     // Saves carry who saved; exports and renders change nothing in the workbook.
     if let Some(c) = &caller
@@ -704,11 +798,23 @@ pub fn run_tool(b: &mut dyn Backend, st: &mut CallState, name: &str, args: &Valu
     if let Some(p) = previous_user {
         b.set_user(&p);
     }
+    // The document a call opened stays active; otherwise the one active before comes back (when
+    // it is still open), so calls without a handle keep acting where they did.
+    let handle = OPENS_DOCUMENT.contains(&name).then(|| b.active_document()).flatten();
+    if let Some(prev) = restore
+        && !OPENS_DOCUMENT.contains(&name)
+    {
+        let _ = b.select_document(&prev);
+    }
     let reports = gridcraft_engine::io::save_policy::take_reports();
     match r {
         Ok(v) => {
             if matches!(name, "open_workbook" | "new_workbook" | "build_workbook") {
                 st.evicted = None;
+            }
+            let mut v = v;
+            if let (Some(h), Some(o)) = (&handle, v.as_object_mut()) {
+                o.insert("document".into(), json!(h));
             }
             let max = raw.get("max_bytes").and_then(Value::as_u64).map_or(st.settings.max_result_bytes, |m| (m as usize).clamp(1024, 64 << 20));
             let from =
@@ -1191,17 +1297,28 @@ fn memory_source() -> &'static str {
 
 /// What server_status answers. `extra` adds the runtime's part (jobs, busy, limits).
 pub fn status_value(snap: Option<&DocSnapshot>, roots: (Option<PathBuf>, Option<PathBuf>), settings: &Settings, extra: Value) -> Value {
-    let doc = snap.map(|s| {
-        json!({
-            "name": Path::new(&s.title).file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| s.title.clone()),
-            "title": s.title,
-            "path": s.path,
-            "dirty": s.dirty,
-            "active": true,
-            "sheets": s.sheets,
-            "cells": s.cells,
-        })
-    });
+    let stem = |t: &str| Path::new(t).file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| t.to_string());
+    let doc: Vec<Value> = match snap {
+        None => vec![],
+        Some(s) => {
+            let active = json!({
+                "document": s.handle,
+                "name": stem(&s.title),
+                "title": s.title,
+                "path": s.path,
+                "dirty": s.dirty,
+                "active": true,
+                "sheets": s.sheets,
+                "cells": s.cells,
+            });
+            // WHIQ: every open workbook with its handle, the active one first.
+            std::iter::once(active)
+                .chain(s.open.iter().filter(|o| !o.active).map(
+                    |o| json!({"document": o.handle, "name": stem(&o.title), "title": o.title, "path": o.path, "dirty": o.dirty, "active": false}),
+                ))
+                .collect()
+        }
+    };
     let (read, write) = roots;
     let rss = rss_bytes();
     let mut v = json!({
@@ -1211,14 +1328,14 @@ pub fn status_value(snap: Option<&DocSnapshot>, roots: (Option<PathBuf>, Option<
         "pid": std::process::id(),
         "memory": {"rss_bytes": rss, "committed_bytes": committed_bytes(), "limit_bytes": Value::Null, "measured": rss.is_some(), "source": memory_source()},
         "fonts": fonts_value(),
-        "documents": doc.into_iter().collect::<Vec<_>>(),
+        "documents": doc,
         "roots": {"read": read.map(|p| p.display().to_string()), "write": write.map(|p| p.display().to_string())},
         "author": settings.author,
         "current_call": Value::Null,
         "jobs": [],
         "recovered_files": [],
         "evicted": [],
-        "limits": {"max_result_bytes": settings.max_result_bytes, "max_read_cells": settings.max_read_cells},
+        "limits": {"max_result_bytes": settings.max_result_bytes, "max_read_cells": settings.max_read_cells, "old_copies": settings.old_copies},
     });
     if let (Some(o), Value::Object(e)) = (v.as_object_mut(), extra) {
         for (k, x) in e {

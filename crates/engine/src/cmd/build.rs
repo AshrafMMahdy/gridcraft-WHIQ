@@ -21,7 +21,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Build Workbook",
             [],
             None,
-            "{sheets: [{name, header?: [..], rows: [[..]], start?: \"A1\", columns?: [{header?, width?, format?}], number_formats?: {\"B\": \"#,##0\", \"C2:D9\": \"0%\"}, column_widths?: {\"A\": 30} | [30, 12] | \"auto\", autofit?: bool (default true: columns without a width fit their contents), freeze_header?: bool, autofilter?: bool, table?: bool | \"TableStyleMedium2\" | {name?, style?}, header_style?: {bold?, fill?, font_color?}, merges?: [\"A1:D1\"], rtl?: bool, charts?: [{type: bar|column|line|pie|doughnut|area|scatter|combo, title?, data?: \"A1:C9\", series?: [{name?, values, categories?, type?, secondary?, color?}], x_title?, y_title?, legend?, data_labels?, stacked?, at?, width?, height?}], conditional_formats?: [{range, rule}], validations?: [{range, type, …}]}], title?, author?, company?, path?} → {sheets, charts, path?}",
+            "{sheets: [{name, header?: [..], rows: [[..]], start?: \"A1\", columns?: [{header?, width?, format?}], number_formats?: {\"B\": \"#,##0\", \"C2:D9\": \"0%\"}, column_widths?: {\"A\": 30} | [30, 12] | \"auto\", autofit?: bool (default true: columns without a width fit their contents), freeze_header?: bool, autofilter?: bool, table?: bool | \"TableStyleMedium2\" | {name?, style?}, header_style?: {bold?, fill?, font_color?}, merges?: [\"A1:D1\"], rtl?: bool, charts?: [{type: bar|column|line|pie|doughnut|area|scatter|combo, title?, data?: \"A1:C9\", series?: [{name?, values, categories?, type?, secondary?, color?}], x_title?, y_title?, legend?, data_labels?, stacked?, at?, width?, height?}], conditional_formats?: [{range, rule}], validations?: [{range, type, …}], styles?: [{range: \"A1:D1\" | \"A1:D1,F3\", bold?, italic?, underline?, strike?, font?, font_size?, font_color?, fill?: \"#RRGGBB\" | \"none\" | {color, pattern?}, align?: left|center|right|justify, v_align?: top|middle|bottom, wrap?, indent?, rotation?, number_format?, borders?: preset | {preset, style?, color?} | {top?, bottom?, left?, right?: \"thin\" | {style, color}}}], row_heights?: [{row: 3 | \"3:5\", height: 20 (points)}] | {\"3\": 20}, freeze?: \"C2\" | {rows, columns}, literal_strings?: bool (strings stay text; ISO dates become dates), iso_dates?: bool (default true)}], literal_strings?, iso_dates? (defaults for every sheet), title?, author?, company?, path?} — a cell is a value or an object {text | formula | date | number | bool | value (+ type: text|number|date|formula|boolean|auto), style?: {…look}, or the look keys beside the value} → {sheets, charts, path?}",
             always,
             build
         ),
@@ -119,7 +119,7 @@ fn fill(s: &mut Session, p: &Json, sheets: &[Json], names: &[String]) -> Result<
             run(s, &format!("sheet {name}"), "home.insertSheet", json!({"name": name, "before": i}))?;
         }
         run(s, &format!("sheet {name}"), "sheet.activate", json!({"sheet": name}))?;
-        out_sheets.push(fill_sheet(s, spec, name, &mut charts)?);
+        out_sheets.push(fill_sheet(s, spec, p, name, &mut charts)?);
     }
     // Charts listed at the top level name their sheet (the platform's chart specs).
     for (k, c) in p.get("charts").and_then(Json::as_array).into_iter().flatten().enumerate() {
@@ -158,8 +158,12 @@ fn fill(s: &mut Session, p: &Json, sheets: &[Json], names: &[String]) -> Result<
     Ok(out)
 }
 
-fn fill_sheet(s: &mut Session, spec: &Json, name: &str, charts: &mut usize) -> Result<Json> {
+fn fill_sheet(s: &mut Session, spec: &Json, top: &Json, name: &str, charts: &mut usize) -> Result<Json> {
     let step = |what: &str| format!("sheet {name}, {what}");
+    // WHIQ: how string cells are read (typed input, or literal text with ISO dates as dates).
+    let flag = |k: &str| spec.get(k).or_else(|| top.get(k)).and_then(Json::as_bool);
+    let mode = CellMode { literal: flag("literal_strings").unwrap_or(false), iso_dates: flag("iso_dates").unwrap_or(true) };
+    let sys = s.doc()?.wb.date_system;
     let start = match str_param(spec, "start") {
         Some(a) => CellRef::parse(a.trim()).ok_or_else(|| bad(CMD, step(&format!("`start` is not a cell: `{a}`"))))?,
         None => CellRef::new(0, 0),
@@ -181,6 +185,27 @@ fn fill_sheet(s: &mut Session, spec: &Json, name: &str, charts: &mut usize) -> R
         values.push(Json::Array(h.clone()));
     }
     values.extend(rows.iter().cloned());
+    // WHIQ: cell objects ({text}, {formula}, {date}, {value, type}, with a look of their own) and
+    // literal strings become the input setValues takes; their looks are applied after.
+    let mut date_looks: Vec<(Vec<RangeRef>, looks::Look)> = Vec::new();
+    let mut cell_looks: Vec<(Vec<RangeRef>, looks::Look)> = Vec::new();
+    for (ri, row) in values.iter_mut().enumerate() {
+        let Some(cells) = row.as_array_mut() else { continue };
+        for (ci, v) in cells.iter_mut().enumerate() {
+            if !matches!(v, Json::String(_) | Json::Object(_)) {
+                continue;
+            }
+            let at = CellRef::new(start.row + ri as u32, start.col + ci as u32);
+            let (input, date_fmt, look) = cell_input(v, &mode, sys).map_err(|e| bad(CMD, step(&format!("cell {}: {e}", at.a1()))))?;
+            *v = input;
+            if let Some(f) = date_fmt {
+                date_looks.push((vec![RangeRef::new(at, at)], looks::Look::number_format(f)));
+            }
+            if let Some(l) = look {
+                cell_looks.push((vec![RangeRef::new(at, at)], l));
+            }
+        }
+    }
     let q = q(name);
     let first_data = start.row + u32::from(header.is_some());
     let last_row = start.row + (values.len() as u32).saturating_sub(1);
@@ -188,6 +213,8 @@ fn fill_sheet(s: &mut Session, spec: &Json, name: &str, charts: &mut usize) -> R
     if !values.is_empty() {
         run(s, &step("values"), "range.setValues", json!({"range": format!("{q}{}", start.a1()), "values": values}))?;
     }
+    // Dates written as dates show as dates (before the column formats, which win).
+    looks::apply(s, &date_looks, MAX_CELLS, &step)?;
     let header_range = header.as_ref().and(block).map(|b| RangeRef::new(b.start, CellRef::new(b.start.row, b.end.col)));
     // Header look (bold by default).
     if let Some(h) = header_range {
@@ -290,6 +317,21 @@ fn fill_sheet(s: &mut Session, spec: &Json, name: &str, charts: &mut usize) -> R
     for m in spec.get("merges").and_then(Json::as_array).into_iter().flatten().filter_map(Json::as_str) {
         run(s, &step(&format!("merge {m}")), "home.mergeCells", json!({"range": format!("{q}{m}")}))?;
     }
+    // WHIQ: cell looks by range (`styles`), then each cell object's own (a cell's wins).
+    let mut range_looks: Vec<(Vec<RangeRef>, looks::Look)> = Vec::new();
+    for (k, st) in spec.get("styles").and_then(Json::as_array).into_iter().flatten().enumerate() {
+        let o = st
+            .as_object()
+            .ok_or_else(|| bad(CMD, step(&format!("style {} is not an object like {{\"range\": \"A1:D1\", \"bold\": true}}", k + 1))))?;
+        let range = o.get("range").or(o.get("ranges")).and_then(Json::as_str).unwrap_or("");
+        let rs = looks::ranges(range).map_err(|e| bad(CMD, step(&format!("style {}: {e}", k + 1))))?;
+        if let Some(l) = looks::Look::parse(o, &["range", "ranges"]).map_err(|e| bad(CMD, step(&format!("style {}: {e}", k + 1))))? {
+            range_looks.push((rs, l));
+        }
+    }
+    range_looks.append(&mut cell_looks);
+    looks::apply(s, &range_looks, MAX_CELLS, &step)?;
+    row_heights(s, spec, &step)?;
     // Table, or a plain AutoFilter.
     let table = spec.get("table").filter(|t| !matches!(t, Json::Bool(false) | Json::Null));
     if let (Some(t), Some(b)) = (table, block) {
@@ -313,7 +355,18 @@ fn fill_sheet(s: &mut Session, spec: &Json, name: &str, charts: &mut usize) -> R
         run(s, &step("autofilter"), "selection.set", json!({"range": format!("{q}{}", b.a1())}))?;
         run(s, &step("autofilter"), "data.filter", json!({"range": format!("{q}{}", b.a1())}))?;
     }
-    if spec.get("freeze_header").and_then(Json::as_bool) == Some(true) {
+    if let Some(f) = spec.get("freeze").filter(|f| !f.is_null()) {
+        // WHIQ: freeze the rows above and the columns left of a cell ("C2"), or {rows, columns}.
+        let at = match f {
+            Json::String(c) => CellRef::parse(c.trim()).ok_or_else(|| bad(CMD, step(&format!("`freeze` is a cell like \"C2\" (got `{c}`)"))))?,
+            Json::Object(o) => {
+                let n = |k: &str| o.get(k).and_then(Json::as_u64).unwrap_or(0).min(u64::from(gridcraft_core::MAX_ROWS - 1)) as u32;
+                CellRef::new(n("rows"), n("columns").max(n("cols")).min(gridcraft_core::MAX_COLS - 1))
+            }
+            _ => return Err(bad(CMD, step("`freeze` is a cell like \"C2\" or {rows, columns}"))),
+        };
+        run(s, &step("freeze panes"), "view.freezePanes", json!({"cell": at.a1()}))?;
+    } else if spec.get("freeze_header").and_then(Json::as_bool) == Some(true) {
         let at = CellRef::new(first_data.max(start.row + 1), 0);
         run(s, &step("freeze header"), "view.freezePanes", json!({"cell": at.a1()}))?;
     }
@@ -340,6 +393,239 @@ fn fill_sheet(s: &mut Session, spec: &Json, name: &str, charts: &mut usize) -> R
     }
     run(s, &step("selection"), "selection.set", json!({"range": format!("{q}{}", start.a1())}))?;
     Ok(json!({"name": name, "range": block.map(|b| b.a1()), "rows": rows.len(), "columns": width}))
+}
+
+/// WHIQ: how a sheet's string cells are read.
+struct CellMode {
+    /// `literal_strings: true`: a string is stored as the text it is ("2.10", "1,234", "=x", "+5"),
+    /// never parsed as a number, formula or date…
+    literal: bool,
+    /// … except an ISO date or date-time, which is a date unless `iso_dates: false`.
+    iso_dates: bool,
+}
+
+/// The keys a cell object holds for its value (the others are its look).
+const VALUE_KEYS: &[&str] = &["text", "formula", "date", "number", "value", "type", "bool", "boolean", "style"];
+
+/// An ISO date (`2026-04-03`) or date-time (`2026-04-03T08:30`, `…T08:30:15`, a space for the
+/// `T`, an optional `.sss` / `Z`) as a serial number and the format it shows with.
+fn iso_date(t: &str, sys: gridcraft_core::DateSystem) -> Option<(f64, &'static str)> {
+    let t = t.trim();
+    let b = t.as_bytes();
+    let digits = |r: std::ops::Range<usize>| -> Option<i64> {
+        let part = t.get(r)?;
+        (!part.is_empty() && part.bytes().all(|c| c.is_ascii_digit())).then(|| part.parse().ok()).flatten()
+    };
+    if b.len() < 10 || b.get(4) != Some(&b'-') || b.get(7) != Some(&b'-') {
+        return None;
+    }
+    let (y, m, d) = (digits(0..4)?, digits(5..7)?, digits(8..10)?);
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let days = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if !(1..=days).contains(&d) {
+        return None;
+    }
+    let day = gridcraft_core::date::serial_from_ymd(sys, y, m, d)?;
+    if b.len() == 10 {
+        return Some((day, "yyyy-mm-dd"));
+    }
+    if !matches!(b.get(10), Some(b'T' | b't' | b' ')) || b.len() < 16 || b.get(13) != Some(&b':') {
+        return None;
+    }
+    let (h, mi) = (digits(11..13)?, digits(14..16)?);
+    let mut rest = t.get(16..)?;
+    let mut sec = 0.0;
+    let mut with_secs = false;
+    if let Some(r) = rest.strip_prefix(':') {
+        let end = r.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(r.len());
+        sec = r.get(..end)?.parse::<f64>().ok().filter(|s| (0.0..60.0).contains(s))?;
+        with_secs = true;
+        rest = r.get(end..)?;
+    }
+    if !(rest.is_empty() || rest.eq_ignore_ascii_case("z")) || h > 23 || mi > 59 {
+        return None;
+    }
+    let f = gridcraft_core::date::time_fraction(h as f64, mi as f64, sec);
+    Some((day + f, if with_secs { "yyyy-mm-dd hh:mm:ss" } else { "yyyy-mm-dd hh:mm" }))
+}
+
+/// A literal text cell as typed input: the leading apostrophe keeps it text (it is not stored).
+fn text_input(t: &str) -> Json {
+    if t.is_empty() { Json::Null } else { json!(format!("'{t}")) }
+}
+
+/// One spec cell as setValues input, the date format it needs and its own look.
+fn cell_input(
+    v: &Json,
+    mode: &CellMode,
+    sys: gridcraft_core::DateSystem,
+) -> std::result::Result<(Json, Option<&'static str>, Option<looks::Look>), String> {
+    let date = |t: &str| -> Option<(Json, Option<&'static str>, Option<looks::Look>)> { iso_date(t, sys).map(|(n, f)| (json!(n), Some(f), None)) };
+    match v {
+        Json::String(t) if mode.literal => Ok(match date(t).filter(|_| mode.iso_dates) {
+            Some(d) => d,
+            None => (text_input(t), None, None),
+        }),
+        Json::Object(o) => {
+            let scalar = |x: &Json| match x {
+                Json::String(t) => t.clone(),
+                Json::Null => String::new(),
+                other => other.to_string(),
+            };
+            let kind = o.get("type").and_then(Json::as_str).map(str::to_ascii_lowercase);
+            let (input, fmt) = if let Some(t) = o.get("text") {
+                (text_input(&scalar(t)), None)
+            } else if let Some(f) = o.get("formula") {
+                let f = scalar(f);
+                let f = f.trim();
+                (
+                    if f.is_empty() {
+                        Json::Null
+                    } else if f.starts_with('=') {
+                        json!(f)
+                    } else {
+                        json!(format!("={f}"))
+                    },
+                    None,
+                )
+            } else if let Some(d) = o.get("date") {
+                match d {
+                    Json::Number(_) => (d.clone(), Some("yyyy-mm-dd")),
+                    _ => {
+                        let t = scalar(d);
+                        let (n, f) = iso_date(&t, sys)
+                            .ok_or_else(|| format!("`date` is an ISO date like \"2026-04-03\" or \"2026-04-03T08:30\" (got `{t}`)"))?;
+                        (json!(n), Some(f))
+                    }
+                }
+            } else if let Some(n) = o.get("number") {
+                let x = n.as_f64().or_else(|| n.as_str().and_then(|t| t.trim().parse().ok())).filter(|x: &f64| x.is_finite());
+                (json!(x.ok_or_else(|| format!("`number` is a number (got {n})"))?), None)
+            } else if let Some(b) = o.get("bool").or(o.get("boolean")) {
+                (json!(b.as_bool().ok_or_else(|| format!("`bool` is true or false (got {b})"))?), None)
+            } else {
+                let value = o.get("value").cloned().unwrap_or(Json::Null);
+                match kind.as_deref() {
+                    None | Some("auto") => match &value {
+                        Json::String(_) | Json::Object(_) => {
+                            let (i, f, _) = cell_input(&value, mode, sys)?;
+                            (i, f)
+                        }
+                        other => (other.clone(), None),
+                    },
+                    Some("text" | "string") => (text_input(&scalar(&value)), None),
+                    Some("formula") => {
+                        let f = scalar(&value);
+                        (if f.starts_with('=') { json!(f) } else { json!(format!("={f}")) }, None)
+                    }
+                    Some("number") => {
+                        let x = value.as_f64().or_else(|| value.as_str().and_then(|t| t.trim().parse().ok())).filter(|x: &f64| x.is_finite());
+                        (json!(x.ok_or_else(|| format!("a number cell needs a number (got {value})"))?), None)
+                    }
+                    Some("date") => {
+                        let t = scalar(&value);
+                        match value.as_f64() {
+                            Some(n) => (json!(n), Some("yyyy-mm-dd")),
+                            None => {
+                                let (n, f) =
+                                    iso_date(&t, sys).ok_or_else(|| format!("a date cell needs an ISO date like \"2026-04-03\" (got `{t}`)"))?;
+                                (json!(n), Some(f))
+                            }
+                        }
+                    }
+                    Some("bool" | "boolean") => (json!(as_bool_cell(&value)?), None),
+                    Some(other) => return Err(format!("cell `type` `{other}` is text, number, date, formula, boolean or auto")),
+                }
+            };
+            // The look: the keys beside the value, and those of `style`.
+            let mut keys: Map<String, Json> =
+                o.iter().filter(|(k, _)| !VALUE_KEYS.iter().any(|v| v.eq_ignore_ascii_case(k))).map(|(k, v)| (k.clone(), v.clone())).collect();
+            match o.get("style") {
+                Some(Json::Object(st)) => keys.extend(st.iter().map(|(k, v)| (k.clone(), v.clone()))),
+                None | Some(Json::Null) => {}
+                Some(other) => return Err(format!("a cell's `style` is an object like {{\"bold\": true, \"fill\": \"#3B82F6\"}} (got {other})")),
+            }
+            let look = looks::Look::parse(&keys, &[])?;
+            Ok((input, fmt, look))
+        }
+        other => Ok((other.clone(), None, None)),
+    }
+}
+
+fn as_bool_cell(v: &Json) -> std::result::Result<bool, String> {
+    match v {
+        Json::Bool(b) => Ok(*b),
+        Json::String(t) if t.eq_ignore_ascii_case("true") => Ok(true),
+        Json::String(t) if t.eq_ignore_ascii_case("false") => Ok(false),
+        _ => Err(format!("a boolean cell needs true or false (got {v})")),
+    }
+}
+
+/// WHIQ: `row_heights` in points: `[{row: 3, height: 20}]` (`row` may be "3:5"), or
+/// `{"3": 20, "5:7": 14}`.
+fn row_heights(s: &mut Session, spec: &Json, step: &dyn Fn(&str) -> String) -> Result<()> {
+    let mut items: Vec<(String, f64)> = Vec::new();
+    let as_rows = |r: &Json| -> Option<String> {
+        match r {
+            Json::Number(n) => n.as_u64().filter(|n| (1..=u64::from(gridcraft_core::MAX_ROWS)).contains(n)).map(|n| format!("{n}:{n}")),
+            Json::String(t) => {
+                let t = t.trim();
+                let (a, b) = t.split_once(':').unwrap_or((t, t));
+                let (a, b): (u32, u32) = (a.trim().parse().ok()?, b.trim().parse().ok()?);
+                (a >= 1 && b >= a && b <= gridcraft_core::MAX_ROWS).then(|| format!("{a}:{b}"))
+            }
+            _ => None,
+        }
+    };
+    match spec.get("row_heights") {
+        None | Some(Json::Null) => return Ok(()),
+        Some(Json::Array(list)) => {
+            for (k, it) in list.iter().enumerate() {
+                let r = it.get("row").or(it.get("rows")).and_then(as_rows);
+                let h = it.get("height").and_then(Json::as_f64);
+                match (r, h) {
+                    (Some(r), Some(h)) => items.push((r, h)),
+                    _ => {
+                        return Err(bad(
+                            CMD,
+                            step(&format!("row height {}: give {{\"row\": 3, \"height\": 20}} (points; `row` a number or \"3:5\")", k + 1)),
+                        ));
+                    }
+                }
+            }
+        }
+        Some(Json::Object(m)) => {
+            for (k, h) in m {
+                let r = as_rows(&json!(k)).ok_or_else(|| bad(CMD, step(&format!("row heights: `{k}` is not a row number or \"3:5\""))))?;
+                let h = h.as_f64().ok_or_else(|| bad(CMD, step(&format!("row heights: the height of `{k}` is a number of points"))))?;
+                items.push((r, h));
+            }
+        }
+        Some(_) => return Err(bad(CMD, step("`row_heights` is [{row, height}] or {\"3\": 20} (points)"))),
+    }
+    // One Row Height per distinct height (the command takes pixels on screen: points ÷ 0.75).
+    let mut by: Vec<(f64, Vec<String>)> = Vec::new();
+    for (r, h) in items {
+        if !(0.0..=409.0).contains(&h) || !h.is_finite() {
+            return Err(bad(CMD, step(&format!("row height {h} for rows {r}: heights are 0 to 409 points"))));
+        }
+        match by.iter_mut().find(|(x, _)| *x == h) {
+            Some((_, rows)) => rows.push(r),
+            None => by.push((h, vec![r])),
+        }
+    }
+    for (h, rows) in by {
+        for chunk in rows.chunks(500) {
+            run(s, &step("row heights"), "home.rowHeight", json!({"rows": chunk.join(","), "height": h / 0.75}))?;
+        }
+    }
+    Ok(())
 }
 
 fn chart_type(t: &str, stacked: bool) -> Option<ChartKind> {
@@ -825,5 +1111,149 @@ mod tests {
             .execute("file.build", json!({"sheets": [{"name": "A", "rows": [[1, 2]], "charts": [{"type": "scatter", "line_width": -1, "series": [{"values": "B1:B1", "categories": "A1:A1"}]}]}]}))
             .unwrap_err();
         assert!(e.to_string().contains("line_width"), "{e}");
+    }
+
+    fn style_at(s: &Session, sheet: usize, a1: &str) -> gridcraft_model::Style {
+        let d = s.doc().unwrap();
+        let sh = d.wb.sheet(sheet).unwrap();
+        d.wb.styles.get(sh.style_id(CellRef::parse(a1).unwrap())).clone()
+    }
+
+    /// WHIQ: one call builds a formatted workbook — cell looks by range and per cell (a cell's
+    /// own fill paints a Gantt bar), borders, row heights in points, frozen columns — and the
+    /// saved file carries them.
+    #[test]
+    fn styles_row_heights_and_freeze_in_one_call() {
+        use gridcraft_model::{BorderStyle, Color, HAlign, PatternType, VAlign};
+        let mut s = s();
+        s.execute(
+            "file.build",
+            json!({"sheets": [{
+                "name": "Gantt",
+                "rows": [
+                    ["High-Level Timeline"],
+                    ["ID", "Activity", "W1", "W2", "W3"],
+                    [1, "Excavation", {"value": null, "fill": "#3B82F6"}, {"value": "", "style": {"fill": "#3B82F6"}}, null],
+                    [2, "Concrete", null, {"value": null, "fill": "#E11D48", "borders": {"left": "thin", "right": {"style": "medium", "color": "#111827"}}}, null],
+                    ["Notes", "A long paragraph that wraps", null, null, null]
+                ],
+                "merges": ["A1:E1"],
+                "styles": [
+                    {"range": "A1:E1", "bold": true, "font_size": 12, "fill": "#EAF1FB", "font_color": "#1D4ED8"},
+                    {"range": "A2:E2", "bold": true, "fill": "#1D4ED8", "fontColor": "#FFFFFF", "wrap": true, "align": "center", "v_align": "middle", "borders": "all"},
+                    {"range": "B5", "italic": true, "wrap": true, "number_format": "@"},
+                    {"range": "A3:A4,A5", "align": "right"}
+                ],
+                "row_heights": [{"row": 1, "height": 20}, {"row": 2, "height": 22}, {"row": "5:5", "height": 60}],
+                "column_widths": [6, 38, 3.2, 3.2, 3.2],
+                "freeze": "C3"
+            }]}),
+        )
+        .unwrap();
+        let title = style_at(&s, 0, "A1");
+        assert!(title.font.bold && title.font.size == 12.0 && title.font.color == Color::Rgb(0x1D4ED8));
+        assert_eq!(title.fill.fg, Color::Rgb(0xEAF1FB));
+        let head = style_at(&s, 0, "C2");
+        assert!(head.font.bold && head.align.wrap && head.align.h == HAlign::Center && head.align.v == VAlign::Center);
+        assert_eq!((head.fill.pattern, head.fill.fg, head.font.color), (PatternType::Solid, Color::Rgb(0x1D4ED8), Color::Rgb(0xFFFFFF)));
+        assert_eq!(head.borders.top.style, BorderStyle::Thin, "the `all` preset");
+        for bar in ["C3", "D3"] {
+            assert_eq!(style_at(&s, 0, bar).fill.fg, Color::Rgb(0x3B82F6), "{bar}: a real fill, no code to paint");
+        }
+        let red = style_at(&s, 0, "D4");
+        assert_eq!(red.fill.fg, Color::Rgb(0xE11D48));
+        assert_eq!(
+            (red.borders.left.style, red.borders.right.style, red.borders.right.color),
+            (BorderStyle::Thin, BorderStyle::Medium, Color::Rgb(0x111827))
+        );
+        assert_eq!(style_at(&s, 0, "E3").fill.pattern, PatternType::None, "only the bar cells");
+        let note = style_at(&s, 0, "B5");
+        assert!(note.font.italic && note.align.wrap && note.num_fmt.as_str() == "@");
+        assert_eq!(style_at(&s, 0, "A5").align.h, HAlign::Right);
+        let d = s.doc().unwrap();
+        let sh = d.wb.sheet(0).unwrap();
+        assert_eq!(sh.freeze, Some((2, 2)), "rows above and columns left of C3");
+        assert!(sh.value(CellRef::parse("C3").unwrap()).is_empty(), "a bar cell holds no code");
+        // The file: fills, fonts, borders, heights in points, the frozen pane.
+        let bytes = crate::io::save_bytes(&d.wb, "g.xlsx").unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.clone())).unwrap();
+        let read = |zip: &mut zip::ZipArchive<std::io::Cursor<Vec<u8>>>, n: &str| {
+            let mut x = String::new();
+            std::io::Read::read_to_string(&mut zip.by_name(n).unwrap(), &mut x).unwrap();
+            x
+        };
+        let sheet = read(&mut zip, "xl/worksheets/sheet1.xml");
+        assert!(sheet.contains("ht=\"20\"") && sheet.contains("ht=\"22\"") && sheet.contains("ht=\"60\""), "{sheet}");
+        assert!(sheet.contains("xSplit=\"2\"") && sheet.contains("ySplit=\"2\""), "{sheet}");
+        let styles = read(&mut zip, "xl/styles.xml");
+        for rgb in ["3B82F6", "E11D48", "1D4ED8", "EAF1FB"] {
+            assert!(styles.contains(rgb), "{rgb}: {styles}");
+        }
+        let (back, _) = gridcraft_xlsx::read_xlsx(&bytes).unwrap();
+        let b = back.sheet(0).unwrap();
+        assert_eq!(back.styles.get(b.style_id(CellRef::parse("C3").unwrap())).fill.fg, Color::Rgb(0x3B82F6));
+        assert_eq!(b.freeze, Some((2, 2)));
+    }
+
+    /// WHIQ: `literal_strings` keeps the platform's text as text (no leading apostrophe), ISO
+    /// dates become dates the engine formats itself; cell objects say a cell's type; without the
+    /// flag strings are typed input as before.
+    #[test]
+    fn literal_strings_and_iso_dates() {
+        let mut s = s();
+        s.execute(
+            "file.build",
+            json!({"literal_strings": true, "sheets": [
+                {"name": "Lit", "header": ["WBS", "Qty", "Note", "Sign", "Start", "At", "Pct"],
+                 "rows": [
+                    ["2.10", "1,234", "=x", "+5", "2026-04-03", "2026-04-03T08:30", "50%"],
+                    [{"formula": "=1+1"}, {"number": "7"}, {"text": 12}, {"value": "2026-02-30", "type": "text"}, {"date": "2024-02-29"}, {"value": "3", "type": "number"}, "2026-13-01"]
+                 ]},
+                {"name": "NoDates", "literal_strings": true, "iso_dates": false, "rows": [["2026-04-03"]]},
+                {"name": "Typed", "literal_strings": false, "rows": [["2.10", "1,234", "2026-04-03"]]}
+            ]}),
+        )
+        .unwrap();
+        let d = s.doc().unwrap();
+        let v = |si: usize, a1: &str| d.wb.sheet(si).unwrap().value(CellRef::parse(a1).unwrap());
+        let fmt = |si: usize, a1: &str| d.wb.styles.get(d.wb.sheet(si).unwrap().style_id(CellRef::parse(a1).unwrap())).num_fmt.as_str().to_string();
+        for (a1, t) in
+            [("A2", "2.10"), ("B2", "1,234"), ("C2", "=x"), ("D2", "+5"), ("G2", "50%"), ("C3", "12"), ("D3", "2026-02-30"), ("G3", "2026-13-01")]
+        {
+            assert_eq!(v(0, a1), gridcraft_core::Value::text(t), "{a1} stays the text it was");
+        }
+        assert_eq!(v(0, "A1"), gridcraft_core::Value::text("WBS"));
+        assert_eq!(v(0, "E2").as_f64(), Some(46115.0), "2026-04-03 is a date");
+        assert_eq!(fmt(0, "E2"), "yyyy-mm-dd");
+        assert!((v(0, "F2").as_f64().unwrap() - (46115.0 + 8.5 / 24.0)).abs() < 1e-9, "a date-time");
+        assert_eq!(fmt(0, "F2"), "yyyy-mm-dd hh:mm");
+        assert_eq!(v(0, "A3").as_f64(), Some(2.0), "a formula cell");
+        assert_eq!(v(0, "B3").as_f64(), Some(7.0));
+        assert_eq!(v(0, "E3").as_f64(), Some(45351.0), "a leap day");
+        assert_eq!(v(0, "F3").as_f64(), Some(3.0));
+        assert_eq!(v(1, "A1"), gridcraft_core::Value::text("2026-04-03"), "iso_dates: false keeps the text");
+        assert_eq!(v(2, "A1").as_f64(), Some(2.1), "typed input as before");
+        assert_eq!(v(2, "B1").as_f64(), Some(1234.0));
+        assert_eq!(v(2, "C1").as_f64(), Some(46115.0));
+        // A bad cell or style says what to give.
+        let e = s.execute("file.build", json!({"sheets": [{"name": "A", "rows": [[{"date": "next week"}]]}]})).unwrap_err().to_string();
+        assert!(e.contains("cell A1") && e.contains("ISO date"), "{e}");
+        let e = s
+            .execute("file.build", json!({"sheets": [{"name": "A", "rows": [[1]], "styles": [{"range": "A1", "boldness": true}]}]}))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("boldness") && e.contains("font_color"), "{e}");
+        let e = s
+            .execute("file.build", json!({"sheets": [{"name": "A", "rows": [[1]], "styles": [{"range": "A:A", "bold": true}]}]}))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("whole row or column"), "{e}");
+        let e = s
+            .execute("file.build", json!({"sheets": [{"name": "A", "rows": [[1]], "row_heights": [{"row": 1, "height": 500}]}]}))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("0 to 409 points"), "{e}");
+        let e = s.execute("file.build", json!({"sheets": [{"name": "A", "rows": [[1]], "freeze": "nope"}]})).unwrap_err().to_string();
+        assert!(e.contains("`freeze`"), "{e}");
     }
 }

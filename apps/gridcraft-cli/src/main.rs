@@ -59,10 +59,13 @@ const USAGE: &str = "usage:
                     [--job-after-ms N (15000)] [--busy-after-ms N (300)] [--max-memory-mb N]
                     [--idle-evict-secs N] [--open-job-mb N (20)] [--job-cells N] [--max-result-bytes N]
                     [--max-read-cells N] [--checkpoint-edits N (20)] [--checkpoint-secs N (60)]
+                    [--automation-no-old-copies]
                      (the flag names WordCraft and DeckCraft take; the older --call-timeout-ms,
                      --evict-idle-secs, --job-open-mb and --max-result-kb are still read)
                      --automation-*-root confine every file the headless server reads/writes;
                      saves never replace an existing file silently (it becomes OLD_<name>);
+                     --automation-no-old-copies turns OLD_ copies off (saves replace files:
+                     the supervisor keeps backups);
                      busy/jobs/auto-save: see WHIQ-CHANGES.md
   gridcraft-cli send <port> <method> [json]
   gridcraft-cli version";
@@ -601,7 +604,7 @@ fn mcp(args: &[String]) -> Result<(), String> {
             "checkpoint-edits",
             "checkpoint-secs",
         ],
-        &["no-signals"],
+        &["no-signals", "automation-no-old-copies"],
     )?;
     a.no_extra(0)?;
     let num = |name: &str| -> Result<Option<f64>, String> {
@@ -617,6 +620,8 @@ fn mcp(args: &[String]) -> Result<(), String> {
     .map_err(|e| format!("mcp: {e}"))?;
     let mut config = gridcraft_mcp::runtime::RuntimeConfig::default();
     config.settings.author = a.opt("author").map(str::to_string);
+    // WHIQ: a supervisor that keeps the backups itself turns the OLD_ copies off.
+    config.settings.old_copies = !a.has("automation-no-old-copies");
     // WHIQ parity pass: the flag names every craft app takes (older names still read).
     let either = |a: &str, b: &str| -> Result<Option<f64>, String> { Ok(num(a)?.or(num(b)?)) };
     if let Some(n) = either("job-after-ms", "call-timeout-ms")? {
@@ -681,8 +686,9 @@ fn mcp(args: &[String]) -> Result<(), String> {
                 let show = |root: Option<&std::path::Path>| root.map_or_else(|| "none".to_string(), |r| r.display().to_string());
                 eprintln!("gridcraft-cli: files confined: read root {}, write root {}", show(r.read_root()), show(r.write_root()));
             }
-            // Saves made by agents never replace a file silently: the previous one becomes OLD_<name>.
-            gridcraft_engine::io::save_policy::keep_old_files(true);
+            // Saves made by agents never replace a file silently: the previous one becomes OLD_<name>
+            // (unless --automation-no-old-copies: the supervisor keeps the backups).
+            gridcraft_engine::io::save_policy::keep_old_files(config.settings.old_copies);
             let mut session = match (a.opt("in"), a.opt("sample")) {
                 (Some(p), _) => open(p)?,
                 (None, Some(name)) => {

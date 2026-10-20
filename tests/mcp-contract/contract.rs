@@ -48,6 +48,68 @@ fn errors_carry_code_reason_and_next_step() {
     // A protocol error carries the same shape in `data`.
     let v = m.request("nope/nope", json!({}));
     assert!(v["error"]["data"]["next_step"].is_string(), "{v}");
+    assert!(v["error"]["data"]["code"].is_string() && v["error"]["data"]["reason"].is_string(), "{v}");
+    // So does a tools/call without a tool name: code, reason, next step.
+    let v = m.request("tools/call", json!({"arguments": {}}));
+    let e = if v["error"].is_object() { v["error"]["data"].clone() } else { v["result"]["structuredContent"]["error"].clone() };
+    assert!(e["code"].is_string() && e["reason"].is_string() && e["next_step"].is_string(), "{v}");
+    // An unknown document handle names the open ones.
+    let e = m.err("read_range", json!({"range": "A1", "document": "doc-999999"}));
+    assert_eq!(e["code"], "not_found", "{e}");
+    assert!(e["open_documents"].as_array().is_some_and(|d| !d.is_empty()), "{e}");
+}
+
+// WHIQ: a supervisor that keeps the backups itself turns the OLD_ copies off.
+#[test]
+fn old_copies_can_be_turned_off_for_a_supervisor() {
+    let dir = folder("no-old");
+    std::fs::write(dir.join("report.xlsx"), b"the customer's file").unwrap();
+    let mut m = start(&dir, &["--automation-no-old-copies"]);
+    assert_eq!(m.ok("server_status", json!({}))["limits"]["old_copies"], false);
+    m.ok("set_cell", json!({"cell": "A1", "input": "one"}));
+    for path in ["report.xlsx", "report.xlsx", "report.pdf", "report.pdf"] {
+        let v = m.ok(if path.ends_with(".pdf") { "export_pdf" } else { "save_workbook" }, json!({"path": path}));
+        assert!(v.get("previous_files_renamed").is_none() && v.get("notice").is_none(), "{v}");
+    }
+    m.ok("build_workbook", json!({"path": "report.xlsx", "sheets": [{"name": "S", "rows": [["two"]]}]}));
+    assert_eq!(files_in(&dir), ["report.pdf", "report.xlsx"], "replaced in place, no OLD_ copies");
+    assert_eq!(cells_of(&dir.join("report.xlsx"), "A1"), json!([["two"]]));
+    drop(m);
+    let mut m = start(&dir, &[]);
+    assert_eq!(m.ok("server_status", json!({}))["limits"]["old_copies"], true, "on by default");
+}
+
+// WHIQ: build / open / new return a document handle; calls name the workbook they act on, so two
+// exports in one process never touch each other's document.
+#[test]
+fn document_handles_keep_two_exports_apart() {
+    let dir = folder("handles");
+    let mut m = start(&dir, &[]);
+    let a = m.ok("build_workbook", json!({"sheets": [{"name": "A", "rows": [["first"]]}]}))["document"].as_str().unwrap().to_string();
+    let b = m.ok("build_workbook", json!({"sheets": [{"name": "B", "rows": [["second"]]}]}))["document"].as_str().unwrap().to_string();
+    assert!(a.starts_with("doc-") && a != b, "{a} {b}");
+    // The second build is active; the first is still reached by its handle.
+    m.ok("set_cell", json!({"cell": "A2", "input": "for A", "document": a}));
+    m.ok("format_range", json!({"range": "A1", "bold": true, "document": a}));
+    assert_eq!(m.ok("read_range", json!({"range": "A1:A2"}))["values"], json!([["second"], [null]]), "B untouched");
+    let v = m.ok("save_workbook", json!({"path": "a.xlsx", "document": a}));
+    assert!(v["path"].as_str().unwrap().ends_with("a.xlsx"), "{v}");
+    m.ok("save_workbook", json!({"path": "b.xlsx"}));
+    assert_eq!(cells_of(&dir.join("a.xlsx"), "A1:A2"), json!([["first"], ["for A"]]));
+    assert_eq!(cells_of(&dir.join("b.xlsx"), "A1:A2"), json!([["second"], [null]]));
+    let st = m.ok("server_status", json!({}));
+    let docs: Vec<&str> = st["documents"].as_array().unwrap().iter().filter_map(|d| d["document"].as_str()).collect();
+    assert!(docs.contains(&a.as_str()) && docs.contains(&b.as_str()), "{st}");
+    assert_eq!(st["documents"][0]["document"], b, "the active one first: {st}");
+    let o = m.ok("open_workbook", json!({"path": "a.xlsx"}));
+    assert_eq!(o["document"], a, "already open: the same handle");
+    // Closing frees one workbook; its handle is gone, the other stays.
+    m.ok("set_cell", json!({"cell": "B1", "input": "unsaved", "document": b}));
+    let e = m.err("close_workbook", json!({"document": b}));
+    assert!(e["reason"].as_str().unwrap().contains("unsaved"), "{e}");
+    assert_eq!(m.ok("close_workbook", json!({"document": b, "discard": true}))["closed"], b);
+    assert_eq!(m.err("read_range", json!({"range": "A1", "document": b}))["code"], "not_found");
+    assert_eq!(m.ok("read_range", json!({"range": "A1", "document": a}))["values"], json!([["first"]]));
 }
 
 // 2. Nothing hangs: busy with a retry time, long work as jobs, results that survive timeouts.
@@ -370,6 +432,25 @@ fn annotations() {
     }
     let save = tools.iter().find(|t| t["name"] == "save_workbook").unwrap();
     assert!(save["inputSchema"]["properties"]["overwrite"].is_object());
+    // `_meta["whiq/files"]`: the arguments naming files a call reads, and whether it opens the
+    // document (the field WordCraft and DeckCraft carry).
+    let files = |n: &str| tools.iter().find(|t| t["name"] == n).unwrap()["_meta"]["whiq/files"].clone();
+    assert_eq!(files("open_workbook"), json!({"read": ["path"], "opens": true}));
+    assert_eq!(files("new_workbook"), json!({"read": [], "opens": true}));
+    assert_eq!(files("build_workbook"), json!({"read": [], "opens": true}));
+    assert_eq!(files("roundtrip_check"), json!({"read": ["path"], "opens": false}));
+    assert!(files("save_workbook").is_null() && files("export_pdf").is_null(), "a save's path is written, not read");
+    for t in tools {
+        for k in t["_meta"]["whiq/files"]["read"].as_array().into_iter().flatten() {
+            assert!(t["inputSchema"]["properties"][k.as_str().unwrap()].is_object(), "{}: `{k}` is in its schema", t["name"]);
+        }
+    }
+    // Document tools name the workbook they act on.
+    for n in ["read_range", "set_cell", "format_range", "save_workbook", "export_pdf", "close_workbook", "execute_command"] {
+        let t = tools.iter().find(|t| t["name"] == n).unwrap();
+        assert!(t["inputSchema"]["properties"]["document"].is_object(), "{n} takes document");
+    }
+    assert_eq!(get("close_workbook")["destructiveHint"], true);
     // structuredContent everywhere (the harness asserts it on each call).
     m.ok("inspect_workbook", json!({}));
     m.ok("list_commands", json!({"search": "bold"}));

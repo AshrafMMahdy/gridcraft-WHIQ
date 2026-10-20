@@ -18,6 +18,25 @@ pub struct DocSnapshot {
     pub dirty: bool,
     pub cells: u64,
     pub sheets: Vec<String>,
+    /// WHIQ: the document handle calls name it by (`document: "doc-7"`).
+    pub handle: String,
+    /// WHIQ: every open document (the active one included), for server_status.
+    pub open: Vec<OpenDoc>,
+}
+
+/// WHIQ: an open document as server_status lists it.
+#[derive(Clone, Debug)]
+pub struct OpenDoc {
+    pub handle: String,
+    pub title: String,
+    pub path: Option<String>,
+    pub dirty: bool,
+    pub active: bool,
+}
+
+/// WHIQ: the handle of the document with this uid.
+pub fn handle_of(uid: u64) -> String {
+    format!("doc-{uid}")
 }
 
 /// Something that answers control-channel methods (`engine.execute`, `engine.commands`,
@@ -42,6 +61,19 @@ pub trait Backend {
     fn stamp_author(&mut self, _name: &str) {}
     /// WHIQ: close every document and start over with a blank one (eviction frees the memory).
     fn reset(&mut self) {}
+    /// WHIQ: whether documents have handles here (the headless server; a running app has none).
+    fn has_handles(&self) -> bool {
+        false
+    }
+    /// WHIQ: the handle of the active document (`None` when the backend has no handles).
+    fn active_document(&self) -> Option<String> {
+        None
+    }
+    /// WHIQ: make the document with this handle the active one. `Err` carries the handles that
+    /// are open (empty when the backend has no handles).
+    fn select_document(&mut self, _handle: &str) -> Result<(), Vec<String>> {
+        Err(vec![])
+    }
     /// WHIQ: the automation read and write roots in force.
     fn roots(&self) -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
         (None, None)

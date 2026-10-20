@@ -137,6 +137,56 @@ fn scatter_charts_are_solid_lines_per_series() {
     );
 }
 
+/// WHIQ: the platform's schedule workbook in one call — section titles and table heads styled,
+/// Gantt bars as real fills, row heights in points, ID / Activity frozen, WBS codes kept as text
+/// and ISO dates as dates — instead of build, format_range / execute_command per sheet, save.
+#[test]
+fn build_workbook_formats_in_one_call() {
+    let dir = folder("build-styled");
+    let mut m = start(&dir, "Schedule");
+    let v = m.ok(
+        "build_workbook",
+        json!({
+            "path": "schedule.xlsx",
+            "literal_strings": true,
+            "sheets": [{
+                "name": "Gantt (weekly)",
+                "rows": [
+                    ["High-Level Timeline · 1 column = 1 week"],
+                    ["ID", "Activity", "Start", "W1", "W2"],
+                    ["2.10", "Excavation", "2026-04-03", {"value": "", "fill": "#3B82F6"}, null],
+                    ["2.20", "=not a formula", "2026-04-10", null, {"value": "", "fill": "#E11D48"}]
+                ],
+                "merges": ["A1:E1"],
+                "styles": [
+                    {"range": "A1:E1", "bold": true, "font_size": 12, "fill": "#EAF1FB", "font_color": "#1D4ED8"},
+                    {"range": "A2:E2", "bold": true, "fill": "#1D4ED8", "font_color": "#FFFFFF", "wrap": true, "borders": "all"}
+                ],
+                "row_heights": [{"row": 1, "height": 20}, {"row": 2, "height": 22}],
+                "column_widths": [6, 38, 12, 3.2, 3.2],
+                "freeze": "D3"
+            }]
+        }),
+    );
+    assert!(v["document"].as_str().is_some_and(|d| d.starts_with("doc-")), "{v}");
+    let path = dir.join("schedule.xlsx");
+    let sheet = zip_text(&path, "xl/worksheets/sheet1.xml");
+    assert!(sheet.contains("ht=\"20\"") && sheet.contains("ht=\"22\""), "row heights in points: {sheet}");
+    assert!(sheet.contains("xSplit=\"3\"") && sheet.contains("ySplit=\"2\""), "frozen at D3: {sheet}");
+    let styles = zip_text(&path, "xl/styles.xml");
+    for rgb in ["3B82F6", "E11D48", "1D4ED8", "EAF1FB", "FFFFFF"] {
+        assert!(styles.contains(rgb), "{rgb}");
+    }
+    assert!(styles.contains("yyyy-mm-dd"), "dates formatted by the engine");
+    assert_eq!(cells_of(&path, "A3:C4"), json!([["2.10", "Excavation", 46115.0], ["2.20", "=not a formula", 46122.0]]), "text kept, dates as dates");
+    // The WBS codes are text cells, the dates numbers.
+    let r = m.ok("read_range", json!({"range": "A3:C3", "formulas": true}));
+    assert!(r.to_string().contains("2.10"), "{r}");
+    assert_eq!(m.ok("evaluate_formula", json!({"formula": "=ISTEXT(A3)+ISNUMBER(C3)*2"}))["result"], json!(3.0), "text and a date");
+    let out = std::process::Command::new(binary()).args(["check", path.to_str().unwrap()]).output().unwrap();
+    assert!(out.status.success(), "check: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+}
+
 #[test]
 fn recalculate_reports_formulas_and_errors() {
     let dir = folder("recalc");

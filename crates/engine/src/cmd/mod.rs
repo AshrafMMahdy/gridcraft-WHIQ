@@ -13,6 +13,7 @@ pub mod format;
 pub mod formulas;
 pub mod insert;
 pub mod inspect;
+pub(crate) mod looks;
 pub mod pivot;
 pub mod print;
 pub mod review;

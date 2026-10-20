@@ -34,7 +34,9 @@ charts) from JSON; render_range / render_sheet give PNG pictures and export_pdf 
 fonts embedded); recalculate recomputes every formula; insert_rows, delete_columns, rename_sheet, conditional_format, \
 data_validation edit in place. Every failure says what to do next (`next_step`); `busy` means retry after \
 `retry_after_ms`; long calls answer with a `job_id` to poll with job_status; server_status always answers. Saves never \
-replace an existing file silently (it becomes OLD_<name>; pass overwrite: true to replace it).";
+replace an existing file silently (it becomes OLD_<name>; pass overwrite: true to replace it). open_workbook, \
+new_workbook and build_workbook answer with a `document` handle: pass it as `document` to act on that workbook while \
+others are open; close_workbook frees one.";
 
 /// Resource URIs.
 pub const WORKBOOK_URI: &str = "gridcraft://workbook";

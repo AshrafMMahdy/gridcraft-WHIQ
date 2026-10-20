@@ -98,7 +98,40 @@ impl Backend for Headless {
             dirty: d.is_dirty(),
             cells: d.wb.sheets.iter().map(|s| s.cells.len() as u64).sum(),
             sheets: d.wb.sheets.iter().map(|s| s.name.clone()).collect(),
+            handle: crate::backend::handle_of(d.uid),
+            open: self
+                .session
+                .documents()
+                .iter()
+                .map(|o| crate::backend::OpenDoc {
+                    handle: crate::backend::handle_of(o.uid),
+                    title: o.display_title(),
+                    path: o.path.clone(),
+                    dirty: o.is_dirty(),
+                    active: o.uid == d.uid,
+                })
+                .collect(),
         })
+    }
+
+    fn has_handles(&self) -> bool {
+        true
+    }
+
+    fn active_document(&self) -> Option<String> {
+        self.session.active().map(|d| crate::backend::handle_of(d.uid))
+    }
+
+    fn select_document(&mut self, handle: &str) -> Result<(), Vec<String>> {
+        let want = handle.trim();
+        let docs = self.session.documents();
+        match docs.iter().position(|d| crate::backend::handle_of(d.uid) == want || d.uid.to_string() == want) {
+            Some(i) => {
+                self.session.set_active(i);
+                Ok(())
+            }
+            None => Err(docs.iter().map(|d| crate::backend::handle_of(d.uid)).collect()),
+        }
     }
 
     fn set_user(&mut self, name: &str) -> Option<String> {
