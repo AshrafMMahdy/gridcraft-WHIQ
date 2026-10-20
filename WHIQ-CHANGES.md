@@ -398,6 +398,14 @@ Hardened 2026-10-20 (as the P6 clone's workflow, p6-clone de992a2):
   Python `zipfile` script (entries sorted, every date the commit's time in UTC, fixed modes and
   host, deflate level 9) in place of `Compress-Archive`. Checked locally: the same files packed
   twice, with different file times in between, give byte-identical `.zip` and `.tar.gz`.
+- **Publish onto a draft** (as WordCraft 228f5e4, after its whiq-v0.7.1 43 MB zip upload reached
+  GitHub but its answer did not and gh's retry got 422): the release is created as an empty
+  draft, each file is uploaded on its own, after a failed upload the file on the release is
+  checked by size and sha256 and kept when it is this file; on a draft only an incomplete file is
+  removed and uploaded again (a published release with files still fails the run); the draft is
+  published once every file is there, and a draft left by an earlier run is resumed. Checked
+  locally against a stub `gh`: a partial file left on a draft is replaced, an upload that
+  "failed" after landing is kept, the draft is published; a published release with files fails.
 
 
 ### Test status after the parity pass (Linux x86_64, 2026-10-18, craft-fonts 43913056, `CRAFT_FONTS_REQUIRED=1`)
