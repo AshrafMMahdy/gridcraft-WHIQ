@@ -482,6 +482,9 @@ fn add_chart(s: &mut Session, c: &Json, sheet: &str, block: Option<RangeRef>, ha
                     kind,
                     smooth: bool_param(sp, "smooth").unwrap_or(false),
                     trendlines: vec![],
+                    line: None,
+                    markers: None,
+                    line_width: None,
                 });
             }
             let d = s.doc()?;
@@ -544,6 +547,11 @@ fn add_chart(s: &mut Session, c: &Json, sheet: &str, block: Option<RangeRef>, ha
             se.color = gridcraft_model::Color::from_hex(col).or(se.color);
         }
     }
+    // WHIQ: scatter series are drawn with straight lines and markers unless the spec says
+    // otherwise (`line`, `markers`, `line_width`, `color` on the chart or a series).
+    let line_default = matches!(t.to_ascii_lowercase().as_str(), "scatter" | "xy").then_some(true);
+    let theme = s.doc()?.wb.theme.clone();
+    super::insert::apply_scatter_lines(&mut chart, c, explicit.map_or(&[][..], Vec::as_slice), line_default, &theme)?;
     let si = s.doc()?.wb.sheet_index(sheet).ok_or_else(|| bad("chart", format!("no sheet `{sheet}`")))?;
     edit(s, |cx| {
         cx.sheet_mut(si)?.charts.push(chart);
@@ -690,7 +698,8 @@ mod tests {
         assert_eq!(combo.anchor.cell, CellRef::new(1, 5));
         assert!(combo.anchor.width > 300.0, "{:?}", combo.anchor);
         assert_eq!(combo.x_title.as_deref(), Some("Month"));
-        assert_eq!(sh.charts[1].kind, ChartKind::Scatter);
+        // WHIQ: a scatter is drawn with straight lines (and markers) unless the spec says `line: false`.
+        assert_eq!(sh.charts[1].kind, ChartKind::ScatterLines);
         assert_eq!(sh.charts[1].series[0].categories.as_deref(), Some("'Cash Flow'!$B$2:$B$4"), "scatter X values");
         assert_eq!(sh.charts[2].kind, ChartKind::ColumnClustered);
         assert!(s.execute("file.build", json!({"sheets": [{"name": "A"}], "charts": [{"sheet": "B", "kind": "col", "series": []}]})).is_err());
@@ -744,5 +753,77 @@ mod tests {
         assert!(!s.doc().unwrap().is_dirty(), "recalculating a saved workbook leaves it saved");
         assert_eq!(r["errorCount"], 1);
         assert_eq!(r["errors"][0]["error"], "#DIV/0!");
+    }
+
+    /// WHIQ: scatter series are solid straight lines with markers by default (the platform's
+    /// Line-of-Balance chart: one production line per trade); `line`, `markers`, `line_width` and
+    /// `color` on the chart or on a series say otherwise, and the saved file carries them.
+    #[test]
+    fn scatter_charts_draw_lines_unless_told_otherwise() {
+        let mut s = s();
+        s.execute(
+            "file.build",
+            json!({
+                "sheets": [{
+                    "name": "LOB",
+                    "header": ["Day", "Excavation", "Day2", "Concrete"],
+                    "rows": [[0, 1, 5, 1], [10, 20, 15, 20]],
+                    "charts": [
+                        {"type": "scatter", "title": "LOB", "series": [
+                            {"name": "Excavation", "categories": "A2:A3", "values": "B2:B3"},
+                            {"name": "Concrete", "categories": "C2:C3", "values": "D2:D3", "color": "#E11D48", "markers": false, "line_width": 3}
+                        ]},
+                        {"type": "scatter", "line": false, "series": [{"categories": "A2:A3", "values": "B2:B3"}]},
+                        {"type": "scatter", "markers": false, "color": "#123456", "lineWidth": 1.5, "series": [{"categories": "A2:A3", "values": "B2:B3"}]},
+                        {"type": "line", "line_width": 3, "series": [{"categories": "A2:A3", "values": "B2:B3"}]}
+                    ]
+                }]
+            }),
+        )
+        .unwrap();
+        let d = s.doc().unwrap();
+        let sh = d.wb.sheet(0).unwrap();
+        let lob = &sh.charts[0];
+        assert_eq!(lob.kind, ChartKind::ScatterLines);
+        let (a, b) = (&lob.series[0], &lob.series[1]);
+        assert_eq!((a.line, a.markers, a.line_width), (Some(true), Some(true), None));
+        assert!(a.color.is_some(), "a palette colour, so the file's line and the render agree");
+        assert_eq!((b.line, b.markers, b.line_width), (Some(true), Some(false), Some(3.0)));
+        assert_eq!(b.color, gridcraft_model::Color::from_hex("E11D48"));
+        assert_ne!(a.color, b.color);
+        let pts = &sh.charts[1];
+        assert_eq!(pts.kind, ChartKind::Scatter, "line: false = markers only");
+        assert_eq!((pts.series[0].line, pts.series[0].markers), (Some(false), Some(true)));
+        let plain = &sh.charts[2];
+        assert_eq!((plain.series[0].line, plain.series[0].markers, plain.series[0].line_width), (Some(true), Some(false), Some(1.5)));
+        assert_eq!(plain.series[0].color, gridcraft_model::Color::from_hex("123456"));
+        let line = &sh.charts[3];
+        assert_eq!(line.kind, ChartKind::Line, "other chart types are left alone");
+        assert_eq!((line.series[0].line, line.series[0].markers, line.series[0].line_width, line.series[0].color), (None, None, None, None));
+        // The file: one solid, round-capped line per series, markers off where asked.
+        let bytes = crate::io::save_bytes(&d.wb, "lob.xlsx").unwrap();
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.clone())).unwrap();
+        let mut xml = String::new();
+        std::io::Read::read_to_string(&mut zip.by_name("xl/charts/chart1.xml").unwrap(), &mut xml).unwrap();
+        assert!(xml.contains("<c:scatterStyle val=\"lineMarker\"/>"), "{xml}");
+        assert_eq!(xml.matches("<a:ln w=\"28575\" cap=\"rnd\"><a:solidFill>").count(), 1, "{xml}");
+        assert!(xml.contains("<a:ln w=\"38100\" cap=\"rnd\"><a:solidFill><a:srgbClr val=\"E11D48\"/></a:solidFill>"), "{xml}");
+        assert!(!xml.contains("<a:noFill/>"), "{xml}");
+        assert_eq!(xml.matches("<c:symbol val=\"none\"/>").count(), 1, "{xml}");
+        assert_eq!(xml.matches("<c:symbol val=\"circle\"/>").count(), 1, "{xml}");
+        // Read back: the same chart.
+        let (back, _) = gridcraft_xlsx::read_xlsx(&bytes).unwrap();
+        let bl = &back.sheet(0).unwrap().charts[0];
+        assert_eq!(bl.kind, ChartKind::ScatterLines);
+        assert_eq!(bl.series[0].markers, Some(true));
+        assert_eq!(bl.series[1].markers, Some(false), "a line without markers stays without markers");
+        assert_eq!(bl.series[1].line_width, Some(3.0));
+        assert_eq!(bl.series[1].color, gridcraft_model::Color::from_hex("E11D48"));
+        assert_eq!(back.sheet(0).unwrap().charts[1].kind, ChartKind::Scatter);
+        // A bad width says what to give.
+        let e = s
+            .execute("file.build", json!({"sheets": [{"name": "A", "rows": [[1, 2]], "charts": [{"type": "scatter", "line_width": -1, "series": [{"values": "B1:B1", "categories": "A1:A1"}]}]}]}))
+            .unwrap_err();
+        assert!(e.to_string().contains("line_width"), "{e}");
     }
 }

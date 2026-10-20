@@ -424,6 +424,17 @@ pub struct Series {
     /// Trendlines fitted to this series (Excel allows several per series).
     #[serde(default)]
     pub trendlines: Vec<Trendline>,
+    /// WHIQ, scatter series: draw the straight line through the points (`None`: the chart kind
+    /// decides, `ScatterLines` yes, `Scatter` no).
+    #[serde(default)]
+    pub line: Option<bool>,
+    /// WHIQ, scatter series: draw a marker at each point (`None`: the chart kind decides,
+    /// `Scatter` yes, `ScatterLines` no).
+    #[serde(default)]
+    pub markers: Option<bool>,
+    /// WHIQ, scatter series: line width in points (`None`: 2.25 pt).
+    #[serde(default)]
+    pub line_width: Option<f32>,
 }
 
 /// Regression a trendline fits (`c:trendlineType`).

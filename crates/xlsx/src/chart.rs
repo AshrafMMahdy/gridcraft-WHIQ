@@ -61,6 +61,33 @@ fn group_kind(g: &El) -> Option<ChartKind> {
     })
 }
 
+/// WHIQ: a scatter series' line, markers and width, kept only where they differ from what its
+/// group's kind draws anyway (so files without them read back as before).
+fn read_scatter_style(s: &El, kind: ChartKind, ser: &mut Series) {
+    let ln = s.path(&["spPr", "ln"]);
+    let no_line = ln.is_some_and(|l| l.child("noFill").is_some());
+    let symbol = s.path(&["marker", "symbol"]).and_then(|m| m.attr("val"));
+    let w = ln.and_then(|l| l.attr_f64("w")).filter(|w| w.is_finite() && *w > 0.0);
+    if kind == ChartKind::ScatterLines {
+        if no_line {
+            ser.line = Some(false);
+        }
+        // No marker element in a lineMarker scatter: automatic markers. A drawn line without
+        // markers is kept explicit too, so the renderer (which marks short scatter lines by
+        // default) draws what Excel does.
+        if symbol != Some("none") {
+            ser.markers = Some(true);
+        } else if ln.is_some_and(|l| l.child("solidFill").is_some()) {
+            ser.markers = Some(false);
+        }
+        if let Some(w) = w.filter(|w| (*w - SCATTER_LINE_EMU as f64).abs() > 0.5) {
+            ser.line_width = Some((w / EMU_PER_PT) as f32);
+        }
+    } else if symbol == Some("none") {
+        ser.markers = Some(false);
+    }
+}
+
 fn data_ref(e: Option<&El>) -> Option<String> {
     let e = e?;
     for k in ["numRef", "strRef", "multiLvlStrRef"] {
@@ -108,6 +135,9 @@ fn read_series(s: &El) -> Series {
         kind: None,
         smooth: bool_val(s, "smooth"),
         trendlines: s.kids("trendline").filter_map(read_trendline).collect(),
+        line: None,
+        markers: None,
+        line_width: None,
     }
 }
 
@@ -193,6 +223,9 @@ pub fn read_chart(root: &El) -> Option<Chart> {
     for (gi, (g, k)) in groups.iter().enumerate() {
         for s in g.kids("ser") {
             let mut ser = read_series(s);
+            if matches!(k, ChartKind::Scatter | ChartKind::ScatterLines) {
+                read_scatter_style(s, *k, &mut ser);
+            }
             if gi > 0 {
                 ser.kind = Some(*k);
                 ser.secondary = axis_ids(g) != first_axes;
@@ -408,8 +441,14 @@ fn series_xml(s: &Series, idx: usize, g: G, wb: &Workbook, si: usize) -> String 
         }
     }
     let color = s.color.as_ref().and_then(|c: &Color| srgb(c, &wb.theme));
+    // WHIQ: a scatter series with its own line / markers / width writes them explicitly.
+    let styled = matches!(g, G::Scatter { .. }) && (s.line.is_some() || s.markers.is_some() || s.line_width.is_some());
     let line_like = matches!(g, G::Line { .. } | G::Radar | G::Scatter { lines: true });
+    if styled {
+        x.push_str(&scatter_style_xml(s, idx, g, color.as_deref(), wb));
+    }
     match (&color, line_like) {
+        _ if styled => {}
         (Some(c), true) => {
             let _ = write!(x, "<c:spPr><a:ln w=\"28575\" cap=\"rnd\"><a:solidFill>{c}</a:solidFill><a:round/></a:ln></c:spPr>");
         }
@@ -426,6 +465,7 @@ fn series_xml(s: &Series, idx: usize, g: G, wb: &Workbook, si: usize) -> String 
         _ => {}
     }
     match g {
+        G::Scatter { .. } if styled => {}
         G::Bar { .. } => x.push_str("<c:invertIfNegative val=\"0\"/>"),
         G::Line { markers: false, .. } | G::Scatter { lines: true } | G::Stock => x.push_str("<c:marker><c:symbol val=\"none\"/></c:marker>"),
         G::Bubble => x.push_str("<c:invertIfNegative val=\"0\"/>"),
@@ -462,6 +502,48 @@ fn series_xml(s: &Series, idx: usize, g: G, wb: &Workbook, si: usize) -> String 
         }
     }
     x.push_str("</c:ser>");
+    x
+}
+
+/// Default series line width (2.25 pt, in EMU).
+const SCATTER_LINE_EMU: i64 = 28_575;
+
+/// WHIQ: `c:spPr` and `c:marker` of a scatter series that sets `line`, `markers` or
+/// `line_width`: a solid, round-capped line in the series colour (the theme accent of its index
+/// when it has none) or `a:noFill`, and a circle marker or `c:symbol none`. Both Excel and
+/// LibreOffice draw the line from `a:ln` (`scatterStyle` alone is not enough for either).
+fn scatter_style_xml(s: &Series, idx: usize, g: G, color: Option<&str>, wb: &Workbook) -> String {
+    let group_lines = matches!(g, G::Scatter { lines: true });
+    let line = s.line.unwrap_or(group_lines);
+    let markers = s.markers.unwrap_or(!group_lines);
+    let fallback;
+    let c: &str = match color {
+        Some(c) => c,
+        None => {
+            // Accents 1-6 of the workbook's theme, as the chart renderer picks them.
+            fallback = srgb(&Color::Theme(4 + (idx % 6) as u8, 0), &wb.theme).unwrap_or_else(|| "<a:srgbClr val=\"156082\"/>".into());
+            &fallback
+        }
+    };
+    let mut x = String::new();
+    if line {
+        // ST_LineWidth: 0..=20116800 EMU.
+        let w = s
+            .line_width
+            .filter(|w| w.is_finite() && *w > 0.0)
+            .map_or(SCATTER_LINE_EMU, |w| (f64::from(w) * EMU_PER_PT).round().clamp(1.0, 20_116_800.0) as i64);
+        let _ = write!(x, "<c:spPr><a:ln w=\"{w}\" cap=\"rnd\"><a:solidFill>{c}</a:solidFill><a:round/></a:ln></c:spPr>");
+    } else {
+        x.push_str("<c:spPr><a:ln w=\"19050\"><a:noFill/></a:ln></c:spPr>");
+    }
+    if markers {
+        let _ = write!(
+            x,
+            "<c:marker><c:symbol val=\"circle\"/><c:size val=\"5\"/><c:spPr><a:solidFill>{c}</a:solidFill><a:ln w=\"9525\"><a:solidFill>{c}</a:solidFill></a:ln></c:spPr></c:marker>"
+        );
+    } else {
+        x.push_str("<c:marker><c:symbol val=\"none\"/></c:marker>");
+    }
     x
 }
 

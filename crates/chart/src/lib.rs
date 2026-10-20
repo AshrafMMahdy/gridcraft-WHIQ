@@ -146,6 +146,15 @@ pub struct SeriesData {
     pub smooth: bool,
     /// Trendlines to fit and draw over this series.
     pub trendlines: Vec<TrendlineData>,
+    /// WHIQ, scatter: draw the line through the points (`None`: the chart kind decides).
+    #[serde(default)]
+    pub line: Option<bool>,
+    /// WHIQ, scatter: draw the point markers (`None`: the chart kind decides).
+    #[serde(default)]
+    pub markers: Option<bool>,
+    /// WHIQ, scatter: line width in points (`None`: the default).
+    #[serde(default)]
+    pub line_width: Option<f32>,
     /// Number format code of the source values ("General" by default).
     pub number_format: String,
 }
@@ -169,6 +178,9 @@ impl Default for SeriesData {
             secondary: false,
             smooth: false,
             trendlines: vec![],
+            line: None,
+            markers: None,
+            line_width: None,
             number_format: "General".into(),
         }
     }

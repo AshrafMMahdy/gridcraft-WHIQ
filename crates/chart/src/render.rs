@@ -165,6 +165,15 @@ pub fn legend_entries(chart: &Chart, data: &ChartData) -> Vec<(String, Rgba, Swa
                 .clone()
                 .map(|s| {
                     let sw = match plot_kind(chart, s) {
+                        // WHIQ: a scatter series' own line / markers choice.
+                        ChartKind::Scatter | ChartKind::ScatterLines if s.line.is_some() || s.markers.is_some() => {
+                            let line = s.line.unwrap_or(plot_kind(chart, s) == ChartKind::ScatterLines);
+                            match (line, s.markers.unwrap_or(!line)) {
+                                (true, true) => Swatch::LineMarker,
+                                (true, false) => Swatch::Line,
+                                _ => Swatch::Marker,
+                            }
+                        }
                         ChartKind::Line | ChartKind::LineStacked | ChartKind::Radar | ChartKind::ScatterLines => Swatch::Line,
                         ChartKind::LineMarkers => Swatch::LineMarker,
                         ChartKind::Scatter | ChartKind::Bubble => Swatch::Marker,
@@ -206,6 +215,9 @@ fn sanitize(d: &ChartData) -> ChartData {
                 secondary: s.secondary,
                 smooth: s.smooth,
                 trendlines: s.trendlines.iter().take(MAX_TRENDLINES).cloned().collect(),
+                line: s.line,
+                markers: s.markers,
+                line_width: s.line_width.filter(|w| w.is_finite()).map(|w| w.clamp(0.25, 20.0)),
                 number_format: s.number_format.clone(),
             })
             .collect(),
@@ -1172,11 +1184,13 @@ fn scatter(ctx: &mut Ctx, chart: &Chart, data: &ChartData, area: Bx) {
                 ctx.out.push(Prim::Circle { cx: p[0], cy: p[1], r, fill: Some(fill), stroke: Some((WHITE, 0.75)) });
             }
         } else {
-            let lines = chart.kind == ChartKind::ScatterLines || s.kind == ChartKind::ScatterLines;
+            let lines = s.line.unwrap_or(chart.kind == ChartKind::ScatterLines || s.kind == ChartKind::ScatterLines);
             if lines {
-                draw_runs(ctx, &px, s.color, 2.0, s.smooth.then_some(plot));
+                // WHIQ: a series' own width (points; the 2.25 pt default draws 2.0 here).
+                let w = s.line_width.filter(|w| w.is_finite() && *w > 0.0).map_or(2.0, |w| (w * 2.0 / 2.25).clamp(0.25, 20.0));
+                draw_runs(ctx, &px, s.color, w, s.smooth.then_some(plot));
             }
-            if !lines || px.len() <= 500 {
+            if s.markers.unwrap_or(!lines || px.len() <= 500) {
                 draw_markers(ctx, px.iter().flatten().copied(), 3.5, s.color);
             }
         }

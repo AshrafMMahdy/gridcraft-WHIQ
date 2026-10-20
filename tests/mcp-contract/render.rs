@@ -108,8 +108,24 @@ fn arabic_pdf_export_embeds_subset_fonts() {
     assert!(pdf.len() < 120_000, "subsets, not whole fonts: {} bytes", pdf.len());
     // The text layer, read back by pdftotext as UTF-8. Only poppler's pdftotext is held to it: the old xpdf build some Windows
     // images carry cannot write Arabic at all (the PDF's ToUnicode maps are asserted above either way).
-    let poppler = std::process::Command::new("pdftotext").arg("-v").output().map(|o| String::from_utf8_lossy(&o.stderr).to_lowercase().contains("poppler") || String::from_utf8_lossy(&o.stdout).to_lowercase().contains("poppler")).unwrap_or(false);
-    if let Ok(out) = std::process::Command::new("pdftotext").arg("-enc").arg("UTF-8").arg(dir.join("report.pdf")).arg("-").output().ok().filter(|_| poppler).ok_or(()) {
+    let poppler = std::process::Command::new("pdftotext")
+        .arg("-v")
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stderr).to_lowercase().contains("poppler")
+                || String::from_utf8_lossy(&o.stdout).to_lowercase().contains("poppler")
+        })
+        .unwrap_or(false);
+    if let Ok(out) = std::process::Command::new("pdftotext")
+        .arg("-enc")
+        .arg("UTF-8")
+        .arg(dir.join("report.pdf"))
+        .arg("-")
+        .output()
+        .ok()
+        .filter(|_| poppler)
+        .ok_or(())
+    {
         let t = String::from_utf8_lossy(&out.stdout);
         let flat: String = t.chars().filter(|c| !matches!(*c, '\u{202A}'..='\u{202E}')).collect();
         for word in ["البند", "الإجمالي", "المجموع", "Steel works", "96060"] {

@@ -14,6 +14,7 @@ mod pivot_slicer;
 mod pivot_tests;
 mod richdata_tests;
 mod roundtrip;
+mod scatter_lines;
 mod sheet_names;
 mod smooth_roundtrip;
 mod trendline_roundtrip;

@@ -19,6 +19,9 @@ fn smooth_line_setting_round_trips() {
         kind: None,
         smooth: false,
         trendlines: Vec::new(),
+        line: None,
+        markers: None,
+        line_width: None,
     };
     s.charts.push(Chart {
         id: 1,

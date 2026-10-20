@@ -291,14 +291,16 @@ fn editing_definitions() -> Vec<Value> {
              values (strings starting with = are formulas), per-column number formats and widths, a frozen header, an \
              AutoFilter or a formatted table, merges, conditional formats, validation, right-to-left sheets, and native charts \
              (bar, column, line, pie, doughnut, area, scatter, combo with a secondary axis; title, axis titles, series by \
-             range). Formulas are recalculated so the file opens with correct values. Example: {\"path\": \"report.xlsx\", \
+             range). Scatter series are solid straight lines with markers by default (`line: false` = markers only, \
+             `markers: false` = the line alone, `line_width` in points, `color`; on the chart or per series), e.g. one \
+             production line per trade. Formulas are recalculated so the file opens with correct values. Example: {\"path\": \"report.xlsx\", \
              \"sheets\": [{\"name\": \"Sales\", \"header\": [\"Region\", \"Units\"], \"rows\": [[\"North\", 10], [\"Total\", \"=SUM(B2:B2)\"]], \
              \"columns\": [{\"width\": 20}, {\"format\": \"#,##0\"}], \"freeze_header\": true, \"table\": \"TableStyleMedium2\", \
              \"charts\": [{\"type\": \"column\", \"title\": \"Units\", \"series\": [{\"name\": \"Units\", \"values\": \"B2:B2\", \"categories\": \"A2:A2\"}]}]}]}",
             obj(
                 json!({
                     "sheets": {"type": "array", "description": "Sheets: {name, header?, rows, start?, columns?: [{header?, width?, format?}], number_formats?, column_widths?, freeze_header?, autofilter?, table?, header_style?, merges?, rtl?, charts?, conditional_formats?, validations?}", "items": {"type": "object"}},
-                    "charts": {"type": "array", "description": "Charts naming their sheet: {sheet, type|kind: bar|column|col|line|pie|doughnut|area|scatter|combo, title?, x_title|xTitle?, y_title|yTitle?, series: [{name, values|valRange, categories|catRange|xRange, type?, secondary?, color?}], lineSeries? (combo lines), data?: \"A1:C9\", at?: \"H2\" | anchor?: {fromCol, fromRow, toCol, toRow}, legend?, hideLegend?, data_labels?, stacked?, width?, height?} (also accepted per sheet)", "items": {"type": "object"}},
+                    "charts": {"type": "array", "description": "Charts naming their sheet: {sheet, type|kind: bar|column|col|line|pie|doughnut|area|scatter|combo, title?, x_title|xTitle?, y_title|yTitle?, series: [{name, values|valRange, categories|catRange|xRange, type?, secondary?, color?, line?, markers?, line_width?}], lineSeries? (combo lines), data?: \"A1:C9\", scatter: line? (default true: solid straight lines), markers? (default true), line_width? (points, default 2.25), color? (\"#RRGGBB\", every series), at?: \"H2\" | anchor?: {fromCol, fromRow, toCol, toRow}, legend?, hideLegend?, data_labels?, stacked?, width?, height?} (also accepted per sheet)", "items": {"type": "object"}},
                     "path": string("Save the workbook here (inside the write root); without it the workbook stays open unsaved"),
                     "title": string("Document title"),
                     "author": string("Document author (default: the caller)"),

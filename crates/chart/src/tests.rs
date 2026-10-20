@@ -63,6 +63,9 @@ fn series(name: &str, values: &[f64], color: Rgba, kind: ChartKind) -> SeriesDat
         secondary: false,
         smooth: false,
         trendlines: Vec::new(),
+        line: None,
+        markers: None,
+        line_width: None,
         number_format: "$#,##0".into(),
     }
 }
@@ -229,6 +232,9 @@ fn resolve_from_workbook() {
             kind: None,
             smooth: false,
             trendlines: Vec::new(),
+            line: None,
+            markers: None,
+            line_width: None,
         },
         Series {
             name: None,
@@ -240,6 +246,9 @@ fn resolve_from_workbook() {
             kind: None,
             smooth: false,
             trendlines: Vec::new(),
+            line: None,
+            markers: None,
+            line_width: None,
         },
         Series {
             name: Some("Literal".into()),
@@ -251,6 +260,9 @@ fn resolve_from_workbook() {
             kind: None,
             smooth: false,
             trendlines: Vec::new(),
+            line: None,
+            markers: None,
+            line_width: None,
         },
     ];
     let d = resolve(&wb, 0, &c);
@@ -289,6 +301,9 @@ fn resolve_from_workbook() {
             kind: None,
             smooth: false,
             trendlines: Vec::new(),
+            line: None,
+            markers: None,
+            line_width: None,
         },
         Series {
             name: None,
@@ -300,6 +315,9 @@ fn resolve_from_workbook() {
             kind: None,
             smooth: false,
             trendlines: Vec::new(),
+            line: None,
+            markers: None,
+            line_width: None,
         },
     ];
     let d = resolve(&wb, 0, &c);
@@ -316,6 +334,9 @@ fn resolve_from_workbook() {
         kind: None,
         smooth: false,
         trendlines: Vec::new(),
+        line: None,
+        markers: None,
+        line_width: None,
     }];
     let d = resolve(&wb, 0, &c);
     assert_eq!(d.series[0].x.as_ref().map(|x| x.len()), Some(3));
@@ -333,6 +354,9 @@ fn resolve_from_workbook() {
         kind: None,
         smooth: false,
         trendlines: Vec::new(),
+        line: None,
+        markers: None,
+        line_width: None,
     }];
     let d = resolve(&wb, 7, &c);
     assert_eq!(d.series.len(), 1);
@@ -630,6 +654,9 @@ fn fuzz_random_data_and_sizes() {
                         color: [0, 0, 0, 255],
                     })
                     .collect(),
+                line: [None, Some(true), Some(false)][(r.next() % 3) as usize],
+                markers: [None, Some(true), Some(false)][(r.next() % 3) as usize],
+                line_width: [None, Some(0.0), Some(f32::NAN), Some(-1.0), Some(1e9), Some(1.5)][(r.next() % 6) as usize],
                 number_format: ["General", "$#,##0", "0.00%", "yyyy-mm-dd", "#,##0.0;[Red]-#,##0.0", "@"][(r.next() % 6) as usize].into(),
             })
             .collect();
@@ -1003,6 +1030,9 @@ fn pie_points_follow_workbook_theme() {
         kind: None,
         smooth: false,
         trendlines: Vec::new(),
+        line: None,
+        markers: None,
+        line_width: None,
     }];
     let d = resolve(&wb, 0, &c);
     let expected = vec![series_color(&wb.theme, 0), series_color(&wb.theme, 1)];

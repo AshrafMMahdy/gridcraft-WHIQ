@@ -63,7 +63,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Insert Chart",
             ["Insert", "Charts"],
             None,
-            "{range?, type?: column|bar|line|pie|doughnut|area|scatter|bubble|radar|combo|histogram|waterfall|funnel|treemap|sunburst|boxWhisker|stock, subtype?: clustered|stacked|stacked100|markers, title?, at?: \"H2\", width?, height?}",
+            "{range?, type?: column|bar|line|pie|doughnut|area|scatter|bubble|radar|combo|histogram|waterfall|funnel|treemap|sunburst|boxWhisker|stock, subtype?: clustered|stacked|stacked100|markers|lines, title?, at?: \"H2\", width?, height?, scatter only: line?: bool, markers?: bool, lineWidth?: pt, color?: \"#RRGGBB\"}",
             has_doc,
             insert_chart
         ),
@@ -605,6 +605,9 @@ pub fn series_from_range(sh: &Sheet, r: RangeRef, by_rows: bool) -> Vec<Series> 
                 kind: None,
                 smooth: false,
                 trendlines: Vec::new(),
+                line: None,
+                markers: None,
+                line_width: None,
             });
         }
     } else {
@@ -620,6 +623,9 @@ pub fn series_from_range(sh: &Sheet, r: RangeRef, by_rows: bool) -> Vec<Series> 
                 kind: None,
                 smooth: false,
                 trendlines: Vec::new(),
+                line: None,
+                markers: None,
+                line_width: None,
             });
         }
     }
@@ -765,8 +771,57 @@ pub fn build_chart(s: &Session, p: &Json) -> Result<(usize, Chart)> {
     Ok((sheet, chart))
 }
 
+/// WHIQ: the scatter line options of a chart spec, `line`, `markers`, `line_width` (points,
+/// also `lineWidth`) and `color` ("#RRGGBB"), on the chart and on each of `per_series` (which
+/// win). `line_default` applies when neither says (build_workbook's `scatter`: true, Excel's
+/// "Scatter with Straight Lines and Markers"); markers default to on, except on a `ScatterLines`
+/// chart without a `line_default`. Every styled series gets its colour (the renderer's palette
+/// colour of its index when none is given), so the file and the rendered chart agree. Other
+/// chart kinds and specs without any of the options are left as they are.
+pub fn apply_scatter_lines(chart: &mut Chart, c: &Json, per_series: &[Json], line_default: Option<bool>, theme: &Theme) -> Result<()> {
+    if !matches!(chart.kind, ChartKind::Scatter | ChartKind::ScatterLines) {
+        return Ok(());
+    }
+    let width = |p: &Json| -> Result<Option<f32>> {
+        match f64_param(p, "line_width").or_else(|| f64_param(p, "lineWidth")) {
+            None => Ok(None),
+            Some(w) if w.is_finite() && w > 0.0 => Ok(Some(w.clamp(0.25, 20.0) as f32)),
+            Some(w) => Err(bad("chart", format!("`line_width` is a width in points above 0 (got {w}), e.g. 2.25"))),
+        }
+    };
+    let color = |p: &Json| -> Result<Option<Color>> {
+        match str_param(p, "color") {
+            None => Ok(None),
+            Some(h) => Color::from_hex(h).map(Some).ok_or_else(|| bad("chart", format!("`color` is \"#RRGGBB\" (got `{h}`)"))),
+        }
+    };
+    let any = |p: &Json| ["line", "markers", "line_width", "lineWidth"].iter().any(|k| p.get(*k).is_some_and(|v| !v.is_null()));
+    if line_default.is_none() && !any(c) && !per_series.iter().any(any) {
+        return Ok(());
+    }
+    let none = Json::Null;
+    let (c_line, c_markers, c_width, c_color) = (bool_param(c, "line"), bool_param(c, "markers"), width(c)?, color(c)?);
+    let lines_kind = chart.kind == ChartKind::ScatterLines;
+    for (i, se) in chart.series.iter_mut().enumerate() {
+        let sp = per_series.get(i).unwrap_or(&none);
+        let line = bool_param(sp, "line").or(c_line).or(line_default).unwrap_or(lines_kind);
+        let markers = bool_param(sp, "markers").or(c_markers).unwrap_or(!lines_kind || line_default.is_some());
+        se.line = Some(line);
+        se.markers = Some(markers);
+        se.line_width = width(sp)?.or(c_width);
+        if se.color.is_none() {
+            let [r, g, b, _] = gridcraft_chart::series_color(theme, i);
+            se.color = Some(c_color.unwrap_or(Color::rgb(r, g, b)));
+        }
+    }
+    chart.kind = if chart.series.iter().any(|x| x.line == Some(true)) { ChartKind::ScatterLines } else { ChartKind::Scatter };
+    Ok(())
+}
+
 fn insert_chart(s: &mut Session, p: &Json) -> Result<Json> {
-    let (sheet, chart) = build_chart(s, p)?;
+    let (sheet, mut chart) = build_chart(s, p)?;
+    let theme = s.doc()?.wb.theme.clone();
+    apply_scatter_lines(&mut chart, p, &[], None, &theme)?;
     let id = chart.id;
     edit(s, |cx| {
         cx.sheet_mut(sheet)?.charts.push(chart);

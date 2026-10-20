@@ -89,6 +89,54 @@ fn build_workbook_with_native_charts() {
     assert_eq!(m.ok("inspect_workbook", json!({}))["sheets"][0]["name"], "Sales");
 }
 
+/// WHIQ: a scatter chart (the platform's Line-of-Balance: one production line per trade) is a
+/// solid straight line per series, with markers unless `markers: false`; `line: false` keeps the
+/// markers-only scatter. Both build_workbook and insert_chart.
+#[test]
+fn scatter_charts_are_solid_lines_per_series() {
+    let dir = folder("scatter-lines");
+    let mut m = start(&dir, "LOB");
+    m.ok(
+        "build_workbook",
+        json!({
+            "path": "lob.xlsx",
+            "sheets": [{
+                "name": "LOB",
+                "header": ["Day", "Excavation", "Day", "Concrete"],
+                "rows": [[0, 1, 5, 1], [10, 20, 15, 20]],
+                "charts": [
+                    {"type": "scatter", "title": "Line of balance", "markers": false, "series": [
+                        {"name": "Excavation", "categories": "A2:A3", "values": "B2:B3", "color": "#2563EB"},
+                        {"name": "Concrete", "categories": "C2:C3", "values": "D2:D3", "line_width": 3}
+                    ]},
+                    {"type": "scatter", "line": false, "series": [{"categories": "A2:A3", "values": "B2:B3"}]}
+                ]
+            }]
+        }),
+    );
+    let path = dir.join("lob.xlsx");
+    let lob = zip_text(&path, "xl/charts/chart1.xml");
+    assert!(lob.contains("<c:scatterStyle val=\"lineMarker\"/>"), "{lob}");
+    assert!(lob.contains("<a:ln w=\"28575\" cap=\"rnd\"><a:solidFill><a:srgbClr val=\"2563EB\"/></a:solidFill>"), "{lob}");
+    assert!(lob.contains("<a:ln w=\"38100\" cap=\"rnd\"><a:solidFill><a:srgbClr"), "{lob}");
+    assert_eq!(lob.matches("<c:marker><c:symbol val=\"none\"/></c:marker>").count(), 2, "{lob}");
+    assert!(!lob.contains("noFill"), "{lob}");
+    let pts = zip_text(&path, "xl/charts/chart2.xml");
+    assert!(pts.contains("<a:noFill/>") && pts.contains("<c:symbol val=\"circle\"/>"), "markers only: {pts}");
+    // insert_chart: scatter = lines and markers by default; the options reach it.
+    m.ok("insert_chart", json!({"range": "A1:B3", "type": "scatter", "title": "Default", "at": "H2"}));
+    m.ok("insert_chart", json!({"range": "A1:B3", "type": "scatter", "markers": false, "line_width": 1.5, "color": "#E11D48", "at": "H20"}));
+    m.ok("save_workbook", json!({"path": "lob.xlsx"}));
+    let all: Vec<String> = (1..=4).map(|c| zip_text(&path, &format!("xl/charts/chart{c}.xml"))).collect();
+    let default = all.iter().find(|x| x.contains("Default")).unwrap();
+    assert!(default.contains("cap=\"rnd\"><a:solidFill>") && default.contains("<c:symbol val=\"circle\"/>"), "{default}");
+    assert!(
+        all.iter()
+            .any(|x| x.contains("<a:ln w=\"19050\" cap=\"rnd\"><a:solidFill><a:srgbClr val=\"E11D48\"/>") && x.contains("<c:symbol val=\"none\"/>")),
+        "{all:?}"
+    );
+}
+
 #[test]
 fn recalculate_reports_formulas_and_errors() {
     let dir = folder("recalc");

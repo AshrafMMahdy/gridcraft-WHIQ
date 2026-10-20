@@ -236,6 +236,9 @@ pub fn resolve(wb: &Workbook, sheet: usize, chart: &Chart) -> ChartData {
             secondary: s.secondary,
             smooth: s.smooth,
             trendlines,
+            line: s.line,
+            markers: s.markers,
+            line_width: s.line_width,
             number_format: ref_format(wb, sheet, &s.values),
         });
     }

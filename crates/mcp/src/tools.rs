@@ -303,14 +303,20 @@ fn base_definitions() -> Vec<Value> {
         tool(
             "insert_chart",
             "Insert chart",
-            "Insert a chart from a data range (first row/column used as series names and categories, like Excel). Returns the chart id.",
+            "Insert a chart from a data range (first row/column used as series names and categories, like Excel). Returns the chart id. \
+             Scatter charts draw each series as a solid straight line with markers (Excel's \"Scatter with Straight Lines and \
+             Markers\") unless `line` / `markers` say otherwise; `line_width` and `color` style every series' line.",
             obj(
                 json!({
                     "range": string("Source data range including headers, e.g. \"A1:C6\""),
                     "type": enumeration("Chart type", CHART_TYPES),
-                    "subtype": enumeration("Variant (optional)", &["clustered", "stacked", "stacked100", "markers"]),
+                    "subtype": enumeration("Variant (optional); scatter: lines = straight lines without markers", &["clustered", "stacked", "stacked100", "markers", "lines"]),
                     "title": string("Chart title"),
                     "at": string("Top-left anchor cell (default: right of the data)"),
+                    "line": boolean("Scatter: draw a solid straight line through each series' points (default true; false = markers only)"),
+                    "markers": boolean("Scatter: draw a marker at each point (default true; false = the line alone)"),
+                    "line_width": {"type": "number", "exclusiveMinimum": 0, "maximum": 20, "description": "Scatter: line width in points (default 2.25)"},
+                    "color": color("Scatter: one line/marker color \"#RRGGBB\" for every series (default: the theme's accent colors, one per series)"),
                 }),
                 &["range", "type"],
             ),
@@ -668,7 +674,16 @@ pub(crate) fn dispatch(b: &mut dyn Backend, name: &str, a: &Args) -> Result<Valu
         }
         "select" => exec(b, "selection.set", pick(a, &["range", "active"])),
         "format_range" => format_range(b, a),
-        "insert_chart" => exec(b, "insert.chart", pick(a, &["range", "type", "subtype", "title", "at"])),
+        "insert_chart" => {
+            let mut p = pick(a, &["range", "type", "subtype", "title", "at", "line", "markers", "line_width", "color"]);
+            // WHIQ: a scatter chart is drawn with straight lines unless `line: false` (or subtype lines, no markers).
+            let scatter = p.get("type").and_then(Value::as_str).is_some_and(|t| t.eq_ignore_ascii_case("scatter"));
+            let subtype = p.get("subtype").and_then(Value::as_str).unwrap_or("");
+            if scatter && p.get("line").is_none() && !subtype.eq_ignore_ascii_case("lines") {
+                p["line"] = json!(true);
+            }
+            exec(b, "insert.chart", p)
+        }
         "create_table" => exec(b, "insert.table", pick(a, &["range", "style", "header", "name"])),
         "sort_range" => sort_range(b, a),
         "filter" => filter(b, a),

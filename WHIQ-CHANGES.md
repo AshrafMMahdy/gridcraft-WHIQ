@@ -398,6 +398,54 @@ is that file with the real hashes.
 - musl: `cargo build --release --locked -p gridcraft-cli --target x86_64-unknown-linux-musl` gives a
   `static-pie linked` binary; the contract suite (26/26) and `smoke.sh` pass on it.
 
+## Scatter charts with solid lines (2026-10-20)
+
+The platform's Line-of-Balance chart needs one solid production line per trade. Until now a
+`build_workbook` / `insert_chart` scatter wrote every series as markers only (`a:ln` with
+`a:noFill`), and a `scatter_lines` series without a colour wrote no `a:ln` at all.
+
+- **Options**, on the chart or on one series (a series' own wins): `line: true|false` (default
+  **true** for `scatter` / `xy`: Excel's "Scatter with Straight Lines and Markers"; `false` is the
+  old markers-only scatter), `markers: true|false` (default true), `line_width` (points, also
+  `lineWidth`; default 2.25, 0.25–20) and `color` (`"#RRGGBB"`; per series as before, on the chart
+  it colours every series that has none). `insert_chart` takes the same four (chart-level); the
+  MCP tool defaults `line` to true for `type: scatter` (subtype `lines` stays lines without
+  markers). The engine's `insert.chart` without these params is unchanged (the desktop app's
+  Insert › Scatter is still markers only). Documented in the `build_workbook` and `insert_chart`
+  tool schemas and `insert.chart`'s params.
+- **Model**: `Series::{line, markers, line_width}` (`Option`, serde default; `None` = what the
+  chart kind draws, so every existing chart and file is written exactly as before).
+  `engine::cmd::insert::apply_scatter_lines` resolves the options; a styled series without a
+  colour gets the renderer's palette colour of its index, so the file and the rendered PNG agree.
+- **XLSX** (`crates/xlsx/src/chart.rs`): a styled scatter series writes `<c:scatterStyle
+  val="lineMarker"/>`, `<c:spPr><a:ln w=… cap="rnd"><a:solidFill>…</a:solidFill><a:round/></a:ln></c:spPr>`
+  (or `a:noFill` when `line: false`), and `<c:marker><c:symbol val="none"/></c:marker>` (markers
+  off) or a circle marker in the series colour. Reading keeps width, markers and line where they
+  differ from the group's kind. Excel and LibreOffice both draw the line from `a:ln`. Other chart
+  types are untouched.
+- **Render** (`crates/chart`): the scatter renderer and legend swatches follow a series' `line`,
+  `markers` and `line_width`.
+- Tests: xlsx `scatter_lines::*` (solid `a:ln` per series, widths, `symbol none`, palette
+  fallback, read-back; unstyled and markers-only scatters keep their XML), engine
+  `build::tests::scatter_charts_draw_lines_unless_told_otherwise` (defaults, chart- and
+  series-level options, `line: false`, other kinds untouched, saved XML, read-back, a bad
+  `line_width` names the argument), contract `authoring::scatter_charts_are_solid_lines_per_series`
+  (build_workbook and insert_chart over MCP stdio), and the chart crate's fuzz test with random
+  `line` / `markers` / `line_width`. `platform_chart_specs_are_understood` now expects the
+  platform's `kind: scatter` to come out as `ScatterLines`. Reading a `lineMarker` series with a
+  solid `a:ln` and `c:symbol none` keeps `markers: false`, so GridCraft's own render of a saved
+  file draws no markers either.
+- Also: `tests/mcp-contract/harness.rs` `plain_path` collapsed to a let-chain (clippy
+  `collapsible_if` failed `-D warnings` on the previous commit) and `tests/mcp-contract/render.rs`
+  `cargo fmt`-ed.
+- Status (Linux x86_64, 2026-10-20, craft-fonts 43913056, `CRAFT_FONTS_REQUIRED=1`): every default
+  member's tests pass, 1 691 passed, 0 failed, 1 ignored (run one package / test target at a time
+  on a small disk), `cargo clippy --workspace --all-targets -D warnings`, `cargo fmt --check`,
+  `cargo xtask layers / assets / wasm`, and `tests/mcp-contract/smoke.sh` on the release binary
+  (35/35). Proof: `build_workbook` over MCP stdio with a two-series scatter writes one solid
+  round-capped `a:ln` per series (`w="28575"` and `w="38100"`, `symbol none` on the second);
+  LibreOffice 24 (PDF export) and `gridcraft-cli render` both draw the two lines.
+
 ## Tests
 
 - `cargo test` runs everything; the WHIQ-specific suites:
