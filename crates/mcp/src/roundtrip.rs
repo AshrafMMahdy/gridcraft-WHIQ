@@ -11,25 +11,43 @@ use std::io::Read;
 
 use serde_json::{Value, json};
 
-/// Parts by name (as stored), with their bytes.
-fn parts(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, String> {
-    let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|e| format!("not a package: {e}"))?;
+/// One part of a package: its unpacked size and CRC-32 from the zip's directory (binary parts are
+/// compared by these, never inflated), and the bytes of an XML part.
+#[derive(PartialEq)]
+struct PartInfo {
+    size: u64,
+    crc: u32,
+    xml: Option<Vec<u8>>,
+}
+
+/// WHIQ: parts by name (as stored). Binary parts (media, embeddings) are not inflated: the zip
+/// directory's size and CRC-32 identify their bytes, so a 600 MB video costs nothing to compare.
+/// XML parts are inflated, each within a share of the memory budget (a larger one is an error
+/// that says so, never a silent pass).
+fn parts<R: Read + std::io::Seek>(r: R) -> Result<BTreeMap<String, PartInfo>, String> {
+    let mut z = zip::ZipArchive::new(r).map_err(|e| format!("not a package: {e}"))?;
+    let per_part = (gridcraft_engine::core::memory::budget() / 4).max(96 << 20);
     let mut out = BTreeMap::new();
-    let mut total = 0u64;
     for i in 0..z.len() {
-        let mut f = z.by_index(i).map_err(|e| format!("unreadable part: {e}"))?;
-        if f.is_dir() {
-            continue;
-        }
-        let name = f.name().trim_start_matches('/').to_string();
-        let mut b = Vec::new();
-        // Bounded: a package that inflates past 2 GB is not compared.
-        f.by_ref().take(2u64 << 30).read_to_end(&mut b).map_err(|e| format!("{name}: {e}"))?;
-        total += b.len() as u64;
-        if total > 2u64 << 30 {
-            return Err("the package is too large to compare (over 2 GB unpacked)".into());
-        }
-        out.insert(name, b);
+        let (name, size, crc) = {
+            let f = z.by_index_raw(i).map_err(|e| format!("unreadable part: {e}"))?;
+            if f.is_dir() {
+                continue;
+            }
+            (f.name().trim_start_matches('/').to_string(), f.size(), f.crc32())
+        };
+        let xml = if is_xml(&name) {
+            if size > per_part {
+                return Err(format!("XML part {name} ({} MB) is larger than this process compares in memory ({} MB)", size >> 20, per_part >> 20));
+            }
+            let mut f = z.by_index(i).map_err(|e| format!("unreadable part: {e}"))?;
+            let mut b = Vec::with_capacity(size.min(16 << 20) as usize);
+            f.by_ref().take(per_part.saturating_add(1)).read_to_end(&mut b).map_err(|e| format!("{name}: {e}"))?;
+            Some(b)
+        } else {
+            None
+        };
+        out.insert(name, PartInfo { size, crc, xml });
     }
     Ok(out)
 }
@@ -123,10 +141,16 @@ fn compared_xml(name: &str) -> bool {
 }
 
 /// Compare a package with the one saved from it. `Err` when either is not a package.
+#[cfg(test)]
 pub fn compare(before: &[u8], after: &[u8]) -> Result<Value, String> {
+    compare_readers(std::io::Cursor::new(before), std::io::Cursor::new(after))
+}
+
+/// WHIQ: [`compare`] on open files (neither package is read whole into memory).
+pub fn compare_readers<A: Read + std::io::Seek, B: Read + std::io::Seek>(before: A, after: B) -> Result<Value, String> {
     let a = parts(before)?;
     let b = parts(after)?;
-    let lower = |m: &BTreeMap<String, Vec<u8>>| -> BTreeMap<String, String> { m.keys().map(|k| (k.to_ascii_lowercase(), k.clone())).collect() };
+    let lower = |m: &BTreeMap<String, PartInfo>| -> BTreeMap<String, String> { m.keys().map(|k| (k.to_ascii_lowercase(), k.clone())).collect() };
     let (la, lb) = (lower(&a), lower(&b));
     let mut missing: Vec<String> = la.iter().filter(|(k, _)| !lb.contains_key(*k)).map(|(_, v)| v.clone()).collect();
     let mut added: Vec<String> = lb.iter().filter(|(k, _)| !la.contains_key(*k)).map(|(_, v)| v.clone()).collect();
@@ -160,9 +184,10 @@ pub fn compare(before: &[u8], after: &[u8]) -> Result<Value, String> {
         }
     }
     // Relationships: (source, type, target) before that are not there after.
-    let rels_of = |m: &BTreeMap<String, Vec<u8>>, map: &dyn Fn(&str) -> String| -> BTreeSet<(String, String, String)> {
+    let rels_of = |m: &BTreeMap<String, PartInfo>, map: &dyn Fn(&str) -> String| -> BTreeSet<(String, String, String)> {
         let mut out = BTreeSet::new();
-        for (name, bytes) in m {
+        for (name, info) in m {
+            let Some(bytes) = info.xml.as_deref() else { continue };
             if !name.to_ascii_lowercase().ends_with(".rels") {
                 continue;
             }
@@ -181,8 +206,8 @@ pub fn compare(before: &[u8], after: &[u8]) -> Result<Value, String> {
     let rb = rels_of(&b, &|n: &str| n.to_ascii_lowercase());
     let missing_rels: Vec<String> = ra.difference(&rb).map(|(s, t, x)| format!("{s} -> {x} ({t})")).collect();
     // Content types of parts kept.
-    let types = |m: &BTreeMap<String, Vec<u8>>| -> (BTreeMap<String, String>, BTreeMap<String, String>) {
-        let ct = m.get("[Content_Types].xml").map(Vec::as_slice).unwrap_or(&[]);
+    let types = |m: &BTreeMap<String, PartInfo>| -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+        let ct = m.get("[Content_Types].xml").and_then(|p| p.xml.as_deref()).unwrap_or(&[]);
         let defaults = elements_with_attrs(ct, "Default")
             .into_iter()
             .filter_map(|d| Some((d.get("Extension")?.to_ascii_lowercase(), d.get("ContentType")?.clone())))
@@ -217,7 +242,7 @@ pub fn compare(before: &[u8], after: &[u8]) -> Result<Value, String> {
             continue;
         }
         let Some(other) = lb.get(&after_name(k)) else { continue };
-        let (Some(x), Some(y)) = (a.get(name), b.get(other)) else { continue };
+        let (Some(x), Some(y)) = (a.get(name).and_then(|p| p.xml.as_deref()), b.get(other).and_then(|p| p.xml.as_deref())) else { continue };
         let (ix, iy) = (inventory(x), inventory(y));
         let losses: Vec<String> = ix
             .iter()

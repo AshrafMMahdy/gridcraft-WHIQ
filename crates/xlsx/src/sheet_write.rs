@@ -9,6 +9,7 @@ use gridcraft_model::{
     TotalsFn, Validation, ValidationKind, Workbook, default_icon_thresholds, icon_count,
 };
 
+use crate::IoError;
 use crate::drawing::{Obj, image_content_type, image_ext};
 use crate::fmla::text_to_file;
 use crate::styles::{color_attrs, dxf_id};
@@ -70,9 +71,43 @@ fn table_columns(t: &Table) -> Vec<String> {
         .collect()
 }
 
-pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (String, Rels) {
+/// WHIQ: the sheet's XML is written into `w` as it is made, flushed every few megabytes, so a
+/// sheet of millions of cells never sits in memory as one string. Returns its relationships.
+pub fn write_sheet_into(wb: &Workbook, si: usize, selected: bool, out: &mut Out, w: &mut dyn std::io::Write) -> Result<Rels, IoError> {
+    let mut sink = Sink { w, err: None };
+    let rels = write_sheet_with(wb, si, selected, out, &mut sink);
+    match sink.err {
+        Some(e) => Err(IoError::Zip(format!("writing sheet {}: {e}", si + 1))),
+        None => Ok(rels),
+    }
+}
+
+/// Where a sheet's XML goes, a few megabytes at a time; the first write error is kept.
+struct Sink<'w> {
+    w: &'w mut dyn std::io::Write,
+    err: Option<std::io::Error>,
+}
+
+impl Sink<'_> {
+    /// Writes out `s` (and empties it) when it holds more than `at` bytes.
+    fn flush(&mut self, s: &mut String, at: usize) {
+        if s.len() > at {
+            if self.err.is_none()
+                && let Err(e) = self.w.write_all(s.as_bytes())
+            {
+                self.err = Some(e);
+            }
+            s.clear();
+        }
+    }
+}
+
+/// Bytes of XML a sheet writer holds before handing them on.
+const FLUSH_AT: usize = 4 << 20;
+
+fn write_sheet_with(wb: &Workbook, si: usize, selected: bool, out: &mut Out, sink: &mut Sink<'_>) -> Rels {
     let mut rels = Rels::default();
-    let Some(sheet) = wb.sheet(si) else { return (String::new(), rels) };
+    let Some(sheet) = wb.sheet(si) else { return rels };
     let nstyles = wb.styles.len() as u32;
     let sid = |s: gridcraft_model::StyleId| if s.0 < nstyles { s.0 } else { 0 };
 
@@ -256,20 +291,33 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (
         s.push_str("</cols>");
     }
 
-    // sheetData
-    let mut keys: BTreeSet<CellRef> = sheet.cells.iter().map(|(c, _)| c).collect();
-    keys.extend(sheet.cell_pictures.keys().copied());
-    keys.extend(extra.keys().copied());
-    keys.extend(overrides.keys().copied());
-    let mut rows: BTreeMap<u32, Vec<CellRef>> = BTreeMap::new();
-    for k in keys {
-        rows.entry(k.row).or_default().push(k);
-    }
-    for r in sheet.rows.keys() {
-        rows.entry(*r).or_default();
-    }
+    // sheetData. WHIQ: rows come in order from the cell store merged with the few cells that
+    // live elsewhere (pictures, spilled values, table headers) and the formatted empty rows,
+    // without first listing every cell (that list cost about 40 bytes a cell for the save).
+    let side: BTreeSet<CellRef> = sheet.cell_pictures.keys().chain(extra.keys()).chain(overrides.keys()).copied().collect();
+    let mut stored = sheet.cells.iter().map(|(c, _)| c).peekable();
+    let mut side = side.into_iter().peekable();
+    let mut formatted = sheet.rows.keys().copied().peekable();
     s.push_str("<sheetData>");
-    for (r, cells) in &rows {
+    loop {
+        let next = [stored.peek().map(|c| c.row), side.peek().map(|c| c.row), formatted.peek().copied()].into_iter().flatten().min();
+        let Some(r) = next else { break };
+        let mut cells: Vec<CellRef> = Vec::new();
+        while let Some(c) = stored.next_if(|c| c.row == r) {
+            cells.push(c);
+        }
+        let mut merged = false;
+        while let Some(c) = side.next_if(|c| c.row == r) {
+            cells.push(c);
+            merged = true;
+        }
+        if merged {
+            cells.sort_unstable();
+            cells.dedup();
+        }
+        while formatted.next_if(|f| *f == r).is_some() {}
+        let (r, cells) = (&r, &cells);
+        sink.flush(&mut s, FLUSH_AT);
         let info = sheet.rows.get(r).copied().unwrap_or_default();
         if cells.is_empty() && info == LineInfo::default() {
             continue;
@@ -638,7 +686,8 @@ pub fn write_sheet(wb: &Workbook, si: usize, selected: bool, out: &mut Out) -> (
         s.push_str("</extLst>");
     }
     s.push_str("</worksheet>");
-    (s, rels)
+    sink.flush(&mut s, 0);
+    rels
 }
 
 fn write_cell(

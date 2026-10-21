@@ -13,7 +13,7 @@ pub fn specs() -> Vec<CommandSpec> {
         cmd!(noundo "file.saveAs", "Save As…", ["File"], Some("Cmd+Shift+S"), "{path} (.xlsx, .csv, .tsv, .json, .html, or .pdf: a PDF of the active sheet)", has_doc, save_as),
         cmd!(query "file.saveBytes", "Encode Workbook", [], None, "{format?: xlsx|csv|tsv|json|html} → {base64}", has_doc, save_bytes),
         cmd!(noundo "file.close", "Close", ["File"], Some("Cmd+W"), "{force?: bool}", has_doc, close),
-        cmd!(noundo "file.exportCsv", "Export as CSV", ["File", "Export"], None, "{path, sheet?}", has_doc, |s, p| export(s, p, "csv")),
+        cmd!(noundo "file.exportCsv", "Export as CSV", ["File", "Export"], None, "{path, sheet?, range?} (range: only those cells, e.g. \"A1:L500000\"; streamed, no size limit)", has_doc, |s, p| export(s, p, "csv")),
         cmd!(noundo "file.exportHtml", "Save as Web Page", ["File", "Export"], None, "{path}", has_doc, |s, p| export(s, p, "html")),
         cmd!(
             "file.properties",
@@ -50,6 +50,16 @@ fn new_workbook(s: &mut Session, p: &Json) -> Result<Json> {
 }
 
 fn open(s: &mut Session, p: &Json) -> Result<Json> {
+    // WHIQ: an .xlsx package is read straight from its file (never whole into memory; its
+    // sheets stream from the zip). Everything else is read as bytes.
+    #[cfg(not(target_arch = "wasm32"))]
+    if str_param(p, "base64").is_none()
+        && let Some(path) = str_param(p, "path")
+        && !s.documents().iter().any(|d| d.path.as_deref() == Some(path))
+        && let Some((wb, warnings)) = crate::io::open_xlsx_file(path)?
+    {
+        return adopt_opened(s, p, path.to_string(), wb, warnings, false, false, gridcraft_xlsx::Format::Xlsx);
+    }
     let (name, bytes) = if let Some(b) = str_param(p, "base64") {
         (str_param(p, "name").unwrap_or("Book.xlsx").to_string(), crate::io::base64_decode(b).ok_or_else(|| bad("file.open", "invalid base64"))?)
     } else if let Some(path) = str_param(p, "path") {
@@ -63,12 +73,29 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
         s.ui_requests.push(crate::UiRequest::Dialog("open".into(), json!({})));
         return ok();
     };
-    let encrypted = gridcraft_xlsx::sniff(&bytes) == gridcraft_xlsx::Format::Encrypted;
-    let (mut wb, warnings) = crate::io::open_bytes_with_password(&name, &bytes, str_param(p, "password"))?;
-    wb.source_dir = str_param(p, "path").and_then(crate::io::source_dir);
+    let sniffed = gridcraft_xlsx::sniff(&bytes);
+    let encrypted = sniffed == gridcraft_xlsx::Format::Encrypted;
+    let (wb, warnings) = crate::io::open_bytes_with_password(&name, &bytes, str_param(p, "password"))?;
+    drop(bytes);
     let imported =
         matches!(crate::io::FileKind::from_path(&name), Some(crate::io::FileKind::Ods | crate::io::FileKind::Xlsb | crate::io::FileKind::Xls))
-            || matches!(gridcraft_xlsx::sniff(&bytes), gridcraft_xlsx::Format::Ods | gridcraft_xlsx::Format::Xlsb | gridcraft_xlsx::Format::Xls);
+            || matches!(sniffed, gridcraft_xlsx::Format::Ods | gridcraft_xlsx::Format::Xlsb | gridcraft_xlsx::Format::Xls);
+    adopt_opened(s, p, name, wb, warnings, imported, encrypted, sniffed)
+}
+
+/// The shared end of `file.open`: the read workbook becomes a document.
+#[allow(clippy::too_many_arguments)]
+fn adopt_opened(
+    s: &mut Session,
+    p: &Json,
+    name: String,
+    mut wb: gridcraft_model::Workbook,
+    warnings: Vec<String>,
+    imported: bool,
+    encrypted: bool,
+    sniffed: gridcraft_xlsx::Format,
+) -> Result<Json> {
+    wb.source_dir = str_param(p, "path").and_then(crate::io::source_dir);
     let title = if imported {
         format!("{} (imported).xlsx", std::path::Path::new(&name).file_stem().and_then(|n| n.to_str()).unwrap_or("Book"))
     } else {
@@ -85,7 +112,7 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
         s.close_document(0);
     }
     let mut doc = DocState::new(wb, path, title);
-    if crate::io::FileKind::from_path(&name).is_none() && gridcraft_xlsx::sniff(&bytes) == gridcraft_xlsx::Format::Xlsx {
+    if crate::io::FileKind::from_path(&name).is_none() && sniffed == gridcraft_xlsx::Format::Xlsx {
         doc.content_kind = Some(crate::io::FileKind::Xlsx);
     }
     let i = s.add_document(doc);
@@ -123,17 +150,14 @@ fn save(s: &mut Session, p: &Json) -> Result<Json> {
     let kind = crate::io::FileKind::from_path(&path).or(d.content_kind.filter(|_| d.path.as_deref() == Some(path.as_str())));
     let rebased = crate::io::source_dir(&path).and_then(|f| gridcraft_xlsx::rebase_links(&d.wb, &f));
     let wb = rebased.as_ref().unwrap_or(&d.wb);
-    let bytes = match kind {
-        Some(kind) => crate::io::save_bytes_as(wb, &path, kind)?,
-        None => crate::io::save_bytes(wb, &path)?,
-    };
-    crate::io::write_file(&path, &bytes)?;
+    // WHIQ: an .xlsx streams into the file.
+    let bytes = crate::io::save_to_path(wb, &path, kind)?;
     // Only a full-fidelity format clears the dirty flag and becomes the document's file.
     if matches!(kind, Some(crate::io::FileKind::Xlsx | crate::io::FileKind::Json)) {
         d.saved = d.wb.clone();
         d.path = Some(path.clone());
     }
-    Ok(json!({"path": path, "bytes": bytes.len()}))
+    Ok(json!({"path": path, "bytes": bytes}))
 }
 
 fn save_as(s: &mut Session, p: &Json) -> Result<Json> {
@@ -172,9 +196,19 @@ fn export(s: &mut Session, p: &Json, ext: &str) -> Result<Json> {
         wb.active_sheet = target_sheet(s, p)?;
     }
     let target = if path.ends_with(&format!(".{ext}")) { path.clone() } else { format!("{path}.{ext}") };
-    let bytes = crate::io::save_bytes(&wb, &target)?;
-    crate::io::write_file(&target, &bytes)?;
-    Ok(json!({"path": target, "bytes": bytes.len()}))
+    // WHIQ: `range` exports only those cells (the bulk read: read_range with `path`), streamed.
+    #[cfg(not(target_arch = "wasm32"))]
+    if ext == "csv"
+        && let Some(text) = str_param(p, "range")
+    {
+        let r = gridcraft_core::RangeRef::parse(text.rsplit('!').next().unwrap_or(text))
+            .ok_or_else(|| bad("file.exportCsv", format!("`{text}` is not a range (e.g. A1:L500000)")))?;
+        let sh = wb.sheet(wb.active_sheet).ok_or_else(|| bad("file.exportCsv", "no such sheet"))?;
+        let (rows, bytes) = crate::io::export_csv_range(&wb, sh, Some(r), wb.csv_delimiter.unwrap_or(b','), &target)?;
+        return Ok(json!({"path": target, "bytes": bytes, "range": r.a1(), "rows": rows, "columns": r.width()}));
+    }
+    let bytes = crate::io::save_to_path(&wb, &target, None)?;
+    Ok(json!({"path": target, "bytes": bytes}))
 }
 
 fn properties(s: &mut Session, p: &Json) -> Result<Json> {

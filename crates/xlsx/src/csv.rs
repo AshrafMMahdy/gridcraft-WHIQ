@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use gridcraft_core::parse::parse_input;
-use gridcraft_core::{CellRef, MAX_COLS, MAX_ROWS, Value};
+use gridcraft_core::{CellRef, MAX_COLS, MAX_ROWS, RangeRef, Value};
 use gridcraft_model::{Cell, NumFmt, Sheet, StyleId, Workbook};
 
 use crate::{CsvOptions, IoError};
@@ -198,6 +198,41 @@ pub fn read_csv(bytes: &[u8], opts: &CsvOptions) -> Result<Workbook, IoError> {
 /// its place.
 pub fn write_csv(sheet: &Sheet, delimiter: u8, cell_text: impl FnMut(CellRef) -> String) -> Result<Vec<u8>, IoError> {
     write_csv_limited(sheet, delimiter, MAX_CSV_BYTES, cell_text)
+}
+
+/// WHIQ: the cells of `range` as CSV streamed into `w` a row at a time: no size cap (the disk is
+/// the bound) and nothing held but one row. Returns the rows written.
+pub fn write_csv_range_into(
+    range: RangeRef,
+    delimiter: u8,
+    w: &mut dyn std::io::Write,
+    mut cell_text: impl FnMut(CellRef) -> String,
+) -> Result<u64, IoError> {
+    let delim = if delimiter == 0 { ',' } else { delimiter as char };
+    let mut line = String::new();
+    let mut rows = 0u64;
+    for row in range.start.row..=range.end.row {
+        // WHIQ: a safe point for `cancel` in a long export.
+        gridcraft_core::cancel::checkpoint();
+        line.clear();
+        for col in range.start.col..=range.end.col {
+            if col > range.start.col {
+                line.push(delim);
+            }
+            let t = cell_text(CellRef::new(row, col));
+            if t.contains(delim) || t.contains('"') || t.contains('\n') || t.contains('\r') {
+                line.push('"');
+                line.push_str(&t.replace('"', "\"\""));
+                line.push('"');
+            } else {
+                line.push_str(&t);
+            }
+        }
+        line.push_str("\r\n");
+        w.write_all(line.as_bytes()).map_err(|e| IoError::Zip(format!("writing the CSV: {e}")))?;
+        rows += 1;
+    }
+    Ok(rows)
 }
 
 /// [`write_csv`] with the output cap `limit` (bytes) given.

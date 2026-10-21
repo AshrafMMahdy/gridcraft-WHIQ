@@ -46,7 +46,7 @@ use gridcraft_core::DateSystem;
 use gridcraft_model::Workbook;
 
 pub use crypto::{DecryptError, check_encryption, decrypt};
-pub use csv::{MAX_CSV_BYTES, read_csv, write_csv, write_csv_limited};
+pub use csv::{MAX_CSV_BYTES, read_csv, write_csv, write_csv_limited, write_csv_range_into};
 pub use ods::read_ods;
 pub use passthrough::rebase_links;
 pub use xls::read_xls;
@@ -84,6 +84,36 @@ impl ReadReport {
 /// package relationships, so every main-part content type is accepted).
 pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
     read::read_xlsx(bytes)
+}
+
+/// WHIQ: [`read_xlsx`] from an open file (never read whole into memory; sheets stream).
+pub fn read_xlsx_file(file: std::fs::File) -> Result<(Workbook, ReadReport), IoError> {
+    read::read_xlsx_file(file)
+}
+
+/// WHIQ: [`sniff`] on an open file: its first bytes, and for a zip its directory only.
+pub fn sniff_file(file: &std::fs::File) -> Format {
+    use std::io::{Read, Seek};
+    let Ok(mut f) = file.try_clone() else { return Format::Unknown };
+    let mut head = Vec::with_capacity(8);
+    if f.seek(std::io::SeekFrom::Start(0)).is_err() || (&mut f).take(8).read_to_end(&mut head).is_err() {
+        return Format::Unknown;
+    }
+    let _ = f.seek(std::io::SeekFrom::Start(0));
+    if !(head.starts_with(b"PK\x03\x04") || head.starts_with(b"PK\x05\x06") || head.starts_with(b"PK\x07\x08")) {
+        // Not a zip: the caller reads the bytes (CSV, legacy binary…).
+        return Format::Unknown;
+    }
+    let Ok(mut pkg) = package::Package::open_file(f) else { return Format::Unknown };
+    if pkg.has("mimetype") {
+        // OpenDocument (or something else carrying a mimetype member): the byte sniff decides.
+        return Format::Unknown;
+    }
+    if pkg.has("xl/workbook.bin") {
+        return Format::Xlsb;
+    }
+    let _ = pkg.rels("");
+    Format::Xlsx
 }
 
 /// Which member of the SpreadsheetML family a package is saved as. Only the content type of the
@@ -137,6 +167,12 @@ pub fn write_xlsx(wb: &Workbook) -> Result<Vec<u8>, IoError> {
 /// Writes a workbook as the given member of the `.xlsx` family.
 pub fn write_xlsx_as(wb: &Workbook, kind: XlsxKind) -> Result<Vec<u8>, IoError> {
     write::write_xlsx(wb, kind)
+}
+
+/// WHIQ: [`write_xlsx_as`] straight into `w` (a file): sheets are compressed row by row, and
+/// neither their XML nor the package is held whole in memory.
+pub fn write_xlsx_into<W: std::io::Write + std::io::Seek>(wb: &Workbook, kind: XlsxKind, w: &mut W) -> Result<(), IoError> {
+    write::write_xlsx_into(wb, kind, w)
 }
 
 /// CSV import options.
@@ -208,4 +244,62 @@ pub fn sniff(bytes: &[u8]) -> Format {
         return Format::Unknown;
     }
     Format::Csv
+}
+
+#[cfg(test)]
+mod whiq_stream_tests {
+    //! WHIQ: workbooks stream through the reader and the writer: neither the file, a sheet's XML
+    //! nor the package is held whole, and the result is what the in-memory path gives.
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use gridcraft_core::{CellRef, Value};
+    use gridcraft_model::{Cell, Workbook};
+
+    fn big_book(rows: u32) -> Workbook {
+        let mut wb = Workbook::new();
+        let sh = wb.sheet_mut(0).unwrap();
+        for r in 0..rows {
+            sh.cells.set(CellRef::new(r, 0), Cell::value(Value::from(format!("item {r} of a long bill of quantities").as_str())));
+            sh.cells.set(CellRef::new(r, 1), Cell::value(Value::Number(f64::from(r) * 1.5)));
+            sh.cells.set(CellRef::new(r, 2), Cell::formula(gridcraft_model::Formula::new(&format!("=B{}*2", r + 1))));
+        }
+        wb
+    }
+
+    #[test]
+    fn a_workbook_written_into_a_file_and_read_from_it_is_the_in_memory_one() {
+        // Enough rows that the sheet's XML is flushed to the staging zip several times (4 MB each).
+        let wb = big_book(60_000);
+        let bytes = crate::write_xlsx(&wb).unwrap();
+        let dir = std::env::temp_dir().join(format!("gc-stream-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.xlsx");
+        {
+            let mut f = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+            crate::write_xlsx_into(&wb, crate::XlsxKind::Workbook, &mut f).unwrap();
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "the streamed package is byte for byte the in-memory one");
+        let file = std::fs::File::open(&path).unwrap();
+        assert_eq!(crate::sniff_file(&file), crate::Format::Xlsx);
+        let (back, report) = crate::read_xlsx_file(file).unwrap();
+        let (mem, _) = crate::read_xlsx(&bytes).unwrap();
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        let (a, b) = (back.sheet(0).unwrap(), mem.sheet(0).unwrap());
+        assert_eq!(a.cells.len(), 180_000);
+        assert_eq!(a.cells, b.cells, "read from the file = read from bytes");
+        assert_eq!(a.cells.get(CellRef::new(59_999, 0)).unwrap().value, Value::from("item 59999 of a long bill of quantities"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_range_streams_out_as_csv() {
+        let wb = big_book(3);
+        let sh = wb.sheet(0).unwrap();
+        let mut out = Vec::new();
+        let r = gridcraft_core::RangeRef::parse("A1:B3").unwrap();
+        let rows = crate::write_csv_range_into(r, b',', &mut out, |c| sh.value(c).display()).unwrap();
+        assert_eq!(rows, 3);
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.lines().count(), 3);
+        assert!(text.starts_with("item 0 of a long bill of quantities,0\r\n"), "{text}");
+    }
 }

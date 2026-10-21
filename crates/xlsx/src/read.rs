@@ -74,7 +74,16 @@ pub fn find_rel<'r>(rels: &'r [Rel], kind: &str) -> Option<&'r Rel> {
 }
 
 pub fn read_xlsx(bytes: &[u8]) -> Result<(Workbook, ReadReport), IoError> {
-    let pkg = Package::open(bytes)?;
+    read_package(Package::open(bytes)?)
+}
+
+/// WHIQ: [`read_xlsx`] straight from the file: the file is never read whole, and each sheet
+/// streams from the zip.
+pub fn read_xlsx_file(file: std::fs::File) -> Result<(Workbook, ReadReport), IoError> {
+    read_package(Package::open_file(file)?)
+}
+
+fn read_package(pkg: Package<'_>) -> Result<(Workbook, ReadReport), IoError> {
     let mut cx = Ctx {
         pkg,
         report: ReadReport::default(),

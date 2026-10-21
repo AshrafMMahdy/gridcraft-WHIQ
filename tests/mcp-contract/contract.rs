@@ -288,6 +288,37 @@ fn memory_limit_evicts_with_recovery() {
     assert_eq!(cells_of(&path, "A1"), json!([["precious"]]));
 }
 
+/// WHIQ (owner rule: a save is never interrupted by eviction): the call after which memory was
+/// over the limit says the workbook was closed and where its work is; the save that comes next
+/// writes that work where it was asked, byte for byte.
+#[test]
+fn a_save_after_a_memory_eviction_writes_the_auto_saved_work() {
+    let dir = folder("memory-save");
+    let mut m = start(&dir, &["--max-memory-mb", "1"]);
+    let r = m.ok("set_cell", json!({"cell": "A1", "input": "precious"}));
+    let note = &r["closed_after_this_call"];
+    let rec = note["recovered_path"].as_str().unwrap_or_else(|| panic!("the answer says the workbook was closed: {r}")).to_string();
+    assert!(note["next_step"].as_str().unwrap().contains("save_workbook"), "{r}");
+    let out = dir.join("after-eviction.xlsx");
+    let s = m.ok("save_workbook", json!({"path": out.to_str().unwrap()}));
+    let name = std::path::Path::new(&rec).file_name().unwrap().to_str().unwrap().to_string();
+    assert!(s["saved_from"].as_str().unwrap().ends_with(&name), "{s}");
+    assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&rec).unwrap());
+    assert_eq!(cells_of(&out, "A1"), json!([["precious"]]));
+}
+
+/// WHIQ: a whole range in one call, as a CSV file (read_range answers a window per call).
+#[test]
+fn export_range_writes_a_whole_range_as_csv() {
+    let dir = folder("export-range");
+    let mut m = start(&dir, &[]);
+    m.ok("write_range", json!({"range": "A1", "values": [["a", 1], ["b", 2], ["c", 3]]}));
+    let out = dir.join("range.csv");
+    let r = m.ok("export_range", json!({"path": out.to_str().unwrap(), "range": "A1:B3"}));
+    assert_eq!(r["rows"], 3, "{r}");
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "a,1\r\nb,2\r\nc,3\r\n");
+}
+
 // 3. SIGTERM: the open document is auto-saved; the next process names the file.
 /// WHIQ (owner rule: never lose user work): every open workbook with unsaved changes is
 /// auto-saved, each to its own recovered file, on SIGTERM, on hang-up and on eviction.

@@ -632,6 +632,10 @@ fn mcp(args: &[String]) -> Result<(), String> {
     }
     if let Some(n) = num("max-memory-mb")? {
         config.max_memory_bytes = Some((n * 1024.0 * 1024.0) as u64);
+        // WHIQ: every in-memory limit is a share of this budget, and a file read stops with an
+        // answer once the process is past it (rather than growing until it is closed).
+        gridcraft_engine::core::memory::set_budget((n * 1024.0 * 1024.0) as u64);
+        gridcraft_engine::core::memory::set_probe(gridcraft_mcp::whiq::rss_bytes);
     }
     if let Some(n) = either("idle-evict-secs", "evict-idle-secs")? {
         config.idle_evict = Some(std::time::Duration::from_secs_f64(n.max(0.05)));

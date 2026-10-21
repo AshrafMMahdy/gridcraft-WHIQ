@@ -105,8 +105,16 @@ impl Sst {
 }
 
 /// Package being assembled.
+/// WHIQ: a part's bytes, or a part already compressed into the staging zip.
+enum PartData {
+    Bytes(Vec<u8>),
+    Staged,
+}
+
 pub struct Out {
-    parts: Vec<(String, Vec<u8>)>,
+    parts: Vec<(String, PartData)>,
+    /// WHIQ: worksheets compressed row by row as they are written.
+    staging: crate::package::Staging,
     overrides: Vec<(String, String)>,
     defaults: BTreeMap<String, String>,
     pub dxfs: Vec<Style>,
@@ -135,7 +143,29 @@ impl Out {
         if let Some(ct) = content_type {
             self.overrides.push((format!("/{name}"), ct.to_string()));
         }
-        self.parts.push((name.to_string(), data));
+        self.parts.push((name.to_string(), PartData::Bytes(data)));
+    }
+    /// WHIQ: a part written by `fill` straight into the staging zip (compressed as it comes).
+    pub fn part_streamed(
+        &mut self,
+        name: &str,
+        content_type: Option<&str>,
+        large: bool,
+        fill: &mut dyn FnMut(&mut Out, &mut dyn std::io::Write) -> Result<(), IoError>,
+    ) -> Result<(), IoError> {
+        if let Some(ct) = content_type {
+            self.overrides.push((format!("/{name}"), ct.to_string()));
+        }
+        // The writer and `self` are needed together: write into a buffer flushed to the staging zip.
+        let mut staging = std::mem::take(&mut self.staging);
+        let r = (|| {
+            let w = staging.start(name, large)?;
+            fill(self, w)
+        })();
+        self.staging = staging;
+        r?;
+        self.parts.push((name.to_string(), PartData::Staged));
+        Ok(())
     }
     pub fn default_type(&mut self, ext: &str, ct: &str) {
         self.defaults.entry(ext.to_string()).or_insert_with(|| ct.to_string());
@@ -188,6 +218,14 @@ fn check_sheet_names(wb: &Workbook) -> Result<(), IoError> {
 }
 
 pub fn write_xlsx(wb: &Workbook, kind: XlsxKind) -> Result<Vec<u8>, IoError> {
+    let mut cur = std::io::Cursor::new(Vec::new());
+    write_xlsx_into(wb, kind, &mut cur)?;
+    Ok(cur.into_inner())
+}
+
+/// WHIQ: [`write_xlsx`] straight into `w` (a file). Worksheets are compressed row by row as they
+/// are written, so neither their XML nor the package is ever held whole in memory.
+pub fn write_xlsx_into<W: std::io::Write + std::io::Seek>(wb: &Workbook, kind: XlsxKind, sink: &mut W) -> Result<(), IoError> {
     if wb.sheets.is_empty() {
         return Err(IoError::Format("a workbook needs at least one sheet".into()));
     }
@@ -197,6 +235,7 @@ pub fn write_xlsx(wb: &Workbook, kind: XlsxKind) -> Result<Vec<u8>, IoError> {
     check_sheet_names(wb)?;
     let mut out = Out {
         parts: vec![],
+        staging: Default::default(),
         overrides: vec![],
         defaults: BTreeMap::new(),
         dxfs: vec![],
@@ -238,10 +277,15 @@ pub fn write_xlsx(wb: &Workbook, kind: XlsxKind) -> Result<Vec<u8>, IoError> {
         sheet_id = next;
         // WHIQ parity pass: progress by sheet for job_status.
         gridcraft_core::progress::step_in("writing sheets", i as u64, wb.sheets.len() as u64);
-        let (xml, mut rels) = crate::sheet_write::write_sheet(wb, i, i == active, &mut out);
-        pivots.add_sheet(wb, i, &mut out, &mut rels);
+        // WHIQ: the sheet's XML is written row by row into the staging zip, never whole.
         let name = format!("xl/worksheets/sheet{}.xml", i + 1);
-        out.part(&name, Some(CT_WORKSHEET), xml.into_bytes());
+        let large = (sheet.cells.len() as u64).saturating_mul(256) >= u64::from(u32::MAX) / 2;
+        let mut rels = Rels::default();
+        out.part_streamed(&name, Some(CT_WORKSHEET), large, &mut |out, w| {
+            rels = crate::sheet_write::write_sheet_into(wb, i, i == active, out, w)?;
+            Ok(())
+        })?;
+        pivots.add_sheet(wb, i, &mut out, &mut rels);
         if !rels.is_empty() {
             out.part(&format!("xl/worksheets/_rels/sheet{}.xml.rels", i + 1), None, rels.xml().into_bytes());
         }
@@ -460,7 +504,7 @@ pub fn write_xlsx(wb: &Workbook, kind: XlsxKind) -> Result<Vec<u8>, IoError> {
         let _ = write!(ct, "<Override PartName=\"{}\" ContentType=\"{}\"/>", esc_attr(part), esc_attr(t));
     }
     ct.push_str("</Types>");
-    let mut zip = ZipOut::new();
+    let mut zip = ZipOut::into_writer(sink);
     zip.add("[Content_Types].xml", ct.as_bytes())?;
     // Conventional order: rels, docProps, workbook, the rest.
     let rank = |n: &str| match n {
@@ -473,9 +517,13 @@ pub fn write_xlsx(wb: &Workbook, kind: XlsxKind) -> Result<Vec<u8>, IoError> {
     let mut parts = std::mem::take(&mut out.parts);
     parts.sort_by_key(|(n, _)| rank(n));
     for (name, data) in &parts {
-        zip.add(name, data)?;
+        match data {
+            PartData::Bytes(data) => zip.add(name, data)?,
+            PartData::Staged => zip.add_raw(out.staging.archive()?, name)?,
+        }
     }
-    zip.finish()
+    zip.finish_writer()?;
+    Ok(())
 }
 
 /// Cell metadata declaring dynamic-array formulas (MS-XLSX `XLDAPR`).

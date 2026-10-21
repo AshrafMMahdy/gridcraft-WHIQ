@@ -38,8 +38,14 @@ pub fn specs() -> Vec<CommandSpec> {
 }
 
 const CMD: &str = "file.build";
-/// Largest workbook a spec may describe (cells written).
-const MAX_CELLS: u64 = 5_000_000;
+/// Largest workbook a spec may describe (cells written) at the smallest memory budget. WHIQ: the
+/// working limit is one cell per 64 bytes of the memory budget when that is more (a spec arrives
+/// whole in one call; larger workbooks are built in parts with write_range).
+const MAX_CELLS_FLOOR: u64 = 5_000_000;
+
+fn max_cells() -> u64 {
+    MAX_CELLS_FLOOR.max(gridcraft_core::memory::budget() / 64)
+}
 
 fn fail(step: &str, e: EngineError) -> EngineError {
     match e {
@@ -86,8 +92,14 @@ fn build(s: &mut Session, p: &Json) -> Result<Json> {
         let cols = sh.get("rows").and_then(Json::as_array).into_iter().flatten().filter_map(Json::as_array).map(Vec::len).max().unwrap_or(0) as u64;
         total = total.saturating_add(rows.saturating_mul(cols.max(1)));
     }
-    if total > MAX_CELLS {
-        return Err(bad(CMD, format!("the spec holds {total} cells, more than {MAX_CELLS}: build it in parts (write_range more rows after)")));
+    if total > max_cells() {
+        return Err(bad(
+            CMD,
+            format!(
+                "the spec holds {total} cells, more than one call builds within this process's memory budget ({}): build it in parts (write_range more rows after)",
+                max_cells()
+            ),
+        ));
     }
     let before = s.active_index();
     let had = s.documents().len();
@@ -214,7 +226,7 @@ fn fill_sheet(s: &mut Session, spec: &Json, top: &Json, name: &str, charts: &mut
         run(s, &step("values"), "range.setValues", json!({"range": format!("{q}{}", start.a1()), "values": values}))?;
     }
     // Dates written as dates show as dates (before the column formats, which win).
-    looks::apply(s, &date_looks, MAX_CELLS, &step)?;
+    looks::apply(s, &date_looks, max_cells(), &step)?;
     let header_range = header.as_ref().and(block).map(|b| RangeRef::new(b.start, CellRef::new(b.start.row, b.end.col)));
     // Header look (bold by default).
     if let Some(h) = header_range {
@@ -330,7 +342,7 @@ fn fill_sheet(s: &mut Session, spec: &Json, top: &Json, name: &str, charts: &mut
         }
     }
     range_looks.append(&mut cell_looks);
-    looks::apply(s, &range_looks, MAX_CELLS, &step)?;
+    looks::apply(s, &range_looks, max_cells(), &step)?;
     row_heights(s, spec, &step)?;
     // Table, or a plain AutoFilter.
     let table = spec.get("table").filter(|t| !matches!(t, Json::Bool(false) | Json::Null));

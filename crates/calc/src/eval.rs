@@ -11,8 +11,14 @@ use gridcraft_formula::{BinOp, Expr, RefKind, Reference, SheetSel, StructItem, S
 use gridcraft_functions::{Arg, Ctx};
 use gridcraft_model::Workbook;
 
-/// Largest array a reference may expand to.
+/// Largest array a reference may expand to at the smallest memory budget. WHIQ: the working
+/// limit ([`max_cells`]) is one cell per 32 bytes of the memory budget when that is more.
 pub const MAX_CELLS: u64 = 16_000_000;
+
+/// The largest array a reference may expand to in this process.
+pub fn max_cells() -> u64 {
+    MAX_CELLS.max(gridcraft_core::memory::budget() / 32)
+}
 /// References up to this many cells are read at their full size; larger ones (`A:A`, ranges
 /// reserved for data to come such as `$A$2:$A$50000`) stop at the sheet's used range, so that
 /// formulas over them stay fast.
@@ -176,7 +182,7 @@ impl<'h> Evaluator<'h> {
         let cells = u64::from(a.range.height()) * u64::from(a.range.width());
         let range = if cells > FULL_SIZE_CELLS { self.trim(a) } else { a.range };
         let (h, w) = (range.height() as usize, range.width() as usize);
-        if (h as u64) * (w as u64) > MAX_CELLS {
+        if (h as u64) * (w as u64) > max_cells() {
             return Value::Error(CellError::Num);
         }
         let data = self.host.range_values(a.sheet, range);
@@ -1012,7 +1018,7 @@ impl<'h> Evaluator<'h> {
                 let arrays: Vec<Arc<Array>> = args[..args.len() - 1].iter().map(|a| as_array(self.value(a))).collect();
                 let rows = arrays.iter().map(|a| a.rows).max().unwrap_or(1);
                 let cols = arrays.iter().map(|a| a.cols).max().unwrap_or(1);
-                if (rows * cols) as u64 > MAX_CELLS {
+                if (rows * cols) as u64 > max_cells() {
                     return err(CellError::Num);
                 }
                 let mut out = Vec::with_capacity(rows * cols);
@@ -1081,7 +1087,7 @@ impl<'h> Evaluator<'h> {
                     (Ok(r), Ok(c)) => (r.trunc(), c.trunc()),
                     (Err(e), _) | (_, Err(e)) => return err(e),
                 };
-                if rows < 1.0 || cols < 1.0 || rows * cols > MAX_CELLS as f64 {
+                if rows < 1.0 || cols < 1.0 || rows * cols > max_cells() as f64 {
                     return err(CellError::Value);
                 }
                 let Some(l) = self.lambda_arg(args.get(2), 2) else { return err(CellError::Value) };
@@ -1212,7 +1218,7 @@ impl<'h> Evaluator<'h> {
             };
             let (ra, ca) = (as_array(&rows), as_array(&cols));
             let (h, w) = (ra.rows.max(ca.rows), ra.cols.max(ca.cols));
-            if (h as u64).saturating_mul(w as u64) > MAX_CELLS {
+            if (h as u64).saturating_mul(w as u64) > max_cells() {
                 return err(CellError::Num);
             }
             let mut out = Vec::with_capacity(h * w);

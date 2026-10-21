@@ -186,11 +186,62 @@ impl<T: Copy + Ord> Intervals<T> {
     }
 }
 
+/// WHIQ: the formulas that read one cell. Most cells are read by one formula (`=D2*E2` down a
+/// column), so one key is held inline and only a cell read by several gets a set: about 40
+/// bytes a precedent instead of 175, which matters at millions of formulas.
+#[derive(Clone, Debug)]
+enum Deps {
+    One(Key),
+    Many(HashSet<Key>),
+}
+
+impl Deps {
+    fn insert(&mut self, k: Key) {
+        match self {
+            Deps::One(o) if *o == k => {}
+            Deps::One(o) => {
+                let mut set = HashSet::with_capacity_and_hasher(2, Default::default());
+                set.insert(*o);
+                set.insert(k);
+                *self = Deps::Many(set);
+            }
+            Deps::Many(s) => {
+                s.insert(k);
+            }
+        }
+    }
+    /// Removes `k`; `true` when nothing is left.
+    fn remove(&mut self, k: &Key) -> bool {
+        match self {
+            Deps::One(o) => o == k,
+            Deps::Many(s) => {
+                s.remove(k);
+                if s.len() == 1
+                    && let Some(last) = s.iter().next().copied()
+                {
+                    *self = Deps::One(last);
+                }
+                s_is_empty(self)
+            }
+        }
+    }
+    fn iter(&self) -> Box<dyn Iterator<Item = &Key> + '_> {
+        match self {
+            Deps::One(k) => Box::new(std::iter::once(k)),
+            Deps::Many(s) => Box::new(s.iter()),
+        }
+    }
+}
+
+fn s_is_empty(d: &Deps) -> bool {
+    matches!(d, Deps::Many(s) if s.is_empty())
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Graph {
     nodes: HashMap<Key, Node>,
     /// single cell → dependents
-    cell_deps: HashMap<Key, HashSet<Key>>,
+    cell_deps: HashMap<Key, Deps>,
     /// (sheet, col) → row intervals of the ranges (up to `WIDE` columns) that cover the column
     col_deps: HashMap<(usize, u32), Intervals<Key>>,
     /// sheet → row intervals of wider ranges, with their columns: (first, last, dependent)
@@ -237,7 +288,12 @@ impl Graph {
         self.remove(k);
         let (cells, cols, wide) = Self::entries(&node.areas);
         for c in cells {
-            self.cell_deps.entry(c).or_default().insert(k);
+            match self.cell_deps.get_mut(&c) {
+                Some(d) => d.insert(k),
+                None => {
+                    self.cell_deps.insert(c, Deps::One(k));
+                }
+            }
         }
         for (s, c, r0, r1) in cols {
             self.col_deps.entry((s, c)).or_default().insert(r0, r1, k);
@@ -257,11 +313,10 @@ impl Graph {
         let Some(old) = self.nodes.remove(&k) else { return };
         let (cells, cols, wide) = Self::entries(&old.areas);
         for c in cells {
-            if let Some(v) = self.cell_deps.get_mut(&c) {
-                v.remove(&k);
-                if v.is_empty() {
-                    self.cell_deps.remove(&c);
-                }
+            if let Some(v) = self.cell_deps.get_mut(&c)
+                && v.remove(&k)
+            {
+                self.cell_deps.remove(&c);
             }
         }
         for (s, c, r0, r1) in cols {
@@ -379,9 +434,56 @@ impl Default for Calc {
     }
 }
 
+/// WHIQ: the formulas of one pass. The parse of each is taken from the workbook when the formula
+/// is evaluated, not held for the whole pass (a parse costs about 300 bytes: a pass over 700,000
+/// formulas held some 200 MB of them). `given` carries parses for formulas not in the workbook
+/// (tests, previews).
+pub(crate) struct PassExprs {
+    members: HashSet<Key>,
+    given: HashMap<Key, std::sync::Arc<Expr>>,
+}
+
+impl PassExprs {
+    /// The formulas at `keys` that parse.
+    fn of(wb: &Workbook, keys: &[Key]) -> PassExprs {
+        let mut members = HashSet::with_capacity_and_hasher(keys.len(), Default::default());
+        for k in keys {
+            let parses = wb.sheet(k.0).and_then(|s| s.cell(k.1)).and_then(|c| c.formula.as_ref()).is_some_and(|f| match &f.expr {
+                Some(_) => true,
+                None => gridcraft_formula::parse(&f.text).is_ok(),
+            });
+            if parses {
+                members.insert(*k);
+            }
+        }
+        PassExprs { members, given: HashMap::default() }
+    }
+    fn given(given: HashMap<Key, std::sync::Arc<Expr>>) -> PassExprs {
+        PassExprs { members: given.keys().copied().collect(), given }
+    }
+    fn contains_key(&self, k: &Key) -> bool {
+        self.members.contains(k)
+    }
+    fn len(&self) -> usize {
+        self.members.len()
+    }
+    fn keys(&self) -> impl Iterator<Item = &Key> + '_ {
+        self.members.iter()
+    }
+    fn get(&self, wb: &Workbook, k: &Key) -> Option<std::sync::Arc<Expr>> {
+        if !self.members.contains(k) {
+            return None;
+        }
+        if let Some(e) = self.given.get(k) {
+            return Some(std::sync::Arc::clone(e));
+        }
+        wb.sheet(k.0).and_then(|s| s.cell(k.1)).and_then(|c| c.formula.as_ref()).and_then(|f| f.expr_arc())
+    }
+}
+
 struct PassHost<'a> {
     wb: &'a Workbook,
-    exprs: &'a HashMap<Key, std::sync::Arc<Expr>>,
+    exprs: &'a PassExprs,
     results: HashMap<Key, Value>,
     pending: HashSet<Key>,
     in_progress: HashSet<Key>,
@@ -411,7 +513,7 @@ struct PassHost<'a> {
 }
 
 impl<'a> PassHost<'a> {
-    fn new(wb: &'a Workbook, exprs: &'a HashMap<Key, std::sync::Arc<Expr>>, rng: &'a mut u64, now: f64) -> Self {
+    fn new(wb: &'a Workbook, exprs: &'a PassExprs, rng: &'a mut u64, now: f64) -> Self {
         PassHost {
             wb,
             exprs,
@@ -468,7 +570,7 @@ impl PassHost<'_> {
             }
             return v;
         }
-        let Some(expr) = self.exprs.get(&k) else {
+        let Some(expr) = self.exprs.get(self.wb, &k) else {
             return self.wb.sheet(k.0).map(|s| s.value(k.1)).unwrap_or_default();
         };
         if self.in_progress.contains(&k) || self.depth > 2000 {
@@ -485,7 +587,6 @@ impl PassHost<'_> {
         if self.iterate {
             self.stack.push(k);
         }
-        let expr = std::sync::Arc::clone(expr);
         let v = {
             let mut ev = Evaluator::new(self, k.0, k.1);
             ev.value(&expr)
@@ -607,7 +708,7 @@ impl PassHost<'_> {
 /// Excel does: a single row or column repeats across the range, a single value fills it, cells
 /// past the result show `#N/A`, and a result larger than the range is cut off.
 fn fit_to_range(v: Value, range: RangeRef) -> Value {
-    if range.count() > crate::eval::MAX_CELLS {
+    if range.count() > crate::eval::max_cells() {
         return Value::Error(CellError::Num);
     }
     let (h, w) = (range.height() as usize, range.width() as usize);
@@ -1002,12 +1103,7 @@ impl Calc {
             }
             // Row-major order is a good topological guess; on-demand evaluation fixes the rest.
             dirty.sort_by_key(|(s, c)| (*s, c.row, c.col));
-            let mut exprs: HashMap<Key, std::sync::Arc<Expr>> = HashMap::with_capacity_and_hasher(dirty.len(), Default::default());
-            for k in &dirty {
-                if let Some(e) = wb.sheet(k.0).and_then(|s| s.cell(k.1)).and_then(|c| c.formula.as_ref()).and_then(|f| f.expr_arc()) {
-                    exprs.insert(*k, e);
-                }
-            }
+            let exprs = PassExprs::of(wb, &dirty);
             let now = self.now();
             let mut rng = self.rng;
             let tp = prof_now();
@@ -1140,7 +1236,7 @@ pub fn evaluate(wb: &Workbook, sheet: usize, at: CellRef, formula: &str) -> Valu
 }
 
 pub fn evaluate_expr(wb: &Workbook, sheet: usize, at: CellRef, expr: &Expr) -> Value {
-    let exprs = HashMap::default();
+    let exprs = PassExprs::given(HashMap::default());
     let mut rng = 0x1234_5678_9ABC_DEF0u64;
     let mut host = PassHost::new(wb, &exprs, &mut rng, now_serial());
     let mut ev = Evaluator::new(&mut host, sheet, at);
@@ -1382,6 +1478,7 @@ pub(crate) mod tests {
         // of a real pass partway through; `visit_range` has to cope with the formulas it reads
         // being calculated under it.
         let mut rng = 1u64;
+        let exprs = PassExprs::given(exprs);
         let mut host = PassHost::new(wb, &exprs, &mut rng, 0.0);
 
         let mut seen = Vec::new();
@@ -1390,5 +1487,27 @@ pub(crate) mod tests {
             true
         })
         .then_some(seen)
+    }
+}
+
+#[cfg(test)]
+mod whiq_deps_tests {
+    use super::*;
+
+    #[test]
+    fn a_cell_read_by_one_formula_holds_it_inline_and_grows_to_a_set() {
+        let k = |r: u32| (0usize, CellRef::new(r, 0));
+        let mut d = Deps::One(k(1));
+        d.insert(k(1));
+        assert!(matches!(d, Deps::One(_)), "the same formula twice stays one");
+        d.insert(k(2));
+        d.insert(k(3));
+        let mut got: Vec<Key> = d.iter().copied().collect();
+        got.sort();
+        assert_eq!(got, [k(1), k(2), k(3)]);
+        assert!(!d.remove(&k(2)));
+        assert!(!d.remove(&k(3)));
+        assert!(matches!(d, Deps::One(x) if x == k(1)), "back to one inline");
+        assert!(d.remove(&k(1)), "nothing left");
     }
 }

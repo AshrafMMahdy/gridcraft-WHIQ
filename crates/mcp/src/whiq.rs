@@ -111,6 +111,64 @@ impl Eviction {
     }
 }
 
+/// WHIQ: `save_workbook` (or `execute_command` `file.save` / `file.saveAs`) of a workbook the
+/// server closed: its auto-saved copy (or its unchanged original) is copied to the path asked,
+/// which is the save. `None` when the call is no such save, or when the format asked is not the
+/// copy's (that needs the workbook open again; the `evicted` answer says so).
+fn save_evicted(name: &str, a: &Value, ev: &Eviction, overwrite: bool) -> Option<Result<Value, String>> {
+    let params = match name {
+        "save_workbook" => a.clone(),
+        "execute_command" if matches!(a.get("command").and_then(Value::as_str), Some("file.save" | "file.saveAs")) => {
+            a.get("params").cloned().unwrap_or(Value::Null)
+        }
+        _ => return None,
+    };
+    let source = ev.recovered.as_ref().map(|p| p.display().to_string()).or_else(|| ev.original.clone())?;
+    let target = params.get("path").and_then(Value::as_str).map(String::from).or_else(|| ev.original.clone())?;
+    let kind = |p: &str| gridcraft_engine::io::FileKind::from_path(p);
+    let xlsx_family = |p: &str| kind(p) == Some(gridcraft_engine::io::FileKind::Xlsx);
+    if !(xlsx_family(&source) && xlsx_family(&target))
+        || gridcraft_engine::xlsx::XlsxKind::from_path(&source) != gridcraft_engine::xlsx::XlsxKind::from_path(&target)
+    {
+        return None;
+    }
+    let same = std::fs::canonicalize(&source).ok().zip(std::fs::canonicalize(&target).ok()).is_some_and(|(x, y)| x == y);
+    let copy = || -> Result<u64, String> {
+        if same {
+            return std::fs::metadata(&source).map(|m| m.len()).map_err(|e| format!("{source}: {e}"));
+        }
+        let mut src = std::fs::File::open(&source).map_err(|e| format!("{source}: {e}"))?;
+        let mut n = 0;
+        gridcraft_engine::io::write_file_with(&target, &mut |f| {
+            n = std::io::copy(&mut src, f).map_err(|e| gridcraft_engine::EngineError::Other(format!("{source}: {e}")))?;
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+        Ok(n)
+    };
+    let _ = gridcraft_engine::io::save_policy::take_reports();
+    let r = gridcraft_engine::io::save_policy::allow_overwrite(overwrite, copy);
+    let reports = gridcraft_engine::io::save_policy::take_reports();
+    Some(r.map(|bytes| {
+        let abs = |p: &str| std::path::absolute(p).map(|x| x.display().to_string()).unwrap_or_else(|_| p.to_string());
+        let mut v = json!({
+            "path": abs(&target),
+            "bytes": bytes,
+            "saved_from": abs(&source),
+            "evicted": {"reason": ev.reason, "recovered_path": ev.recovered.as_ref().map(|p| p.display().to_string()), "original_path": ev.original},
+            "next_step": format!(
+                "saved. The workbook had been closed by the server ({}); the save wrote its work from {source}. Call open_workbook {{path: \"{}\"}} to edit it further",
+                ev.reason,
+                abs(&target)
+            ),
+        });
+        if let Some(old) = reports.iter().find_map(|r| r.previous_renamed_to.clone()) {
+            v["previous_file_renamed_to"] = json!(old.display().to_string());
+        }
+        v
+    }))
+}
+
 /// What a server keeps between calls.
 #[derive(Debug, Default)]
 pub struct CallState {
@@ -162,7 +220,7 @@ fn tool(name: &str, title: &str, desc: &str, schema: Value, hints: Hints) -> Val
 }
 
 /// Tools that write files: they take `overwrite`.
-pub(crate) const WRITES_FILES: &[&str] = &["save_workbook", "export_pdf", "render_range", "render_sheet", "build_workbook", "screenshot"];
+pub(crate) const WRITES_FILES: &[&str] = &["save_workbook", "export_pdf", "render_range", "render_sheet", "build_workbook", "screenshot", "export_range"];
 
 /// Tools that work without an open document (they stay available after an eviction).
 const NEEDS_NO_DOCUMENT: &[&str] = &[
@@ -234,6 +292,22 @@ pub fn definitions() -> Vec<Value> {
             "For a supervisor: auto-save the open workbook's unsaved work to a recovered file inside the write root and close it. \
              The next call that needs it answers `evicted` with the file to reopen.",
             obj(json!({"reason": string("Why (shown to the agent)")}), &[]),
+            crate::tools::SET,
+        ),
+        tool(
+            "export_range",
+            "Export range",
+            "Write a range (default: the sheet's used range) as a CSV file and answer with its path, row and column counts: the \
+             way to read a large range in one call (read_range returns a window per call). Values are written as Save As CSV writes \
+             them. Streamed a row at a time, so any size works.",
+            obj(
+                json!({
+                    "path": string("The .csv file to write (inside the write root)"),
+                    "range": string("Range, e.g. \"A1:L500000\" or \"Sheet2!A:F\" (default: the used range)"),
+                    "sheet": string("Sheet name (default: the active sheet)"),
+                }),
+                &["path"],
+            ),
             crate::tools::SET,
         ),
         tool(
@@ -495,11 +569,35 @@ pub(crate) fn dispatch_extra(b: &mut dyn Backend, name: &str, a: &Args) -> Resul
         "roundtrip_check" => {
             let path = a.get("path").and_then(Value::as_str).unwrap_or("");
             gridcraft_engine::core::progress::step_in("round trip: reading", 0, 2);
-            let bytes = gridcraft_engine::io::read_file(path).map_err(|e| e.to_string())?;
+            // WHIQ: neither package is held in memory: the workbook is read from its file, saved
+            // into a scratch file, and binary parts compare by their zip CRC.
+            let (wb, _) = match gridcraft_engine::io::open_xlsx_file(path).map_err(|e| format!("{path}: {e}"))? {
+                Some(x) => x,
+                None => {
+                    let bytes = gridcraft_engine::io::read_file(path).map_err(|e| e.to_string())?;
+                    gridcraft_engine::io::open_bytes(path, &bytes).map_err(|e| format!("{path}: {e}"))?
+                }
+            };
             gridcraft_engine::core::progress::step_in("round trip: saving and comparing", 1, 2);
-            let (wb, _) = gridcraft_engine::io::open_bytes(path, &bytes).map_err(|e| format!("{path}: {e}"))?;
-            let saved = gridcraft_engine::io::save_bytes(&wb, path).map_err(|e| format!("{path}: {e}"))?;
-            let mut v = crate::roundtrip::compare(&bytes, &saved).map_err(|e| format!("{path}: {e}"))?;
+            let kind = gridcraft_engine::xlsx::XlsxKind::from_path(path);
+            let scratch = std::env::temp_dir().join(format!(
+                "gridcraft-roundtrip-{}-{}.xlsx",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+            ));
+            let r = (|| -> Result<Value, String> {
+                {
+                    let f = std::fs::File::create(&scratch).map_err(|e| format!("{}: {e}", scratch.display()))?;
+                    let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+                    gridcraft_engine::xlsx::write_xlsx_into(&wb, kind, &mut w).map_err(|e| format!("{path}: {e}"))?;
+                    std::io::Write::flush(&mut w).map_err(|e| e.to_string())?;
+                }
+                let before = gridcraft_engine::io::open_for_read(path).map_err(|e| e.to_string())?;
+                let after = std::fs::File::open(&scratch).map_err(|e| format!("{}: {e}", scratch.display()))?;
+                crate::roundtrip::compare_readers(std::io::BufReader::new(before), std::io::BufReader::new(after)).map_err(|e| format!("{path}: {e}"))
+            })();
+            let _ = std::fs::remove_file(&scratch);
+            let mut v = r?;
             v["path"] = json!(path);
             if v["lossless"] != true {
                 v["next_step"] =
@@ -764,6 +862,15 @@ pub fn run_tool(b: &mut dyn Backend, st: &mut CallState, name: &str, args: &Valu
     if let Some(ev) = &st.evicted
         && !NEEDS_NO_DOCUMENT.contains(&name)
     {
+        // WHIQ: a save is never lost to an eviction: the workbook's auto-saved copy (or its
+        // unchanged original) is written where the save asks, byte for byte, without opening it.
+        let overwrite = !st.settings.old_copies || raw.get("overwrite").is_some_and(|v| v.as_bool() == Some(true));
+        if let Some(r) = save_evicted(name, &Value::Object(a.clone()), ev, overwrite) {
+            return match r {
+                Ok(v) => ToolResult::json(&v),
+                Err(e) => ToolResult::failure(&ToolError::new("failed", e, "check the path and the write root, or open the workbook again and save it")),
+            };
+        }
         return ToolResult::failure(&ev.error());
     }
     // WHIQ: `document` names the workbook a call acts on; the active one is restored after.
@@ -933,6 +1040,7 @@ fn dispatch(b: &mut dyn Backend, st: &mut CallState, name: &str, a: &Args, warni
         "cancel" => Ok(json!({"cancelled": false, "status": "not_running", "next_step": "no call is running: nothing to stop"})),
         "debug_panic" => provoked_panic(),
         "read_range" => read_range(b, st, a),
+        "export_range" => export_range(b, a),
         "list_commands" => {
             let v = b.call("engine.commands", pick(a, &["search"])).map_err(|e| classify(b, name, a, &e))?;
             Ok(paged(v, a))
@@ -1021,6 +1129,43 @@ pub(crate) fn quote_sheet(s: &str) -> String {
     } else {
         format!("'{}'", s.replace('\'', "''"))
     }
+}
+
+/// WHIQ: a range written as CSV (the bulk read): streamed by the engine, any size.
+fn export_range(b: &mut dyn Backend, a: &Args) -> Result<Value, ToolError> {
+    let path = a.get("path").and_then(Value::as_str).unwrap_or("").to_string();
+    let given = a.get("range").and_then(Value::as_str).map(str::to_string);
+    let (prefix, rest) = match &given {
+        Some(g) => {
+            let (s, r) = split_sheet(g);
+            (s, Some(r.to_string()))
+        }
+        None => (None, None),
+    };
+    let sheet = prefix.or_else(|| a.get("sheet").and_then(Value::as_str).map(str::to_string));
+    let info = b.call("document.inspect", json!({})).map_err(|e| classify(b, "export_range", a, &e))?;
+    let sheets = info["sheets"].as_array().cloned().unwrap_or_default();
+    let found = match &sheet {
+        Some(w) => sheets.iter().find(|s| s["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(w))),
+        None => info["activeSheet"].as_u64().and_then(|i| sheets.get(i as usize)),
+    };
+    let Some(found) = found else {
+        let names: Vec<&str> = sheets.iter().filter_map(|s| s["name"].as_str()).collect();
+        return Err(ToolError::new("not_found", format!("there is no sheet `{}`", sheet.unwrap_or_default()), "inspect_workbook lists the sheets")
+            .with("sheets", json!(names)));
+    };
+    let used = found["usedRange"].as_str().map(str::to_string);
+    let range = match rest.or(used) {
+        Some(r) => r,
+        None => return Ok(json!({"path": path, "rows": 0, "note": "the sheet holds no data"})),
+    };
+    let mut p = json!({"path": path, "range": range});
+    if let Some(n) = found["name"].as_str() {
+        p["sheet"] = json!(n);
+    }
+    let mut v = exec(b, "file.exportCsv", p).map_err(|e| classify(b, "export_range", a, &e))?;
+    v["next_step"] = json!("read the CSV file (it holds the whole range)");
+    Ok(v)
 }
 
 /// read_range that never floods the caller: at most `max_cells` cells per call; the answer says
@@ -1199,6 +1344,14 @@ pub fn classify(b: &mut dyn Backend, tool: &str, a: &Args, msg: &str) -> ToolErr
     }
     if m.contains("is not available right now") {
         return ToolError::new("not_available", msg, "inspect_workbook shows the current state (selection, sheets); change it and try again");
+    }
+    // WHIQ: a limit of this process's memory says how to get more memory, not to ask for less.
+    if m.contains("--max-memory-mb") {
+        return ToolError::new(
+            "too_large",
+            msg,
+            "the workbook needs more memory than this engine process may use: ask the administrator to raise the engine memory limit (WHIQ_ENGINE_PROC_MB), or split the workbook",
+        );
     }
     if m.contains("too large") || m.contains("too many") || m.contains("too tall") || m.contains("larger than") || m.contains("read it in parts") {
         return ToolError::new("too_large", msg, "ask for a smaller part: a range like A1:D500, fewer rows, or fewer pages");

@@ -2,21 +2,87 @@
 //!
 //! Cells live in bands of 64 rows, each band behind an `Arc`. Cloning a store (an undo snapshot)
 //! copies only the band pointers; editing a cell copies just its band.
+//!
+//! WHIQ: a row keeps its cells in one vector sorted by column (48 bytes a cell) instead of a
+//! B-tree per row (about twice that with the node overhead), so a workbook of millions of cells
+//! takes half the memory; rows are short, and a column is found by binary search.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use gridcraft_core::{CellRef, RangeRef};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::cell::Cell;
 
 const BAND: u32 = 64;
 
+/// One row's cells, sorted by column. Serialized as `{col: cell}`, as the B-tree it replaced.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Row(Vec<(u32, Cell)>);
+
+impl Row {
+    fn find(&self, col: u32) -> Result<usize, usize> {
+        self.0.binary_search_by_key(&col, |e| e.0)
+    }
+    fn get(&self, col: u32) -> Option<&Cell> {
+        self.find(col).ok().and_then(|i| self.0.get(i)).map(|e| &e.1)
+    }
+    fn get_mut(&mut self, col: u32) -> Option<&mut Cell> {
+        let i = self.find(col).ok()?;
+        self.0.get_mut(i).map(|e| &mut e.1)
+    }
+    fn contains_key(&self, col: &u32) -> bool {
+        self.find(*col).is_ok()
+    }
+    fn insert(&mut self, col: u32, cell: Cell) -> Option<Cell> {
+        match self.find(col) {
+            Ok(i) => self.0.get_mut(i).map(|e| std::mem::replace(&mut e.1, cell)),
+            Err(i) => {
+                self.0.insert(i, (col, cell));
+                None
+            }
+        }
+    }
+    fn remove(&mut self, col: &u32) -> Option<Cell> {
+        let i = self.find(*col).ok()?;
+        Some(self.0.remove(i).1)
+    }
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    /// Cells in columns `c0..=c1`, in column order.
+    fn range(&self, cols: std::ops::RangeInclusive<u32>) -> impl Iterator<Item = (&u32, &Cell)> + '_ {
+        let (c0, c1) = (*cols.start(), *cols.end());
+        let a = self.0.partition_point(|e| e.0 < c0);
+        let b = self.0.partition_point(|e| e.0 <= c1).max(a);
+        self.0.get(a..b).unwrap_or_default().iter().map(|(c, cell)| (c, cell))
+    }
+    fn iter(&self) -> impl Iterator<Item = (&u32, &Cell)> + '_ {
+        self.0.iter().map(|(c, cell)| (c, cell))
+    }
+    fn keys(&self) -> impl DoubleEndedIterator<Item = &u32> + '_ {
+        self.0.iter().map(|(c, _)| c)
+    }
+}
+
+impl Serialize for Row {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_map(self.0.iter().map(|(c, cell)| (c, cell)))
+    }
+}
+
+impl<'de> Deserialize<'de> for Row {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let m = BTreeMap::<u32, Cell>::deserialize(d)?;
+        Ok(Row(m.into_iter().collect()))
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct Band {
-    /// row → (col → cell)
-    rows: BTreeMap<u32, BTreeMap<u32, Cell>>,
+    /// row → its cells by column
+    rows: BTreeMap<u32, Row>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -36,7 +102,18 @@ impl CellStore {
         self.len == 0
     }
     pub fn get(&self, c: CellRef) -> Option<&Cell> {
-        self.bands.get(&(c.row / BAND))?.rows.get(&c.row)?.get(&c.col)
+        self.bands.get(&(c.row / BAND))?.rows.get(&c.row)?.get(c.col)
+    }
+    /// WHIQ: give back the spare room rows grew into while a file was read (each row's vector is
+    /// trimmed to its cells; bands are not copied when shared).
+    pub fn shrink_to_fit(&mut self) {
+        for band in self.bands.values_mut() {
+            if let Some(b) = Arc::get_mut(band) {
+                for row in b.rows.values_mut() {
+                    row.0.shrink_to_fit();
+                }
+            }
+        }
     }
     /// Mutable access (copies the band if shared).
     pub fn get_mut(&mut self, c: CellRef) -> Option<&mut Cell> {
@@ -44,7 +121,7 @@ impl CellStore {
         if !band.rows.get(&c.row).is_some_and(|r| r.contains_key(&c.col)) {
             return None;
         }
-        Arc::make_mut(band).rows.get_mut(&c.row)?.get_mut(&c.col)
+        Arc::make_mut(band).rows.get_mut(&c.row)?.get_mut(c.col)
     }
     /// Stores a cell; a default (empty, unstyled) cell is removed instead.
     pub fn set(&mut self, c: CellRef, cell: Cell) {
@@ -138,8 +215,8 @@ impl CellStore {
             }
             let (a, b) = (a.map_or(&empty, |x| x), b.map_or(&empty, |x| x));
             for (row, cols) in &a.rows {
-                for (col, cell) in cols {
-                    if b.rows.get(row).and_then(|r| r.get(col)) != Some(cell) {
+                for (col, cell) in cols.iter() {
+                    if b.rows.get(row).and_then(|r| r.get(*col)) != Some(cell) {
                         out.push(CellRef::new(*row, *col));
                     }
                 }
@@ -267,6 +344,32 @@ mod tests {
         s.set(c(500, 0), Cell::value(4.0.into()));
         let v: Vec<f64> = s.iter_range(RangeRef::parse("A1:D100").unwrap()).map(|(_, x)| x.value.as_f64().unwrap()).collect();
         assert_eq!(v, [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn rows_keep_their_json_shape_and_order() {
+        // WHIQ: a row is a sorted vector now, written as the {col: cell} map it was.
+        let mut s = CellStore::new();
+        s.set(c(3, 7), Cell::value(1.0.into()));
+        s.set(c(3, 2), Cell::value(2.0.into()));
+        s.set(c(3, 5), Cell::value(3.0.into()));
+        let json = serde_json::to_value(&s).unwrap();
+        let row = &json["bands"]["0"]["rows"]["3"];
+        assert!(row.is_object(), "{json}");
+        assert_eq!(row.as_object().unwrap().keys().cloned().collect::<Vec<_>>(), ["2", "5", "7"]);
+        let back: CellStore = serde_json::from_value(json).unwrap();
+        assert_eq!(back, s);
+        let cols: Vec<u32> = s.row(3, 0, 10).map(|(col, _)| col).collect();
+        assert_eq!(cols, [2, 5, 7]);
+        assert_eq!(s.row(3, 3, 6).map(|(col, _)| col).collect::<Vec<_>>(), [5]);
+        assert_eq!(s.row(3, 8, 9).count(), 0);
+        // Replacing and removing keep the order.
+        s.set(c(3, 5), Cell::value(9.0.into()));
+        assert_eq!(s.get(c(3, 5)).unwrap().value, Value::Number(9.0));
+        assert!(s.remove(c(3, 2)).is_some());
+        assert_eq!(s.row(3, 0, 10).map(|(col, _)| col).collect::<Vec<_>>(), [5, 7]);
+        s.shrink_to_fit();
+        assert_eq!(s.len(), 2);
     }
 
     #[test]

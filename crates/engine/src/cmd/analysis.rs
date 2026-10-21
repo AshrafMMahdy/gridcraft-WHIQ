@@ -17,10 +17,19 @@ use super::whatif::parse_range;
 use super::*;
 
 const CMD: &str = "data.analysisToolPak";
-/// Most input cells a tool reads.
+/// Most input cells a tool reads at the smallest memory budget. WHIQ: one per 32 bytes of the
+/// memory budget when that is more (inputs are read into memory as numbers).
 const MAX_INPUT_CELLS: u64 = 1_000_000;
-/// Most cells a report may write.
+/// Most cells a report may write at the smallest memory budget; one per 100 bytes of the
+/// budget when that is more.
 const MAX_OUTPUT_CELLS: u64 = 4_000_000;
+
+fn max_input_cells() -> u64 {
+    MAX_INPUT_CELLS.max(gridcraft_core::memory::budget() / 32)
+}
+fn max_output_cells() -> u64 {
+    MAX_OUTPUT_CELLS.max(gridcraft_core::memory::budget() / 100)
+}
 /// Most variables in a correlation or covariance matrix (work grows with its square).
 const MAX_MATRIX_VARS: usize = 256;
 /// Excel's limit on regression X columns.
@@ -129,8 +138,15 @@ fn non_numeric() -> EngineError {
 fn input_range(s: &Session, p: &Json, keys: &[&str]) -> Result<(usize, RangeRef)> {
     let t = text(p, keys).ok_or_else(|| bad(CMD, format!("missing `{}` (the input range)", keys.first().copied().unwrap_or("range"))))?;
     let (si, r) = parse_range(&s.doc()?.wb, t, CMD)?;
-    if r.count() > MAX_INPUT_CELLS {
-        return Err(bad(CMD, format!("the input range is too large ({MAX_INPUT_CELLS} cells at most)")));
+    if r.count() > max_input_cells() {
+        return Err(bad(
+            CMD,
+            format!(
+                "the input range has {} cells; this process's memory budget reads up to {} at once: analyse it in parts",
+                r.count(),
+                max_input_cells()
+            ),
+        ));
     }
     Ok((si, r))
 }
@@ -1048,8 +1064,14 @@ fn anova_single(s: &Session, p: &Json) -> Result<Grid> {
 fn write_report(s: &mut Session, p: &Json, tool: &str, g: Grid) -> Result<Json> {
     let (rows, cols) = g.extent();
     let (rows, cols) = (rows.max(1), cols.max(1));
-    if u64::from(rows) * u64::from(cols) > MAX_OUTPUT_CELLS {
-        return Err(bad(CMD, "the report is too large"));
+    if u64::from(rows) * u64::from(cols) > max_output_cells() {
+        return Err(bad(
+            CMD,
+            format!(
+                "the report would be {rows} × {cols} cells, more than this process's memory budget writes at once ({}): analyse the input in parts",
+                max_output_cells()
+            ),
+        ));
     }
     let d = s.doc()?;
     let target = match str_param(p, "outputTo").map(str::to_ascii_lowercase).as_deref() {

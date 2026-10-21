@@ -9,7 +9,11 @@ use serde::{Deserialize, Serialize};
 use crate::style::StyleId;
 
 /// A parsed formula. `text` is the canonical formula text without the leading `=`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+///
+/// WHIQ: `expr` is a cache of the parse of `text` (the canonical print of it), so two formulas
+/// are equal when their text and array range are; a workbook read from a file keeps no parse
+/// (about 300 bytes a formula: a 700,000-formula workbook saves some 200 MB) and parses on use.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Formula {
     pub text: String,
     #[serde(skip)]
@@ -19,7 +23,18 @@ pub struct Formula {
     pub array: Option<RangeRef>,
 }
 
+impl PartialEq for Formula {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text && self.array == other.array
+    }
+}
+
 impl Formula {
+    /// WHIQ: the same formula without its cached parse (it parses again when evaluated).
+    pub fn without_parse(mut self) -> Formula {
+        self.expr = None;
+        self
+    }
     /// Parses `text` (with or without `=`). Unparseable formulas keep their text and evaluate to
     /// `#NAME?`.
     pub fn new(text: &str) -> Formula {

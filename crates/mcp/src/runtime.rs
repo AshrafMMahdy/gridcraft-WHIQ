@@ -280,8 +280,9 @@ impl Shared {
         });
         let text = path.to_string_lossy().into_owned();
         // The recovered file is the server's own copy: rewriting it never keeps an OLD_ one.
-        let saved = gridcraft_engine::io::save_bytes(&snap.wb, &text)
-            .and_then(|bytes| gridcraft_engine::io::save_policy::allow_overwrite(true, || gridcraft_engine::io::write_file(&text, &bytes)));
+        // WHIQ: streamed into the file (sheets compressed row by row), never whole in memory.
+        let saved =
+            gridcraft_engine::io::save_policy::allow_overwrite(true, || gridcraft_engine::io::save_to_path(&snap.wb, &text, None)).map(|_| ());
         match saved {
             Ok(()) => {
                 eprintln!("gridcraft-cli: {why}: unsaved work auto-saved to {text}");
@@ -1122,6 +1123,14 @@ fn worker_loop(server: &mut Server, shared: &Shared, rx: mpsc::Receiver<Work>) {
                         json!({"jsonrpc": "2.0", "id": id, "result": ToolResult::failure(&e).to_value()})
                     }
                 };
+                // WHIQ: the memory check runs when the call is over (never during it, so a save is
+                // never cut short), and its outcome is part of this call's answer.
+                let mut reply = reply;
+                if tool != "evict"
+                    && let Some(note) = memory_after_call(server, shared)
+                {
+                    annotate(&mut reply, note);
+                }
                 let snap = server.backend().snapshot();
                 shared.note_call(snap.as_ref());
                 *lock(&shared.snapshot) = snap;
@@ -1160,20 +1169,48 @@ fn worker_loop(server: &mut Server, shared: &Shared, rx: mpsc::Receiver<Work>) {
                 }
                 shared.touch();
                 let _ = done.send(reply);
-                if let (Some(max), Some(rss)) = (shared.config.max_memory_bytes, crate::whiq::rss_bytes())
-                    && rss > max
-                {
-                    evict(
-                        server,
-                        shared,
-                        format!("the workbook was closed because the server used {} MB, over its {} MB limit", rss >> 20, max >> 20),
-                    );
-                }
             }
             Work::Evict { reason } => {
                 // An eviction waits for no call: the worker is idle when it gets here.
                 evict(server, shared, reason);
             }
+        }
+    }
+}
+
+/// WHIQ: after a call, a process over `--max-memory-mb` closes its workbooks (each one with
+/// unsaved work auto-saved first). The answer to that call says so; a later `save_workbook` of
+/// the closed workbook is written from its auto-saved copy (`whiq::save_evicted`).
+fn memory_after_call(server: &mut Server, shared: &Shared) -> Option<Value> {
+    let (max, rss) = (shared.config.max_memory_bytes?, crate::whiq::rss_bytes()?);
+    if rss <= max || server.backend().snapshot().is_none() {
+        return None;
+    }
+    let before = lock(&shared.evicted).clone();
+    evict(server, shared, format!("the workbook was closed because the server used {} MB, over its {} MB limit (--max-memory-mb)", rss >> 20, max >> 20));
+    let ev = lock(&shared.evicted).clone().filter(|e| Some(e) != before.as_ref())?;
+    let reopen = ev.recovered.as_ref().map(|p| p.display().to_string()).or_else(|| ev.original.clone());
+    Some(json!({
+        "reason": ev.reason,
+        "recovered_path": ev.recovered.as_ref().map(|p| p.display().to_string()),
+        "recovered_paths": ev.recovered.iter().chain(ev.others.iter()).map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        "original_path": ev.original,
+        "next_step": match &reopen {
+            Some(p) => format!("this call finished; the workbook is closed now. save_workbook still writes your work (from {p}); open_workbook {{path: \"{p}\"}} carries on editing"),
+            None => "this call finished; the workbook is closed now. new_workbook or open_workbook carries on".to_string(),
+        },
+    }))
+}
+
+/// Adds `closed_after_this_call` to a call's answer (its structured content and its text).
+fn annotate(reply: &mut Value, note: Value) {
+    let text = format!("note: {}", note["next_step"].as_str().unwrap_or("the workbook was closed after this call"));
+    if let Some(r) = reply.get_mut("result") {
+        if let Some(sc) = r.get_mut("structuredContent").and_then(Value::as_object_mut) {
+            sc.insert("closed_after_this_call".into(), note);
+        }
+        if let Some(c) = r.get_mut("content").and_then(Value::as_array_mut) {
+            c.push(json!({"type": "text", "text": text}));
         }
     }
 }

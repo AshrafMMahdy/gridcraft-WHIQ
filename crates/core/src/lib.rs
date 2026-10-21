@@ -6,6 +6,7 @@
 pub mod addr;
 pub mod cancel;
 pub mod date;
+pub mod memory;
 pub mod parse;
 pub mod progress;
 pub mod value;

@@ -109,6 +109,14 @@ pub(crate) fn to_utf8(xml: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     std::borrow::Cow::Borrowed(xml)
 }
 
+/// WHIQ: does a part starting with `head` (its first bytes) need [`to_utf8`] (UTF-16)?
+pub fn is_utf16(head: &[u8]) -> bool {
+    head.starts_with(&[0xFF, 0xFE])
+        || head.starts_with(&[0xFE, 0xFF])
+        || (head.len() >= 4 && head.get(1) == Some(&0) && head.get(3) == Some(&0) && head.first() != Some(&0))
+        || (head.len() >= 4 && head.first() == Some(&0) && head.get(2) == Some(&0) && head.get(1) != Some(&0))
+}
+
 fn local(name: &[u8]) -> String {
     let n = match name.iter().rposition(|&b| b == b':') {
         Some(i) => name.get(i + 1..).unwrap_or(name),
@@ -154,7 +162,13 @@ pub fn parse(xml: &[u8]) -> Result<El, IoError> {
 /// kept in the returned tree.
 pub fn parse_streaming(xml: &[u8], split: &[&str], cb: &mut dyn FnMut(El) -> Result<(), IoError>) -> Result<El, IoError> {
     let data = to_utf8(xml);
-    let mut reader = Reader::from_reader(data.as_ref());
+    parse_streaming_reader(data.as_ref(), split, cb)
+}
+
+/// WHIQ: [`parse_streaming`] over a byte stream (a part inflated from the zip as it is read):
+/// the part is never held whole. The stream must be UTF-8 ([`is_utf16`] tells the exception).
+pub fn parse_streaming_reader<R: std::io::BufRead>(input: R, split: &[&str], cb: &mut dyn FnMut(El) -> Result<(), IoError>) -> Result<El, IoError> {
+    let mut reader = Reader::from_reader(input);
     {
         let cfg = reader.config_mut();
         cfg.check_end_names = false;

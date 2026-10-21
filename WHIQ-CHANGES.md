@@ -535,6 +535,35 @@ engine. Without the new arguments everything behaves as before.
   `errors_carry_code_reason_and_next_step` extended (`_meta`, `document` on document tools,
   protocol errors).
 
+## File-size pass (2026-10-21): large workbooks stream, take half the memory, and a save is never lost
+
+The owner's rule: no tool is limited by file size. A workbook is read from its file and written
+into it as a stream; what has to sit in memory (the cells) takes about 105 bytes a cell instead of
+about 235; every in-memory limit is a share of the `--max-memory-mb` budget the platform passes;
+and a limit that is reached is said with its numbers. Measured over MCP stdio with the audit's
+driver (RSS of the process; BOQ-like sheets with shared strings and a formula column):
+
+| Case | Before (whiq-v0.7.2) | After |
+|---|---|---|
+| 100k rows × 12 (1.2 M cells, 8.6 MB): open / recalculate / save | 311 / 484 / 358 MB (resident 291) | 183 / 254 / 144 MB (resident 125–137) |
+| 500k rows + 10 × 20k (8.4 M cells, 59 MB), no limit: open | 2,129 MB peak, 1,978 MB resident | 994 MB peak, 908 MB resident |
+| … save `.xlsx` | 2,343 MB | 982 MB |
+| … `roundtrip_check` | 4,279 MB | 2,157 MB |
+| … the whole BOQ sheet to CSV (`export_range`) | — (no such tool; read_range 120 calls) | one call, 55 MB file, 911 MB |
+| … `--max-memory-mb 400` | opens at 2.1 GB, then every call answers `evicted` | the open stops at row 409,600 with `too_large`: "GridCraft used 404 MB, over the 400 MB this engine process may use (--max-memory-mb …)"; nothing lost |
+| … `--max-memory-mb 1024`: recalculate goes past the limit | the next `save_workbook` answers `evicted`; the save never happens | the recalculate answer carries `closed_after_this_call`; `save_workbook` writes the work (66 MB, from the recovered copy, byte for byte) |
+
+| Change | Where | Tested by |
+|---|---|---|
+| **The package is read from its file**, never whole: a cloneable source (`PosFile`, positional reads) under the zip; `read_xlsx_file`, `sniff_file`, `engine::io::open_xlsx_file` (file.open, roundtrip_check). **Each worksheet streams from the zip into the cell store** (`Package::part_reader`, `xml::parse_streaming_reader`): its XML is never held whole (UTF-16 parts are still converted whole). | `crates/xlsx/src/package.rs`, `xml.rs`, `sheet_read.rs`, `read.rs`, `lib.rs`; `crates/engine/src/io.rs`, `cmd/file.rs` | `xlsx` `whiq_stream_tests::a_workbook_written_into_a_file_and_read_from_it_is_the_in_memory_one` |
+| **A save streams into the file**: worksheets are written row by row (flushed every 4 MB) into a staging zip, compressed as they come, and copied raw into the package, which is written straight into the temporary file (`write_xlsx_into`, `io::save_to_path`, `io::write_file_with`: the same root check, atomic rename and `OLD_` policy). The row walk merges the cell store with the few cells kept elsewhere instead of first listing every cell (40 bytes a cell). The bytes are the same as the in-memory writer's. CSV / TSV stream a row at a time (no 512 MB cap). Auto-saves and checkpoints stream too. | `xlsx/src/write.rs`, `sheet_write.rs`, `package.rs` (`ZipOut::into_writer`, `Staging`), `csv.rs`; `engine/src/io.rs`; `mcp/src/runtime.rs` | the same test (byte-for-byte); `a_range_streams_out_as_csv` |
+| **Half the memory a cell**: a row keeps its cells in one vector sorted by column (48 bytes a cell) instead of a B-tree per row (about 135 with the nodes), serialised as the same `{col: cell}` map; a cell read by one formula keeps its dependent inline in the dependency graph (about 40 bytes a precedent instead of 175); a formula read from a file keeps its text, not its parse (about 300 bytes; `Formula` equality is by text, its canonical print), and a recalculation parses each formula when it evaluates it instead of holding every parse for the whole pass. | `crates/model/src/store.rs`, `cell.rs`; `crates/calc/src/recalc.rs` (`Deps`, `PassExprs`) | `store::tests::rows_keep_their_json_shape_and_order`, `recalc::whiq_deps_tests`; every engine, calc and xlsx test |
+| **Memory pressure never costs a save.** The memory check runs when a call is over (never during it) and its outcome is part of that call's answer (`closed_after_this_call: {reason, recovered_path, recovered_paths, original_path, next_step}`). A `save_workbook` (or `execute_command` `file.save` / `file.saveAs`) of a workbook the server closed writes its auto-saved copy (or its unchanged original) where it was asked, byte for byte, without opening it (`saved_from`, `evicted`, `next_step`). | `crates/mcp/src/runtime.rs` (`memory_after_call`, `annotate`), `whiq.rs` (`save_evicted`) | `contract.rs` `a_save_after_a_memory_eviction_writes_the_auto_saved_work` |
+| **A read stops at the budget with an answer**: reading a sheet checks the process's resident memory every 16,384 rows against `--max-memory-mb` and stops with `too_large` naming the sheet, the row and both numbers, and how to get more room (the engine memory limit, `WHIQ_ENGINE_PROC_MB`), rather than growing until the process is closed. | `crates/core/src/memory.rs`, `sheet_read.rs`, `apps/gridcraft-cli/src/main.rs`, `whiq.rs` (`classify`) | `memory::tests` |
+| **Limits follow the machine**: `MAX_PART` / `MAX_TOTAL` / `MAX_ENTRIES` (zip), `build_workbook`'s 5 M cells, the Analysis ToolPak's 1 M input / 4 M output cells and the 16 M-cell array limit are floors; the working limits are shares of the memory budget (half / twice / one entry per KB; one cell per 64 / 32 / 100 / 32 bytes), each refusal giving the numbers and the way in parts. Files read whole (CSV, ODS, XLS, XLSB) may be the size of the budget (was a fixed 2 GB) and the refusal says to save as .xlsx. | `xlsx/src/package.rs`, `engine/src/cmd/build.rs`, `cmd/analysis.rs`, `calc/src/eval.rs`, `engine/src/io.rs` | the budget tests |
+| **`export_range`** (new tool): a range (default the used range) written as a CSV file in one call, any size; answers with `path`, `rows`, `columns`, `bytes`. `file.exportCsv` takes `range`. | `mcp/src/whiq.rs`, `engine/src/cmd/file.rs`, `engine/src/io.rs` (`export_csv_range`) | `contract.rs` `export_range_writes_a_whole_range_as_csv` |
+| **`roundtrip_check` compares binary parts by their zip CRC-32 and size** and saves into a scratch file (neither package in memory). | `mcp/src/roundtrip.rs`, `whiq.rs` | `roundtrip.rs` tests |
+
 ## Tests
 
 - `cargo test` runs everything; the WHIQ-specific suites:

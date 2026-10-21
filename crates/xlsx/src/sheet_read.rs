@@ -40,16 +40,45 @@ struct RowState {
 const MAX_HYPERLINK_CELLS: u64 = 10_000;
 
 pub fn read_sheet(cx: &mut Ctx<'_>, part: &str, name: &str) -> Result<Sheet, IoError> {
-    let bytes = cx.pkg.read(part)?.ok_or_else(|| IoError::Format(format!("missing part {part}")))?;
+    let mut reader = cx.pkg.part_reader(part).ok_or_else(|| IoError::Format(format!("missing part {part}")))?;
     let rels = cx.pkg.rels(part)?;
     let mut sheet = Sheet::new(name);
     let mut st = RowState::default();
-    let res = xml::parse_streaming(&bytes, &["row"], &mut |row| {
-        // WHIQ: a safe point for `cancel` while a large file opens.
-        gridcraft_core::cancel::checkpoint();
-        read_row(cx, &mut sheet, &mut st, &row);
-        Ok(())
+    // WHIQ: the sheet streams from the zip into the cell store: its XML is never held whole (a
+    // 500,000-row sheet is hundreds of megabytes of XML). A process past its memory budget stops
+    // the read with an answer that says so, rather than growing until it is closed.
+    let mut over: Option<String> = None;
+    let res = reader.read(|r| {
+        use std::io::{BufRead, Read};
+        let mut buf = std::io::BufReader::with_capacity(1 << 16, r);
+        let head = buf.fill_buf().map_err(|e| IoError::Zip(format!("{part}: {e}")))?.to_vec();
+        let mut on_row = |row: El| {
+            // WHIQ: a safe point for `cancel` while a large file opens.
+            gridcraft_core::cancel::checkpoint();
+            read_row(cx, &mut sheet, &mut st, &row);
+            if st.rows % 16_384 == 0
+                && let Err(e) = gridcraft_core::memory::check(&format!("opening sheet \"{name}\" at row {}", st.next_row))
+            {
+                over = Some(e.clone());
+                return Err(IoError::TooLarge(e));
+            }
+            Ok(())
+        };
+        if xml::is_utf16(&head) {
+            // Rare: UTF-16 parts are converted whole.
+            let mut all = Vec::new();
+            buf.read_to_end(&mut all).map_err(|e| IoError::Zip(format!("{part}: {e}")))?;
+            xml::parse_streaming(&all, &["row"], &mut on_row)
+        } else {
+            if head.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                buf.consume(3);
+            }
+            xml::parse_streaming_reader(buf, &["row"], &mut on_row)
+        }
     });
+    if let Some(e) = over {
+        return Err(IoError::TooLarge(e));
+    }
     let root = match res {
         Ok(r) => r,
         Err(e) => {
@@ -60,7 +89,9 @@ pub fn read_sheet(cx: &mut Ctx<'_>, part: &str, name: &str) -> Result<Sheet, IoE
     if st.dropped > 0 {
         cx.warn(format!("sheet \"{name}\": {} cells or rows outside the 1,048,576 × 16,384 grid were dropped", st.dropped));
     }
-    drop(bytes);
+    drop(reader);
+    // WHIQ: rows hold exactly their cells once the sheet is read.
+    sheet.cells.shrink_to_fit();
 
     let mut fit_to_page = false;
     cx.cf_ext_ids.clear();
@@ -460,7 +491,8 @@ fn read_cell(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, c: &El, pos
     let dynamic = c.attr("cm").is_some();
     let formula = c.child("f").and_then(|f| read_formula(cx, st, f, pos, dynamic));
     let value = if formula.is_none() && st.dynamic.iter().any(|r| r.contains(pos) && r.start != pos) { Value::Empty } else { value };
-    sheet.cells.set(pos, Cell { value, formula: formula.map(Arc::new), style });
+    // WHIQ: the model keeps the formula's text, not its parse (it parses again on use).
+    sheet.cells.set(pos, Cell { value, formula: formula.map(|f| Arc::new(f.without_parse())), style });
 }
 
 fn read_formula(cx: &mut Ctx<'_>, st: &mut RowState, f: &El, pos: CellRef, dynamic: bool) -> Option<Formula> {

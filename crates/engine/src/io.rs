@@ -214,6 +214,50 @@ pub fn save_bytes_as(wb: &Workbook, path: &str, kind: FileKind) -> Result<Vec<u8
     }
 }
 
+/// WHIQ: save `wb` to `path` as `kind` (by the extension when `None`). An `.xlsx` streams into
+/// the file (its sheets compressed row by row: nothing of the file is held whole in memory);
+/// other formats are encoded first. Returns the bytes written.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn save_to_path(wb: &Workbook, path: &str, kind: Option<FileKind>) -> Result<u64> {
+    let kind = match kind.or_else(|| FileKind::from_path(path)) {
+        Some(k) => k,
+        None => return save_bytes(wb, path).map(|b| b.len() as u64),
+    };
+    if matches!(kind, FileKind::Csv | FileKind::Tsv) {
+        // WHIQ: delimited text streams a row at a time (no size cap but the disk).
+        let delimiter = if kind == FileKind::Tsv { b'\t' } else { wb.csv_delimiter.unwrap_or(b',') };
+        let Some(sh) = wb.sheet(wb.active_sheet) else { return Ok(0) };
+        return export_csv_range(wb, sh, sh.used_range(), delimiter, path).map(|(_, n)| n);
+    }
+    if kind != FileKind::Xlsx {
+        let bytes = save_bytes_as(wb, path, kind)?;
+        write_file(path, &bytes)?;
+        return Ok(bytes.len() as u64);
+    }
+    let xk = gridcraft_xlsx::XlsxKind::from_path(path);
+    let mut n = 0;
+    write_file_with(path, &mut |f| {
+        {
+            let mut w = std::io::BufWriter::with_capacity(1 << 20, &mut *f);
+            gridcraft_xlsx::write_xlsx_into(wb, xk, &mut w).map_err(|e| EngineError::Other(e.to_string()))?;
+            std::io::Write::flush(&mut w).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+        }
+        n = f.metadata().map(|m| m.len()).unwrap_or(0);
+        Ok(())
+    })?;
+    Ok(n)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn save_to_path(wb: &Workbook, path: &str, kind: Option<FileKind>) -> Result<u64> {
+    let bytes = match kind {
+        Some(k) => save_bytes_as(wb, path, k)?,
+        None => save_bytes(wb, path)?,
+    };
+    write_file(path, &bytes)?;
+    Ok(bytes.len() as u64)
+}
+
 /// [`save_bytes`] for the file at `path`: relative paths to linked workbooks are rewritten for
 /// its folder, so they still name the same files.
 pub fn save_file_bytes(wb: &Workbook, path: &str) -> Result<Vec<u8>> {
@@ -231,6 +275,41 @@ pub fn source_dir(path: &str) -> Option<std::path::PathBuf> {
 /// Save As CSV/Text writes "the text and values as they are displayed in cells" with "all
 /// characters in each cell" (Microsoft Support, *Excel formatting and features that are not
 /// transferred to other file formats*): number formats applied, never column-width `#####`.
+/// WHIQ: the cells of `range` (or nothing for `None`, an empty sheet) of `sh` written to `path`
+/// as delimited text, a row at a time, with values as Save As CSV writes them. Returns (rows,
+/// bytes).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn export_csv_range(wb: &Workbook, sh: &Sheet, range: Option<RangeRef>, delimiter: u8, path: &str) -> Result<(u64, u64)> {
+    let mut rows = 0;
+    let mut n = 0;
+    write_file_with(path, &mut |f| {
+        {
+            let mut w = std::io::BufWriter::with_capacity(1 << 20, &mut *f);
+            if let Some(r) = range {
+                rows = gridcraft_xlsx::write_csv_range_into(r, delimiter, &mut w, |c| csv_text(wb, sh, c)).map_err(|e| EngineError::Other(e.to_string()))?;
+            }
+            std::io::Write::flush(&mut w).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+        }
+        n = f.metadata().map(|m| m.len()).unwrap_or(0);
+        Ok(())
+    })?;
+    Ok((rows, n))
+}
+
+/// One cell's text in a delimited file.
+fn csv_text(wb: &Workbook, sh: &Sheet, c: CellRef) -> String {
+    // General's grid-width formatting rounds large identifiers to scientific notation.
+    // Delimited files have no column width, so preserve the whole numeric value instead.
+    if wb.styles.get(sh.style_id(c)).num_fmt.as_str().eq_ignore_ascii_case("General")
+        && let gridcraft_core::Value::Number(number) = sh.value(c)
+        && number.is_finite()
+    {
+        number.to_string()
+    } else {
+        crate::display::value_text(wb, sh, c)
+    }
+}
+
 fn csv(wb: &Workbook, sh: &Sheet, delimiter: u8) -> Result<Vec<u8>> {
     gridcraft_xlsx::write_csv(sh, delimiter, |c| {
         // General's grid-width formatting rounds large identifiers to scientific notation.
@@ -406,10 +485,43 @@ pub fn read_file(path: &str) -> Result<Vec<u8>> {
     let path = &crate::file_access::resolve_relative(path, crate::file_access::Access::Read);
     crate::file_access::check_read(path).map_err(EngineError::Other)?;
     let meta = std::fs::metadata(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
-    if meta.len() > 2 * 1024 * 1024 * 1024 {
-        return Err(EngineError::Other("files larger than 2 GB aren't supported".into()));
+    // WHIQ: a file read whole into memory (CSV, ODS, XLS, XLSB, a picture) may be at most this
+    // process's memory budget, and the answer says so; an .xlsx is never read this way (it
+    // streams, `open_xlsx_file`).
+    let budget = gridcraft_core::memory::budget();
+    if meta.len() > budget {
+        return Err(EngineError::Other(format!(
+            "{path} is {} MB; this kind of file is read whole into memory, and this process may use {} MB (--max-memory-mb). Save it as .xlsx (which GridCraft streams) or raise the engine's memory limit",
+            meta.len() >> 20,
+            budget >> 20
+        )));
     }
     std::fs::read(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))
+}
+
+/// WHIQ: the file at `path` opened for reading, inside the read root (readers that stream it).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn open_for_read(path: &str) -> Result<std::fs::File> {
+    let path = &crate::file_access::resolve_relative(path, crate::file_access::Access::Read);
+    crate::file_access::check_read(path).map_err(EngineError::Other)?;
+    std::fs::File::open(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))
+}
+
+/// WHIQ: an `.xlsx` (or `.xlsm`, `.xltx`…) package read straight from its file: never whole into
+/// memory, every sheet streamed from the zip. `Ok(None)` when the file is not such a package
+/// (the caller reads it as bytes).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn open_xlsx_file(path: &str) -> Result<Option<(Workbook, Vec<String>)>> {
+    let path = &crate::file_access::resolve_relative(path, crate::file_access::Access::Read);
+    crate::file_access::check_read(path).map_err(EngineError::Other)?;
+    let file = std::fs::File::open(path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
+    if gridcraft_xlsx::sniff_file(&file) != gridcraft_xlsx::Format::Xlsx {
+        return Ok(None);
+    }
+    let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path);
+    let (mut wb, report) = gridcraft_xlsx::read_xlsx_file(file).map_err(|e| EngineError::Other(format!("We can't open '{name}': {e}")))?;
+    fit_imported_rows(&mut wb);
+    Ok(Some((wb, report.warnings)))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -419,6 +531,17 @@ pub fn read_file(path: &str) -> Result<Vec<u8>> {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn write_file(path: &str, bytes: &[u8]) -> Result<()> {
+    write_file_with(path, &mut |f| {
+        use std::io::Write as _;
+        f.write_all(bytes).map_err(|e| EngineError::Other(format!("{path}: {e}")))
+    })
+}
+
+/// WHIQ: [`write_file`] with the bytes written by `fill` straight into the temporary file (a
+/// workbook streamed from the model, a file copied): the same root check, atomic rename and
+/// `OLD_` policy, and nothing of the file held in memory.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn write_file_with(path: &str, fill: &mut dyn FnMut(&mut std::fs::File) -> Result<()>) -> Result<()> {
     // WHIQ: the automation write root applies to every file a command writes; a relative path
     // lies inside it.
     let path = &crate::file_access::resolve_relative(path, crate::file_access::Access::Write);
@@ -433,9 +556,13 @@ pub fn write_file(path: &str, bytes: &[u8]) -> Result<()> {
         EngineError::Other(format!("{path}: {e}"))
     };
     {
-        use std::io::Write as _;
         let mut f = std::fs::File::create(&tmp).map_err(cleanup)?;
-        f.write_all(bytes).and_then(|()| f.sync_all()).map_err(cleanup)?;
+        if let Err(e) = fill(&mut f) {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        f.sync_all().map_err(cleanup)?;
     }
     let target = std::path::Path::new(path);
     // WHIQ: an existing file is never replaced silently while the keep-old policy is on
