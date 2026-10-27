@@ -168,6 +168,20 @@ pub fn parse_streaming(xml: &[u8], split: &[&str], cb: &mut dyn FnMut(El) -> Res
 /// WHIQ: [`parse_streaming`] over a byte stream (a part inflated from the zip as it is read):
 /// the part is never held whole. The stream must be UTF-8 ([`is_utf16`] tells the exception).
 pub fn parse_streaming_reader<R: std::io::BufRead>(input: R, split: &[&str], cb: &mut dyn FnMut(El) -> Result<(), IoError>) -> Result<El, IoError> {
+    parse_streaming_skipping(input, split, &[], &mut |_| {}, cb)
+}
+
+/// WHIQ: [`parse_streaming_reader`] that does not build the elements named in `skip` (nor
+/// anything inside them): each start tag met in them, the element's own included, is handed to
+/// `seen` instead. A worksheet read this way costs the scanning of its cells and nothing of
+/// their memory.
+pub fn parse_streaming_skipping<R: std::io::BufRead>(
+    input: R,
+    split: &[&str],
+    skip: &[&str],
+    seen: &mut dyn FnMut(&BytesStart<'_>),
+    cb: &mut dyn FnMut(El) -> Result<(), IoError>,
+) -> Result<El, IoError> {
     let mut reader = Reader::from_reader(input);
     {
         let cfg = reader.config_mut();
@@ -198,8 +212,39 @@ pub fn parse_streaming_reader<R: std::io::BufRead>(input: R, split: &[&str], cb:
         }
         Ok(())
     }
+    // Depth inside a skipped element (0 = not in one).
+    let mut skipping = 0usize;
     loop {
         let ev = reader.read_event_into(&mut buf).map_err(|e| IoError::Xml(format!("{e} at byte {}", reader.buffer_position())))?;
+        if !skip.is_empty() {
+            match &ev {
+                Event::Start(e) => {
+                    if skipping > 0 || skip.iter().any(|n| e.local_name().as_ref() == n.as_bytes()) {
+                        skipping += 1;
+                        seen(e);
+                        buf.clear();
+                        continue;
+                    }
+                }
+                Event::Empty(e) => {
+                    if skipping > 0 || skip.iter().any(|n| e.local_name().as_ref() == n.as_bytes()) {
+                        seen(e);
+                        buf.clear();
+                        continue;
+                    }
+                }
+                Event::End(_) if skipping > 0 => {
+                    skipping -= 1;
+                    buf.clear();
+                    continue;
+                }
+                Event::Text(_) | Event::CData(_) | Event::GeneralRef(_) if skipping > 0 => {
+                    buf.clear();
+                    continue;
+                }
+                _ => {}
+            }
+        }
         match ev {
             Event::Start(e) => {
                 if stack.len() >= MAX_DEPTH {

@@ -2,7 +2,7 @@ use gridcraft_core::{CellRef, DateSystem, Value};
 use gridcraft_model::{Sheet, Workbook};
 
 use crate::csv::{decode_text, sniff_delimiter};
-use crate::{CsvOptions, Format, IoError, read_csv, sniff, write_csv, write_csv_range_into};
+use crate::{CsvOptions, Format, read_csv, sniff, write_csv, write_csv_range_into};
 
 fn v(wb: &Workbook, r: u32, c: u32) -> Value {
     wb.sheet(0).unwrap().value(CellRef::new(r, c))

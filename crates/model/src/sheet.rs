@@ -305,6 +305,15 @@ impl Sheet {
     pub fn table_at(&self, c: CellRef) -> Option<&Table> {
         self.tables.iter().find(|t| t.range.contains(c))
     }
+    /// [`Sheet::used_range`] without reading cells that are on disk when the file can say where
+    /// they are (a summary of every sheet of a large workbook).
+    pub fn used_range_hint(&self) -> Option<RangeRef> {
+        let mut r = self.cells.used_range_hint();
+        for sr in self.spill_ranges.values() {
+            r = Some(r.map_or(*sr, |x| x.union(sr)));
+        }
+        r
+    }
     pub fn used_range(&self) -> Option<RangeRef> {
         let mut r = self.cells.used_range();
         for sr in self.spill_ranges.values() {

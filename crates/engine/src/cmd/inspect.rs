@@ -41,7 +41,7 @@ fn inspect(s: &mut Session, _: &Json) -> Result<Json> {
             json!({
                 "name": sh.name,
                 "visibility": format!("{:?}", sh.visibility),
-                "usedRange": sh.used_range().map(|r| r.a1()),
+                "usedRange": sh.used_range_hint().map(|r| r.a1()),
                 "cells": sh.cells.len(),
                 "freeze": sh.freeze,
                 "merges": sh.merges.iter().map(|m| m.a1()).collect::<Vec<_>>(),

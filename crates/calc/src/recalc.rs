@@ -12,6 +12,7 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
+use std::sync::Arc;
 
 /// A fast, non-cryptographic hasher for cell keys (FxHash-style multiply-rotate).
 #[derive(Default, Clone, Copy)]
@@ -943,14 +944,40 @@ impl Calc {
     /// Rebuilds the graph from scratch.
     pub fn rebuild(&mut self, wb: &Workbook) {
         self.graph = Graph::default();
-        for (si, sheet) in wb.sheets.iter().enumerate() {
-            for (c, cell) in sheet.cells.iter() {
-                if let Some(f) = &cell.formula
-                    && let Some(e) = f.expr()
-                {
-                    let (areas, dynamic) = precedents(wb, si, &e);
-                    self.graph.insert((si, c), Node { areas, dynamic });
-                }
+        for si in 0..wb.sheets.len() {
+            self.add_sheet_nodes(wb, si);
+        }
+        self.graph.settle();
+    }
+
+    /// WHIQ: the graph nodes of the formulas on sheet `si`. A sheet whose cells are on disk and
+    /// known to hold no formula is not read for it.
+    fn add_sheet_nodes(&mut self, wb: &Workbook, si: usize) {
+        let Some(sheet) = wb.sheets.get(si) else { return };
+        if sheet.cells.is_cold_without_formulas() {
+            return;
+        }
+        for (c, cell) in sheet.cells.iter() {
+            if let Some(f) = &cell.formula
+                && let Some(e) = f.expr()
+            {
+                let (areas, dynamic) = precedents(wb, si, &e);
+                self.graph.insert((si, c), Node { areas, dynamic });
+            }
+        }
+    }
+
+    /// WHIQ: the dependency graph of a workbook opened with sheets left on disk, built without
+    /// calculating anything (the values the file carries stand until an edit reaches them) and
+    /// without keeping the sheets it had to read: each one that was not in memory goes back to disk
+    /// as soon as its formulas are in the graph.
+    pub fn load_graph(&mut self, wb: &mut Workbook) {
+        self.graph = Graph::default();
+        for si in 0..wb.sheets.len() {
+            let was_cold = wb.sheets.get(si).is_some_and(|s| !s.cells.is_resident());
+            self.add_sheet_nodes(wb, si);
+            if was_cold && let Some(sh) = wb.sheets.get_mut(si).and_then(Arc::get_mut) {
+                sh.cells.evict();
             }
         }
         self.graph.settle();

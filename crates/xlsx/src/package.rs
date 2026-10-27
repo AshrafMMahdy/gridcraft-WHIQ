@@ -49,6 +49,17 @@ impl PosFile {
     }
 }
 
+impl PosFile {
+    /// Size and modification time of the file now: a worksheet read later is only trusted while
+    /// they are what they were when the package was opened.
+    pub fn stamp(&self) -> (u64, Option<std::time::SystemTime>) {
+        match self.file.metadata() {
+            Ok(m) => (m.len(), m.modified().ok()),
+            Err(_) => (0, None),
+        }
+    }
+}
+
 impl Read for PosFile {
     #[cfg_attr(not(any(unix, windows)), allow(unused_variables, unreachable_code))]
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -105,6 +116,8 @@ impl Seek for Source<'_> {
 
 pub struct Package<'a> {
     zip: zip::ZipArchive<Source<'a>>,
+    /// WHIQ: the file a package was opened from, so worksheets can be read from it again later.
+    file: Option<PosFile>,
     /// Lower-case normalized part name → zip index.
     names: HashMap<String, usize>,
     total: u64,
@@ -153,7 +166,21 @@ impl<'a> Package<'a> {
     /// WHIQ: a package read straight from its file (never read whole into memory).
     pub fn open_file(file: std::fs::File) -> Result<Package<'static>, IoError> {
         let f = PosFile::new(file).map_err(|e| IoError::Zip(e.to_string()))?;
-        Package::open_source(Source::File(f))
+        let mut pkg = Package::open_source(Source::File(f.clone()))?;
+        pkg.file = Some(f);
+        Ok(pkg)
+    }
+
+    /// WHIQ: the file this package is read from (`None` for one read from memory).
+    pub fn file(&self) -> Option<PosFile> {
+        self.file.clone()
+    }
+
+    /// WHIQ: the declared size of a part once inflated.
+    pub fn part_size(&self, part: &str) -> Option<u64> {
+        let &index = self.names.get(&normalize(part))?;
+        let mut zip = self.zip.clone();
+        zip.by_index(index).ok().map(|f| f.size())
     }
 
     pub fn open_source(src: Source<'a>) -> Result<Package<'a>, IoError> {
@@ -167,7 +194,7 @@ impl<'a> Package<'a> {
                 names.entry(normalize(n)).or_insert(i);
             }
         }
-        Ok(Package { zip, names, total: 0 })
+        Ok(Package { zip, file: None, names, total: 0 })
     }
 
     /// WHIQ: `part` opened for streaming (`None` when it doesn't exist).
@@ -316,16 +343,112 @@ impl<W: Write + Seek> ZipOut<W> {
     }
 }
 
+/// WHIQ: the staged parts' bytes: in memory while they are few, in a temporary file once they pass
+/// a share of the memory budget (a workbook of many large sheets compresses to more than memory).
+pub struct Spool {
+    mem: Option<Cursor<Vec<u8>>>,
+    file: Option<SpoolFile>,
+}
+
+struct SpoolFile {
+    file: std::fs::File,
+    path: std::path::PathBuf,
+}
+
+impl Drop for SpoolFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+static SPOOLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl Default for Spool {
+    fn default() -> Self {
+        Spool { mem: Some(Cursor::new(Vec::new())), file: None }
+    }
+}
+
+impl Spool {
+    fn limit() -> u64 {
+        (16u64 << 20).max(gridcraft_core::memory::budget() / 16)
+    }
+    /// Moves the bytes to a temporary file (the bytes stay in memory when no file can be made).
+    fn move_to_file(&mut self) {
+        let Some(mem) = self.mem.as_ref() else { return };
+        let dir = gridcraft_model::spill::spill_dir();
+        let path = dir.join(format!("stage-{}.zip", SPOOLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        let made = std::fs::create_dir_all(&dir).and_then(|()| {
+            let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path)?;
+            f.write_all(mem.get_ref())?;
+            f.seek(SeekFrom::Start(mem.position()))?;
+            Ok(f)
+        });
+        match made {
+            Ok(file) => {
+                self.file = Some(SpoolFile { file, path });
+                self.mem = None;
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+}
+
+impl Write for Spool {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(m) = &self.mem
+            && m.get_ref().len() as u64 + buf.len() as u64 > Self::limit()
+        {
+            self.move_to_file();
+        }
+        match (&mut self.mem, &mut self.file) {
+            (Some(m), _) => m.write(buf),
+            (None, Some(f)) => f.file.write(buf),
+            (None, None) => Err(std::io::Error::other("spool closed")),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match (&mut self.mem, &mut self.file) {
+            (Some(m), _) => m.flush(),
+            (None, Some(f)) => f.file.flush(),
+            (None, None) => Ok(()),
+        }
+    }
+}
+
+impl Read for Spool {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match (&mut self.mem, &mut self.file) {
+            (Some(m), _) => m.read(buf),
+            (None, Some(f)) => f.file.read(buf),
+            (None, None) => Ok(0),
+        }
+    }
+}
+
+impl Seek for Spool {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        match (&mut self.mem, &mut self.file) {
+            (Some(m), _) => m.seek(to),
+            (None, Some(f)) => f.file.seek(to),
+            (None, None) => Err(std::io::Error::other("spool closed")),
+        }
+    }
+}
+
 /// WHIQ: parts compressed as they are produced (worksheets written row by row), kept until the
-/// package is assembled in its conventional order. Only the compressed bytes are held.
+/// package is assembled in its conventional order. Only the compressed bytes are held, in a
+/// [`Spool`].
 pub struct Staging {
-    zip: Option<zip::ZipWriter<Cursor<Vec<u8>>>>,
-    done: Option<zip::ZipArchive<Cursor<Vec<u8>>>>,
+    zip: Option<zip::ZipWriter<Spool>>,
+    done: Option<zip::ZipArchive<Spool>>,
 }
 
 impl Default for Staging {
     fn default() -> Self {
-        Staging { zip: Some(zip::ZipWriter::new(Cursor::new(Vec::new()))), done: None }
+        Staging { zip: Some(zip::ZipWriter::new(Spool::default())), done: None }
     }
 }
 
@@ -338,10 +461,10 @@ impl Staging {
         Ok(z)
     }
     /// The staged parts for reading (raw copies), once every part is written.
-    pub fn archive(&mut self) -> Result<&mut zip::ZipArchive<Cursor<Vec<u8>>>, IoError> {
+    pub fn archive(&mut self) -> Result<&mut zip::ZipArchive<Spool>, IoError> {
         if let Some(z) = self.zip.take() {
             let mut cur = z.finish().map_err(|e| IoError::Zip(e.to_string()))?;
-            cur.set_position(0);
+            cur.seek(SeekFrom::Start(0)).map_err(|e| IoError::Zip(e.to_string()))?;
             self.done = Some(zip::ZipArchive::new(cur).map_err(|e| IoError::Zip(e.to_string()))?);
         }
         self.done.as_mut().ok_or_else(|| IoError::Zip("no staged parts".into()))

@@ -20,6 +20,7 @@ mod csv;
 mod drawing;
 mod feature_bags;
 mod fmla;
+mod lazy;
 mod ods;
 mod package;
 mod passthrough;

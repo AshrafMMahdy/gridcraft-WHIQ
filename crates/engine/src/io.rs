@@ -83,6 +83,11 @@ pub fn open_bytes_with_password(name: &str, bytes: &[u8], password: Option<&str>
 fn fit_imported_rows(wb: &mut Workbook) {
     for si in 0..wb.sheets.len() {
         let Some(sh) = wb.sheet(si) else { continue };
+        // WHIQ: a sheet left on disk keeps the row heights its file carries (reading it for this
+        // would defeat leaving it there).
+        if !sh.cells.is_resident() {
+            continue;
+        }
         let mut rows: Vec<u32> = sh.cells.iter().map(|(c, _)| c.row).collect();
         rows.sort_unstable();
         rows.dedup();
@@ -361,19 +366,7 @@ fn csv_text(wb: &Workbook, sh: &Sheet, c: CellRef) -> String {
 }
 
 fn csv(wb: &Workbook, sh: &Sheet, delimiter: u8) -> Result<Vec<u8>> {
-    gridcraft_xlsx::write_csv(sh, delimiter, |c| {
-        // General's grid-width formatting rounds large identifiers to scientific notation.
-        // Delimited files have no column width, so preserve the whole numeric value instead.
-        if wb.styles.get(sh.style_id(c)).num_fmt.as_str().eq_ignore_ascii_case("General")
-            && let gridcraft_core::Value::Number(number) = sh.value(c)
-            && number.is_finite()
-        {
-            number.to_string()
-        } else {
-            crate::display::value_text(wb, sh, c)
-        }
-    })
-    .map_err(|e| EngineError::Other(e.to_string()))
+    gridcraft_xlsx::write_csv(sh, delimiter, |c| csv_text(wb, sh, c)).map_err(|e| EngineError::Other(e.to_string()))
 }
 
 fn esc(s: &str) -> String {

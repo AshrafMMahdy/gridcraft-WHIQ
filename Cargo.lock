@@ -1746,6 +1746,7 @@ dependencies = [
  "gridcraft-core",
  "gridcraft-formula",
  "gridcraft-model",
+ "log",
  "quick-xml",
  "sha1",
  "sha2",

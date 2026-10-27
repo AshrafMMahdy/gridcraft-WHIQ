@@ -119,6 +119,9 @@ pub struct Out {
     defaults: BTreeMap<String, String>,
     pub dxfs: Vec<Style>,
     pub sst: Sst,
+    /// WHIQ: text is written in its cell (`inlineStr`), not in the shared strings, which would
+    /// hold every distinct string of the workbook in memory.
+    pub inline_strings: bool,
     pub images: u32,
     pub charts: u32,
     /// References of chartex parts, defined as hidden `_xlchart.v1.N` names.
@@ -240,6 +243,7 @@ pub fn write_xlsx_into<W: std::io::Write + std::io::Seek>(wb: &Workbook, kind: X
         defaults: BTreeMap::new(),
         dxfs: vec![],
         sst: Sst::default(),
+        inline_strings: wb.sheets.iter().map(|s| s.cells.loaded_bytes()).fold(0u64, u64::saturating_add) > gridcraft_core::memory::budget() / 4,
         images: 0,
         charts: 0,
         chart_names: vec![],

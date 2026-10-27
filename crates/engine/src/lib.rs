@@ -19,6 +19,7 @@ pub mod outline;
 pub mod paper;
 pub mod pivot;
 pub mod pivot_calc;
+pub mod pressure;
 pub mod sample;
 pub mod selection;
 pub mod tables;
@@ -127,7 +128,13 @@ const UNDO_LIMIT: usize = 100;
 impl DocState {
     pub fn new(mut wb: Workbook, path: Option<String>, title: String) -> DocState {
         let mut calc = Calc::new();
-        calc.recalc_all(&mut wb);
+        // WHIQ: sheets left on disk by the reader stay there: the graph is built from them and the
+        // values the file carries stand (a full calculation would read every sheet).
+        if wb.sheets.iter().any(|s| !s.cells.is_resident()) {
+            calc.load_graph(&mut wb);
+        } else {
+            calc.recalc_all(&mut wb);
+        }
         let wb = Arc::new(wb);
         let sel = Selection::at(wb.active().map(|s| s.view_active).unwrap_or_default());
         DocState {
@@ -263,6 +270,8 @@ pub struct Session {
     /// Review › Notes › Show All Notes: every note is displayed. An application display setting
     /// (like Excel's comment indicator option), so it's not saved in the file.
     pub show_all_notes: bool,
+    /// WHIQ: what the memory pressure pass could not do ([`Session::take_memory_notes`]).
+    pub memory_notes: Vec<String>,
 }
 
 impl Session {
@@ -329,6 +338,10 @@ impl Session {
         }
         let before = self.active().map(|d| (d.uid, d.wb.clone(), d.selection.clone()));
         let params = if params.is_null() { Json::Object(Default::default()) } else { params };
+        // WHIQ: a sheet that cannot fit in the memory budget by itself is refused with the numbers.
+        if let Some(e) = self.sheet_too_large_for(id, &params) {
+            return Err(e);
+        }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (spec.run)(self, &params)));
         let result = match result {
             Ok(r) => r,
@@ -391,6 +404,9 @@ impl Session {
             d.redo.clear();
             d.revision += 1;
         }
+        // WHIQ: between commands, sheets not in use leave memory when the workbook outgrows its share.
+        #[cfg(not(target_arch = "wasm32"))]
+        self.relieve_memory();
         result
     }
 

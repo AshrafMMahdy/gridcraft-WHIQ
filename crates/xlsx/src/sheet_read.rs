@@ -40,14 +40,69 @@ struct RowState {
 const MAX_HYPERLINK_CELLS: u64 = 10_000;
 
 pub fn read_sheet(cx: &mut Ctx<'_>, part: &str, name: &str) -> Result<Sheet, IoError> {
+    Ok(read_sheet_with(cx, part, name, None)?.unwrap_or_else(|| Sheet::new(name)))
+}
+
+/// WHIQ: [`read_sheet`] that leaves the cells of a plain worksheet (no formulas, no cell
+/// pictures) on disk: the part is scanned for everything but its cells, which are read when
+/// first looked at ([`crate::lazy`]). A worksheet that is not plain is read whole, as ever.
+pub fn read_sheet_lazy(
+    cx: &mut Ctx<'_>,
+    part: &str,
+    name: &str,
+    plan: &crate::lazy::LazyPlan,
+    need_strings: &mut dyn FnMut(&mut Ctx<'_>) -> Result<(), IoError>,
+) -> Result<Sheet, IoError> {
+    match read_sheet_with(cx, part, name, Some(plan))? {
+        Some(sheet) => Ok(sheet),
+        None => {
+            need_strings(cx)?;
+            read_sheet(cx, part, name)
+        }
+    }
+}
+
+/// What a scan of a worksheet's cells found (see [`read_sheet_lazy`]): the cells that hold
+/// something (a value or a format), where they are, and whether any is a formula or a picture.
+#[derive(Default)]
+struct Scan {
+    cells: u64,
+    formulas: bool,
+    pictures: bool,
+    /// First row, last row, first column, last column of the cells counted.
+    bounds: Option<(u32, u32, u32, u32)>,
+    /// The `<c>` being scanned and whether it has been counted.
+    cur: Option<CellRef>,
+    counted: bool,
+}
+
+impl Scan {
+    fn count(&mut self) {
+        self.counted = true;
+        self.cells += 1;
+        if let Some(c) = self.cur {
+            self.bounds = Some(match self.bounds {
+                Some((r0, r1, c0, c1)) => (r0.min(c.row), r1.max(c.row), c0.min(c.col), c1.max(c.col)),
+                None => (c.row, c.row, c.col, c.col),
+            });
+        }
+    }
+    fn used(&self) -> Option<RangeRef> {
+        self.bounds.map(|(r0, r1, c0, c1)| RangeRef::new(CellRef::new(r0, c0), CellRef::new(r1, c1)))
+    }
+}
+
+fn read_sheet_with(cx: &mut Ctx<'_>, part: &str, name: &str, lazy: Option<&crate::lazy::LazyPlan>) -> Result<Option<Sheet>, IoError> {
     let mut reader = cx.pkg.part_reader(part).ok_or_else(|| IoError::Format(format!("missing part {part}")))?;
     let rels = cx.pkg.rels(part)?;
     let mut sheet = Sheet::new(name);
     let mut st = RowState::default();
+    let mut scan = Scan::default();
     // WHIQ: the sheet streams from the zip into the cell store: its XML is never held whole (a
     // 500,000-row sheet is hundreds of megabytes of XML). A process past its memory budget stops
     // the read with an answer that says so, rather than growing until it is closed.
     let mut over: Option<String> = None;
+    let with_cells = lazy.is_none();
     let res = reader.read(|r| {
         use std::io::{BufRead, Read};
         let mut buf = std::io::BufReader::with_capacity(1 << 16, r);
@@ -55,7 +110,7 @@ pub fn read_sheet(cx: &mut Ctx<'_>, part: &str, name: &str) -> Result<Sheet, IoE
         let mut on_row = |row: El| {
             // WHIQ: a safe point for `cancel` while a large file opens.
             gridcraft_core::cancel::checkpoint();
-            read_row(cx, &mut sheet, &mut st, &row);
+            read_row(cx, &mut sheet, &mut st, &row, with_cells);
             if st.rows % 16_384 == 0
                 && let Err(e) = gridcraft_core::memory::check(&format!("opening sheet \"{name}\" at row {}", st.next_row))
             {
@@ -64,20 +119,46 @@ pub fn read_sheet(cx: &mut Ctx<'_>, part: &str, name: &str) -> Result<Sheet, IoE
             }
             Ok(())
         };
+        let skip: &[&str] = if lazy.is_some() { &["c"] } else { &[] };
+        let mut seen = |e: &quick_xml::events::BytesStart<'_>| match e.local_name().as_ref() {
+            b"c" => {
+                scan.cur = e.try_get_attribute("r").ok().flatten().and_then(|a| CellRef::parse(String::from_utf8_lossy(&a.value).trim()));
+                scan.counted = false;
+                if e.try_get_attribute("vm").ok().flatten().is_some() {
+                    scan.pictures = true;
+                }
+                // A cell that holds a format counts; one that holds a value does at its `<v>`.
+                if e.try_get_attribute("s").ok().flatten().is_some_and(|a| a.value.as_ref() != b"0") {
+                    scan.count();
+                }
+            }
+            b"v" | b"is" if !scan.counted => scan.count(),
+            b"f" => scan.formulas = true,
+            _ => {}
+        };
         if xml::is_utf16(&head) {
             // Rare: UTF-16 parts are converted whole.
             let mut all = Vec::new();
             buf.read_to_end(&mut all).map_err(|e| IoError::Zip(format!("{part}: {e}")))?;
-            xml::parse_streaming(&all, &["row"], &mut on_row)
+            let data = xml::to_utf8(&all);
+            xml::parse_streaming_skipping(data.as_ref(), &["row"], skip, &mut seen, &mut on_row)
         } else {
             if head.starts_with(&[0xEF, 0xBB, 0xBF]) {
                 buf.consume(3);
             }
-            xml::parse_streaming_reader(buf, &["row"], &mut on_row)
+            xml::parse_streaming_skipping(buf, &["row"], skip, &mut seen, &mut on_row)
         }
     });
     if let Some(e) = over {
         return Err(IoError::TooLarge(e));
+    }
+    if let Some(plan) = lazy {
+        // Only a worksheet whose cells are plain values can be read later without the rest of the
+        // workbook: a formula or a cell picture has to be seen now.
+        if scan.formulas || scan.pictures || res.is_err() {
+            return Ok(None);
+        }
+        sheet.cells = gridcraft_model::CellStore::from_cold(Box::new(plan.cells_of(part, name, scan.cells, scan.used())));
     }
     let root = match res {
         Ok(r) => r,
@@ -91,7 +172,9 @@ pub fn read_sheet(cx: &mut Ctx<'_>, part: &str, name: &str) -> Result<Sheet, IoE
     }
     drop(reader);
     // WHIQ: rows hold exactly their cells once the sheet is read.
-    sheet.cells.shrink_to_fit();
+    if lazy.is_none() {
+        sheet.cells.shrink_to_fit();
+    }
 
     let mut fit_to_page = false;
     cx.cf_ext_ids.clear();
@@ -258,7 +341,7 @@ pub fn read_sheet(cx: &mut Ctx<'_>, part: &str, name: &str) -> Result<Sheet, IoE
             }
         }
     }
-    Ok(sheet)
+    Ok(Some(sheet))
 }
 
 /// A protection password hash: the iterated attributes (`algorithmName`, `hashValue`,
@@ -373,7 +456,7 @@ fn read_cols(cx: &Ctx<'_>, e: &El, sheet: &mut Sheet) {
     }
 }
 
-fn read_row(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, row: &El) {
+fn read_row(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, row: &El, with_cells: bool) {
     st.rows += 1;
     let r = match row.attr_u32("r") {
         Some(r) if r >= 1 => r - 1,
@@ -407,6 +490,9 @@ fn read_row(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, row: &El) {
     if info != LineInfo::default() {
         sheet.rows.insert(r, info);
     }
+    if !with_cells {
+        return;
+    }
     let mut next_col = 0u32;
     for c in row.kids("c") {
         let pos = match c.attr("r") {
@@ -428,15 +514,16 @@ fn read_row(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, row: &El) {
     }
 }
 
-fn read_cell(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, c: &El, pos: CellRef) {
-    let style = cx.style(c.attr_u32("s"));
+/// The value of a `<c>` element: what the file stores in it, whatever its formula (or lack of
+/// one). What is wrong in it is given to `warn`, once for every cell.
+pub(crate) fn cell_value(c: &El, sst: &[Arc<str>], date_system: DateSystem, warn: &mut dyn FnMut(&'static str)) -> Value {
     let v = c.child("v").map(|v| v.text.as_str());
-    let value = match c.attr("t").unwrap_or("n") {
+    match c.attr("t").unwrap_or("n") {
         "s" => match v.and_then(|v| v.trim().parse::<usize>().ok()) {
-            Some(i) => match cx.sst.get(i) {
+            Some(i) => match sst.get(i) {
                 Some(s) => Value::Text(s.clone()),
                 None => {
-                    cx.warn("some cells refer to missing shared strings");
+                    warn("some cells refer to missing shared strings");
                     Value::Empty
                 }
             },
@@ -448,13 +535,13 @@ fn read_cell(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, c: &El, pos
         }
         "b" => v.map(|v| Value::Bool(matches!(v.trim(), "1" | "true" | "TRUE"))).unwrap_or(Value::Empty),
         "e" => v.map(|v| Value::Error(CellError::parse(v.trim()).unwrap_or(CellError::Value))).unwrap_or(Value::Empty),
-        "d" => match v.and_then(|v| parse_iso_datetime(v.trim(), cx.date_system)) {
+        "d" => match v.and_then(|v| parse_iso_datetime(v.trim(), date_system)) {
             Some(n) => Value::number(n),
             None => {
                 if let Some(v) = v
                     && !v.trim().is_empty()
                 {
-                    cx.warn("some date cells could not be read");
+                    warn("some date cells could not be read");
                 }
                 Value::Empty
             }
@@ -463,13 +550,22 @@ fn read_cell(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, c: &El, pos
             Some(t) => match t.parse::<f64>() {
                 Ok(n) if n.is_finite() => Value::Number(if n == 0.0 { 0.0 } else { n }),
                 _ => {
-                    cx.warn("some numeric cells could not be read");
+                    warn("some numeric cells could not be read");
                     Value::Empty
                 }
             },
             None => Value::Empty,
         },
-    };
+    }
+}
+
+fn read_cell(cx: &mut Ctx<'_>, sheet: &mut Sheet, st: &mut RowState, c: &El, pos: CellRef) {
+    let style = cx.style(c.attr_u32("s"));
+    let mut warnings: Vec<&'static str> = Vec::new();
+    let value = cell_value(c, &cx.sst, cx.date_system, &mut |m| warnings.push(m));
+    for m in warnings {
+        cx.warn(m);
+    }
     let picture = c.attr("vm").and_then(|vm| {
         if vm == "0" {
             return None;

@@ -14,6 +14,5 @@ sha2 = { workspace = true }
 gridcraft-formula = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
-
-[dev-dependencies]
+# WHIQ: cold cells are spilled to disk as JSON lines.
 serde_json = { workspace = true }

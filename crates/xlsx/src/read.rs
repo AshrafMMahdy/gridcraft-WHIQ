@@ -14,7 +14,7 @@ use crate::{IoError, ReadReport};
 pub struct Ctx<'a> {
     pub pkg: Package<'a>,
     pub report: ReadReport,
-    pub sst: Vec<Arc<str>>,
+    pub sst: Arc<Vec<Arc<str>>>,
     /// Cell format index → model style.
     pub xf_map: Vec<StyleId>,
     pub dxfs: Vec<Style>,
@@ -87,7 +87,7 @@ fn read_package(pkg: Package<'_>) -> Result<(Workbook, ReadReport), IoError> {
     let mut cx = Ctx {
         pkg,
         report: ReadReport::default(),
-        sst: vec![],
+        sst: Arc::new(vec![]),
         xf_map: vec![],
         dxfs: vec![],
         palette: crate::tables::INDEXED.to_vec(),
@@ -160,23 +160,16 @@ fn read_package(pkg: Package<'_>) -> Result<(Workbook, ReadReport), IoError> {
     {
         wb.theme = crate::theme::read_theme(&x);
     }
-    // Shared strings, streamed item by item.
-    if let Some(r) = find_rel(&wb_rels, "sharedStrings").cloned() {
-        match cx.pkg.read(&r.target)? {
-            Some(b) => {
-                let mut sst = Vec::new();
-                let res = xml::parse_streaming(&b, &["si"], &mut |si| {
-                    sst.push(Arc::from(xml::rich_text(&si)));
-                    Ok(())
-                });
-                if let Err(e) = res {
-                    cx.warn(format!("shared strings are damaged ({e}); kept {} strings", sst.len()));
-                }
-                cx.sst = sst;
-            }
-            None => cx.warn(format!("missing part {}", r.target)),
-        }
+    // Shared strings, streamed item by item. WHIQ: a workbook whose sheets stay on disk does not
+    // hold them: a sheet read whole loads them when it needs them, a sheet read later takes the
+    // few it uses from the part ([`crate::lazy`]).
+    let sst_target = find_rel(&wb_rels, "sharedStrings").map(|r| r.target.clone());
+    let sheet_els: Vec<El> = wb_xml.child("sheets").map(|s| s.kids("sheet").cloned().collect()).unwrap_or_default();
+    let lazy = lazy_plan(&cx, &wb_rels, &sheet_els, sst_target.clone());
+    if lazy.is_none() {
+        load_sst(&mut cx, sst_target.as_deref())?;
     }
+    let mut sst_loaded = lazy.is_none();
 
     if let Some(r) = find_rel(&wb_rels, "person").cloned()
         && let Ok(Some(x)) = cx.pkg.read_xml(&r.target)
@@ -219,7 +212,10 @@ fn read_package(pkg: Package<'_>) -> Result<(Workbook, ReadReport), IoError> {
     // Sheets. `file_to_model[i]` maps the i-th <sheet> to a model sheet index.
     let mut file_to_model: Vec<Option<usize>> = vec![];
     let mut pivot_caches = crate::pivot::CachesIn::new(&wb_xml, &wb_rels);
-    let sheet_els: Vec<El> = wb_xml.child("sheets").map(|s| s.kids("sheet").cloned().collect()).unwrap_or_default();
+    // WHIQ: a workbook whose worksheets would fill a good share of the memory budget keeps the cells
+    // of its plain worksheets in the file until they are looked at, and writes the others to disk
+    // as they are read once the cells in memory reach half the budget.
+    let mut resident = 0u64;
     for (i, se) in sheet_els.iter().enumerate() {
         // WHIQ parity pass: progress by sheet for job_status.
         gridcraft_core::progress::step_in("reading sheets", i as u64, sheet_els.len() as u64);
@@ -241,7 +237,27 @@ fn read_package(pkg: Package<'_>) -> Result<(Workbook, ReadReport), IoError> {
             continue;
         }
         let name = unique_name(&wb, &name, i);
-        let mut sheet = match crate::sheet_read::read_sheet(&mut cx, &rel.target, &name) {
+        let lazy_part = lazy.as_ref().filter(|_| cx.pkg.part_size(&rel.target).is_some_and(|n| n >= LAZY_MIN_PART));
+        // A sheet read whole needs the shared strings; one that may stay on disk is scanned for
+        // everything but its cells first and needs them only if it turns out to have to be read.
+        let read = match lazy_part {
+            Some(plan) => crate::sheet_read::read_sheet_lazy(&mut cx, &rel.target, &name, plan, &mut |cx| {
+                if !sst_loaded {
+                    sst_loaded = true;
+                    load_sst(cx, sst_target.as_deref())
+                } else {
+                    Ok(())
+                }
+            }),
+            None => {
+                if !sst_loaded {
+                    sst_loaded = true;
+                    load_sst(&mut cx, sst_target.as_deref())?;
+                }
+                crate::sheet_read::read_sheet(&mut cx, &rel.target, &name)
+            }
+        };
+        let mut sheet = match read {
             Ok(s) => s,
             Err(IoError::TooLarge(m)) => return Err(IoError::TooLarge(m)),
             Err(e) => {
@@ -260,11 +276,25 @@ fn read_package(pkg: Package<'_>) -> Result<(Workbook, ReadReport), IoError> {
             Some("veryHidden") => Visibility::VeryHidden,
             _ => Visibility::Visible,
         };
+        if lazy.is_some() {
+            resident = resident.saturating_add(sheet.cells.resident_bytes());
+            if resident > gridcraft_core::memory::budget() / 2 {
+                let bytes = sheet.cells.resident_bytes();
+                match sheet.cells.spill() {
+                    Ok(true) => resident = resident.saturating_sub(bytes),
+                    Ok(false) => {}
+                    Err(e) => cx.warn(format!("sheet \"{}\" stays in memory, it could not be written to disk: {e}", sheet.name)),
+                }
+            }
+        }
         file_to_model.push(Some(wb.sheets.len()));
         if let Some(id) = se.attr_u32("sheetId") {
             cx.sheet_ids.push((id, sheet.name.clone()));
         }
         wb.sheets.push(Arc::new(sheet));
+    }
+    if lazy.is_some() {
+        cx.sst = Arc::new(Vec::new());
     }
     if wb.sheets.is_empty() {
         cx.warn("the workbook has no worksheets; added an empty sheet");
@@ -372,6 +402,42 @@ fn read_package(pkg: Package<'_>) -> Result<(Workbook, ReadReport), IoError> {
     wb.apply_name_call_case();
     wb.styles = cx.styles;
     Ok((wb, cx.report))
+}
+
+/// The shared strings part read into `cx.sst` (a missing or damaged one is a warning).
+fn load_sst(cx: &mut Ctx<'_>, target: Option<&str>) -> Result<(), IoError> {
+    let Some(target) = target else { return Ok(()) };
+    match cx.pkg.read(target)? {
+        Some(b) => {
+            let mut sst = Vec::new();
+            let res = xml::parse_streaming(&b, &["si"], &mut |si| {
+                sst.push(Arc::from(xml::rich_text(&si)));
+                Ok(())
+            });
+            if let Err(e) = res {
+                cx.warn(format!("shared strings are damaged ({e}); kept {} strings", sst.len()));
+            }
+            cx.sst = Arc::new(sst);
+        }
+        None => cx.warn(format!("missing part {target}")),
+    }
+    Ok(())
+}
+
+/// A worksheet part at least this big (inflated) is a candidate for staying in the file.
+const LAZY_MIN_PART: u64 = 256 * 1024;
+
+/// The plan for leaving cells in the file, when the package is a file and its worksheets, inflated,
+/// would take more than a quarter of the memory budget.
+fn lazy_plan(cx: &Ctx<'_>, wb_rels: &[Rel], sheet_els: &[El], sst_part: Option<String>) -> Option<crate::lazy::LazyPlan> {
+    cx.pkg.file()?;
+    let total: u64 = sheet_els
+        .iter()
+        .filter_map(|se| se.attr("id").and_then(|id| wb_rels.iter().find(|r| r.id == id)))
+        .filter(|r| r.kind == "worksheet")
+        .filter_map(|r| cx.pkg.part_size(&r.target))
+        .fold(0, u64::saturating_add);
+    (total > gridcraft_core::memory::budget() / 4).then(|| crate::lazy::LazyPlan::new(cx, sst_part)).flatten()
 }
 
 pub(crate) fn unique_name(wb: &Workbook, name: &str, i: usize) -> String {

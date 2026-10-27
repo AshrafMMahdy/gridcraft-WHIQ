@@ -76,6 +76,14 @@ fn table_columns(t: &Table) -> Vec<String> {
 pub fn write_sheet_into(wb: &Workbook, si: usize, selected: bool, out: &mut Out, w: &mut dyn std::io::Write) -> Result<Rels, IoError> {
     let mut sink = Sink { w, err: None };
     let rels = write_sheet_with(wb, si, selected, out, &mut sink);
+    // WHIQ: cells that could not be read back (their file changed or was lost) are not a sheet to
+    // save as empty.
+    if let Some(why) = wb.sheet(si).and_then(|s| s.cells.load_failure()) {
+        return Err(IoError::Format(format!(
+            "sheet \"{}\" could not be read back, so nothing was saved: {why}",
+            wb.sheet(si).map(|s| s.name.as_str()).unwrap_or("")
+        )));
+    }
     match sink.err {
         Some(e) => Err(IoError::Zip(format!("writing sheet {}: {e}", si + 1))),
         None => Ok(rels),
@@ -107,7 +115,18 @@ const FLUSH_AT: usize = 4 << 20;
 
 fn write_sheet_with(wb: &Workbook, si: usize, selected: bool, out: &mut Out, sink: &mut Sink<'_>) -> Rels {
     let mut rels = Rels::default();
-    let Some(sheet) = wb.sheet(si) else { return rels };
+    let Some(shared) = wb.sheet(si) else { return rels };
+    // WHIQ: a sheet whose cells are on disk is written from a copy read for this save alone, so a
+    // workbook larger than memory goes out one sheet at a time.
+    let transient;
+    let sheet = if shared.cells.is_resident() {
+        shared
+    } else {
+        let mut t = shared.clone();
+        t.cells = shared.cells.transient();
+        transient = t;
+        &transient
+    };
     let nstyles = wb.styles.len() as u32;
     let sid = |s: gridcraft_model::StyleId| if s.0 < nstyles { s.0 } else { 0 };
 
@@ -776,6 +795,9 @@ fn write_cell(
         Value::Empty | Value::Array(_) => s.push_str("/>"),
         Value::Number(n) => {
             let _ = write!(s, "><v>{}</v></c>", num(*n));
+        }
+        Value::Text(t) if out.inline_strings => {
+            let _ = write!(s, " t=\"inlineStr\"><is>{}</is></c>", crate::xml::t_el(t));
         }
         Value::Text(t) => {
             let i = out.sst.index(t);
