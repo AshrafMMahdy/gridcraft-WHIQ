@@ -201,6 +201,23 @@ pub fn save_bytes(wb: &Workbook, path: &str) -> Result<Vec<u8>> {
 
 /// Encodes a workbook as `kind`, whatever `path`'s extension says.
 pub fn save_bytes_as(wb: &Workbook, path: &str, kind: FileKind) -> Result<Vec<u8>> {
+    let bytes = save_bytes_unchecked(wb, path, kind)?;
+    check_cells_read(wb)?;
+    Ok(bytes)
+}
+
+/// WHIQ: a save of cells that could not be read back (their file changed or was lost) is refused,
+/// whatever the format: the sheet would be written empty.
+pub fn check_cells_read(wb: &Workbook) -> Result<()> {
+    for sh in &wb.sheets {
+        if let Some(why) = sh.cells.load_failure() {
+            return Err(EngineError::Other(format!("sheet \"{}\" could not be read back, so nothing was saved: {why}", sh.name)));
+        }
+    }
+    Ok(())
+}
+
+fn save_bytes_unchecked(wb: &Workbook, path: &str, kind: FileKind) -> Result<Vec<u8>> {
     let sheet = wb.active_sheet;
     match kind {
         // The extension picks the package kind; only the macro-enabled kinds (.xlsm, .xltm) carry
@@ -299,6 +316,8 @@ pub fn export_csv_range(wb: &Workbook, sh: &Sheet, range: Option<RangeRef>, deli
             }
             std::io::Write::flush(&mut w).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
         }
+        // The cells just written may not have been readable: then the file is not the sheet.
+        check_cells_read(wb)?;
         n = f.metadata().map(|m| m.len()).unwrap_or(0);
         Ok(())
     })?;
@@ -1113,6 +1132,27 @@ mod tests {
         assert_eq!(back.value(CellRef::new(0, 0)), gridcraft_core::Value::text("a"));
         assert_eq!(back.value(last), gridcraft_core::Value::text("b"));
         assert!(free_space_for(path).is_some_and(|f| f > 0), "the free space of the disk is known");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Cells whose spill file was damaged are not saved as an empty sheet, in any format.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn whiq_a_damaged_spill_refuses_every_save() {
+        let mut wb = Workbook::new();
+        wb.sheet_mut(0).unwrap().set_value(CellRef::new(0, 0), gridcraft_core::Value::text("precious"));
+        let sheet = std::sync::Arc::get_mut(&mut wb.sheets[0]).unwrap();
+        assert!(sheet.cells.spill().unwrap());
+        let path = sheet.cells.describe_source().unwrap().trim_start_matches("spill file ").to_string();
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(0).unwrap();
+        let dir = std::env::temp_dir().join(format!("gridcraft-damaged-spill-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["a.csv", "a.tsv", "a.json", "a.xlsx", "a.html"] {
+            let target = dir.join(name);
+            let err = save_to_path(&wb, target.to_str().unwrap(), None).unwrap_err().to_string();
+            assert!(err.contains("could not be read back"), "{name}: {err}");
+            assert!(!target.exists(), "{name}: nothing was written");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
