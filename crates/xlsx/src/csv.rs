@@ -233,10 +233,12 @@ impl RowSpills {
 /// the bound) and nothing held but one row. Returns the rows written.
 ///
 /// Rows are RAGGED: the empty cells at the end of a row are dropped (the row ends at its last
-/// non-empty cell) and a row with no text is an empty line, so a sparse sheet costs what its data
-/// costs, not the area of its used range. Every line starts at the range's first column, and a
-/// reader puts each field back in its cell (a row with fewer fields leaves the rest empty). Only
-/// the cells that exist (stored, or spilled into) are asked for their text.
+/// non-empty cell), so a sparse sheet costs what its data costs, not the area of its used range.
+/// Two things keep it readable by tools that take the width from the first row and skip blank
+/// lines (pandas, Excel): the FIRST row is padded to the width of the range, and a row with
+/// nothing in it is one empty quoted field (`""`), not an empty line. Every line starts at the
+/// range's first column, and a reader puts each field back in its cell (a row with fewer fields
+/// leaves the rest empty). Only the cells that exist (stored, or spilled into) are asked for text.
 pub fn write_csv_range_into(
     sheet: &Sheet,
     range: RangeRef,
@@ -283,6 +285,18 @@ pub fn write_csv_range_into(
             for col in c0..=spill_end.max(stored_end) {
                 field(col, cell_text(CellRef::new(row, col)), &mut line);
             }
+        }
+        // The first row is as wide as the range: readers that take their width from it (pandas) see
+        // every later row fit. A row with nothing in it is one empty quoted field, not an empty
+        // line, which readers skip.
+        if row == range.start.row {
+            match prev {
+                Some(p) => line.extend(std::iter::repeat_n(delim, (c1 - p) as usize)),
+                None if c1 > c0 => line.extend(std::iter::repeat_n(delim, (c1 - c0) as usize)),
+                None => line.push_str("\"\""),
+            }
+        } else if prev.is_none() {
+            line.push_str("\"\"");
         }
         line.push_str("\r\n");
         w.write_all(line.as_bytes()).map_err(|e| IoError::Zip(format!("writing the CSV: {e}")))?;

@@ -18,8 +18,9 @@ fn session_with(cells: &[(&str, &str)]) -> Session {
 #[test]
 fn a_sparse_sheet_spanning_the_grid_exports_small_and_reads_back_to_the_same_cells() {
     let mut s = session_with(&[("A1", "a"), ("XFD1048576", "b")]);
-    // 1,048,574 blank lines (2 bytes each), 16,383 commas and the two fields.
-    let expected = 3 + 1_048_574 * 2 + 16_383 + 1 + 2;
+    // The first row padded to the width (16,383 commas), 1,048,574 blank rows of `""` (4 bytes
+    // each), and the last row's 16,383 commas and field.
+    let expected = (1 + 16_383 + 2) + 1_048_574 * 4 + 16_383 + 1 + 2;
     for format in ["csv", "tsv"] {
         assert_eq!(s.execute("file.saveBytes", json!({"format": format})).unwrap()["bytes"], expected, "{format}");
     }
@@ -39,8 +40,33 @@ fn a_sparse_sheet_spanning_the_grid_exports_small_and_reads_back_to_the_same_cel
 
 #[test]
 fn exports_keep_their_positions_and_drop_only_trailing_empties() {
-    for (corner, bytes) in [("C3", 3 + 2 + 5), ("Z10", 3 + 8 * 2 + 25 + 1 + 2), ("XFD8", 3 + 6 * 2 + 16_383 + 1 + 2)] {
+    for (corner, bytes) in [("C3", 5 + 4 + 5), ("Z10", 28 + 8 * 4 + 28), ("XFD8", 16_386 + 6 * 4 + 16_386)] {
         let mut s = session_with(&[("A1", "a"), (corner, "b")]);
         assert_eq!(s.execute("file.saveBytes", json!({"format": "csv"})).unwrap()["bytes"], bytes, "{corner}");
     }
+}
+
+/// A pandas that is installed reads the export of a sparse sheet at the shape of its used range:
+/// the first row is as wide as the range and a blank row is not skipped.
+#[test]
+fn pandas_reads_a_sparse_export_at_the_shape_of_the_sheet() {
+    let python = ["python3.13", "python3", "python"]
+        .into_iter()
+        .find(|p| std::process::Command::new(p).args(["-c", "import pandas"]).output().is_ok_and(|o| o.status.success()));
+    let Some(python) = python else {
+        eprintln!("pandas is not installed: skipped");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("gridcraft-csv-pandas-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (cells, shape) in [(vec![("A1", "h1"), ("B1", "h2"), ("E5", "note")], (5, 5)), (vec![("B2", "x"), ("Z50", "y")], (49, 25))] {
+        let mut s = session_with(&cells);
+        let path = dir.join("sparse.csv");
+        s.execute("file.exportCsv", json!({"path": path.to_str().unwrap()})).unwrap();
+        let code = format!("import pandas as pd; d = pd.read_csv(r'{}', header=None); print(d.shape[0], d.shape[1])", path.display());
+        let out = std::process::Command::new(python).args(["-c", &code]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), format!("{} {}", shape.0, shape.1), "{cells:?}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
 }

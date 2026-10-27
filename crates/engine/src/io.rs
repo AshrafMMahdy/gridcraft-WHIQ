@@ -936,7 +936,7 @@ mod tests {
 
     /// Cut-list rows as a CAD/CAM program exports them: `;`-separated, CRLF, part codes in the last
     /// two columns, a part name containing a comma.
-    const CUT_LIST: &str = "1;511;184;P3_L1_led;2162PE;16;1MM_2162PE;1MM_2162PE;;;1244121406FB\r\n\
+    const CUT_LIST: &str = "1;511;184;P3_L1_led;2162PE;16;1MM_2162PE;1MM_2162PE;;;1244121406FB;\r\n\
                             1;562.5;510;Komoda, lijevo;2162PE;19;1MM_2162PE;;;;12441214071A;124412140710\r\n";
 
     #[test]
@@ -1106,7 +1106,7 @@ mod tests {
         let sh = wb.sheet(0).unwrap();
         let (rows, bytes) = export_csv_range(&wb, sh, sh.used_range(), b',', path).unwrap();
         assert_eq!(rows, u64::from(gridcraft_core::MAX_ROWS));
-        assert!(bytes < 3 << 20, "{bytes} bytes");
+        assert!(bytes < 5 << 20, "{bytes} bytes");
         let (back, _) = open_bytes("corners.csv", &std::fs::read(path).unwrap()).unwrap();
         let back = back.sheet(0).unwrap();
         assert_eq!(back.cells.len(), 2);
