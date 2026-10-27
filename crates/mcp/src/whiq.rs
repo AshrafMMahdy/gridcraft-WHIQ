@@ -220,7 +220,8 @@ fn tool(name: &str, title: &str, desc: &str, schema: Value, hints: Hints) -> Val
 }
 
 /// Tools that write files: they take `overwrite`.
-pub(crate) const WRITES_FILES: &[&str] = &["save_workbook", "export_pdf", "render_range", "render_sheet", "build_workbook", "screenshot", "export_range"];
+pub(crate) const WRITES_FILES: &[&str] =
+    &["save_workbook", "export_pdf", "render_range", "render_sheet", "build_workbook", "screenshot", "export_range"];
 
 /// Tools that work without an open document (they stay available after an eviction).
 const NEEDS_NO_DOCUMENT: &[&str] = &[
@@ -868,7 +869,9 @@ pub fn run_tool(b: &mut dyn Backend, st: &mut CallState, name: &str, args: &Valu
         if let Some(r) = save_evicted(name, &Value::Object(a.clone()), ev, overwrite) {
             return match r {
                 Ok(v) => ToolResult::json(&v),
-                Err(e) => ToolResult::failure(&ToolError::new("failed", e, "check the path and the write root, or open the workbook again and save it")),
+                Err(e) => {
+                    ToolResult::failure(&ToolError::new("failed", e, "check the path and the write root, or open the workbook again and save it"))
+                }
             };
         }
         return ToolResult::failure(&ev.error());

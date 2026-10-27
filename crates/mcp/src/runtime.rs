@@ -1187,7 +1187,11 @@ fn memory_after_call(server: &mut Server, shared: &Shared) -> Option<Value> {
         return None;
     }
     let before = lock(&shared.evicted).clone();
-    evict(server, shared, format!("the workbook was closed because the server used {} MB, over its {} MB limit (--max-memory-mb)", rss >> 20, max >> 20));
+    evict(
+        server,
+        shared,
+        format!("the workbook was closed because the server used {} MB, over its {} MB limit (--max-memory-mb)", rss >> 20, max >> 20),
+    );
     let ev = lock(&shared.evicted).clone().filter(|e| Some(e) != before.as_ref())?;
     let reopen = ev.recovered.as_ref().map(|p| p.display().to_string()).or_else(|| ev.original.clone());
     Some(json!({

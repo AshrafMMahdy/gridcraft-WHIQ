@@ -157,11 +157,7 @@ impl<'a> Package<'a> {
     pub fn open_source(src: Source<'a>) -> Result<Package<'a>, IoError> {
         let zip = zip::ZipArchive::new(src).map_err(|e| IoError::Zip(e.to_string()))?;
         if zip.len() > max_entries() {
-            return Err(IoError::TooLarge(format!(
-                "{} zip entries (this process's memory budget indexes up to {})",
-                zip.len(),
-                max_entries()
-            )));
+            return Err(IoError::TooLarge(format!("{} zip entries (this process's memory budget indexes up to {})", zip.len(), max_entries())));
         }
         let mut names = HashMap::new();
         for i in 0..zip.len() {

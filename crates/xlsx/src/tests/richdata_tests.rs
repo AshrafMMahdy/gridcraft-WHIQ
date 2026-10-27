@@ -255,6 +255,9 @@ fn oversized_entry(mut bytes: Vec<u8>, path: &str, size: u32) -> Vec<u8> {
 
 #[test]
 fn picture_metadata_limits_and_relationship_read_errors_do_not_block_workbooks() {
+    // WHIQ: the part limit is a floor (512 MB) that grows with the memory budget; the floor is
+    // what the fixture's declared size crosses.
+    gridcraft_core::memory::set_budget(1 << 20);
     let mut parts = independent_parts(false);
     replace(&mut parts, "sheets/data.xml", "</sheetData>", "<row r=\"3\"><c r=\"C3\"><v>42</v></c></row></sheetData>");
     let oversized_xml = oversized_entry(zip(&parts), "rich/values.xml", 16 * 1024 * 1024 + 1);

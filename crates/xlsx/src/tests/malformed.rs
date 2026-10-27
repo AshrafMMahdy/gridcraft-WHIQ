@@ -107,6 +107,9 @@ fn deeply_nested_and_broken_xml() {
 
 #[test]
 fn zip_bomb_is_rejected() {
+    // WHIQ: the part limit is a floor (512 MB) that grows with the memory budget; the floor is
+    // what this test crosses.
+    gridcraft_core::memory::set_budget(1 << 20);
     // A part that inflates beyond the per-part cap: 600 MB of zeros compresses very well, but
     // building it takes a while, so test the cap via a declared size instead using a smaller
     // stand-in limit check on the reader path.

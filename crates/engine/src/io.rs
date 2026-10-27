@@ -280,13 +280,19 @@ pub fn source_dir(path: &str) -> Option<std::path::PathBuf> {
 /// bytes).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn export_csv_range(wb: &Workbook, sh: &Sheet, range: Option<RangeRef>, delimiter: u8, path: &str) -> Result<(u64, u64)> {
+    if let Some(r) = range
+        && let Some(why) = sparse_export_refusal(r, sh.cells.len() as u64)
+    {
+        return Err(EngineError::Other(why));
+    }
     let mut rows = 0;
     let mut n = 0;
     write_file_with(path, &mut |f| {
         {
             let mut w = std::io::BufWriter::with_capacity(1 << 20, &mut *f);
             if let Some(r) = range {
-                rows = gridcraft_xlsx::write_csv_range_into(r, delimiter, &mut w, |c| csv_text(wb, sh, c)).map_err(|e| EngineError::Other(e.to_string()))?;
+                rows = gridcraft_xlsx::write_csv_range_into(r, delimiter, &mut w, |c| csv_text(wb, sh, c))
+                    .map_err(|e| EngineError::Other(e.to_string()))?;
             }
             std::io::Write::flush(&mut w).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
         }
@@ -294,6 +300,25 @@ pub fn export_csv_range(wb: &Workbook, sh: &Sheet, range: Option<RangeRef>, deli
         Ok(())
     })?;
     Ok((rows, n))
+}
+
+/// A delimited export streams to the file, whatever the size of the data; what it refuses is the
+/// expansion of a sparse sheet: a rectangle past [`SPARSE_EXPORT_BYTES`] of which almost every cell
+/// is empty (two cells at opposite corners of the grid would write 17 GB of commas). The reason
+/// gives the numbers and the way (a range).
+const SPARSE_EXPORT_BYTES: u64 = 4 << 30;
+
+fn sparse_export_refusal(r: RangeRef, cells: u64) -> Option<String> {
+    let rows = u64::from(r.end.row.saturating_sub(r.start.row)) + 1;
+    let cols = u64::from(r.end.col.saturating_sub(r.start.col)) + 1;
+    let bytes = rows.saturating_mul(cols.saturating_add(1));
+    (bytes > SPARSE_EXPORT_BYTES && cells.saturating_mul(64) < bytes).then(|| {
+        format!(
+            "the CSV would be at least {} MiB ({rows} rows by {cols} columns), almost all of it empty cells, over the limit for a sparse sheet ({} MiB); export the part that holds data (a range)",
+            bytes >> 20,
+            SPARSE_EXPORT_BYTES >> 20
+        )
+    })
 }
 
 /// One cell's text in a delimited file.
@@ -1045,5 +1070,17 @@ mod tests {
             let (opened, _) = open_bytes(name, b"a,b\n1,2\n").unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(opened.sheet(0).unwrap().value(CellRef::new(0, 1)), gridcraft_core::Value::text("b"), "{name}");
         }
+    }
+
+    /// A delimited export streams whatever the data: only the blank expansion of a sparse sheet
+    /// past 4 GiB is refused.
+    #[test]
+    fn whiq_a_csv_export_refuses_blank_expansion_not_data() {
+        let all = RangeRef::new(CellRef::new(0, 0), CellRef::new(1_048_575, 16_383));
+        assert!(sparse_export_refusal(all, 2).is_some_and(|m| m.contains("1048576 rows by 16384 columns") && m.contains("over the limit")));
+        // The same rectangle full of data is a real (17 GB) export: not refused.
+        assert!(sparse_export_refusal(all, 1_048_576 * 16_384).is_none());
+        // 8.4 M cells of a BOQ, or a wide sheet below 4 GiB, whatever the fill.
+        assert!(sparse_export_refusal(RangeRef::new(CellRef::new(0, 0), CellRef::new(500_000, 11)), 10).is_none());
     }
 }

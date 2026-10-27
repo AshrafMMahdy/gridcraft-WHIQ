@@ -1262,7 +1262,7 @@ pub(crate) mod tests {
     use gridcraft_core::{CellRef, RangeRef, Value};
     use gridcraft_model::{Cell, Formula, Workbook};
 
-    use super::{Calc, HashMap, Host, Intervals, Key, PassHost};
+    use super::{Calc, HashMap, Host, Intervals, Key, PassExprs, PassHost};
 
     /// xorshift64 for repeatable pseudo-random cases.
     fn rng(state: &mut u64) -> u64 {
