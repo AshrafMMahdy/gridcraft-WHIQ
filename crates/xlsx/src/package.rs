@@ -36,6 +36,7 @@ fn max_entries() -> usize {
 /// A file read by position, so clones of a package's zip each keep their own place.
 #[derive(Clone, Debug)]
 pub struct PosFile {
+    #[cfg_attr(not(any(unix, windows)), allow(dead_code))]
     file: Arc<std::fs::File>,
     pos: u64,
     len: u64,
