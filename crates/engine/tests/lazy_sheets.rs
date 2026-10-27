@@ -78,6 +78,10 @@ fn a_workbook_several_times_the_budget_opens_edits_one_sheet_and_saves_intact() 
     assert_eq!(info["sheets"][2]["cells"], 3 * ROWS);
     assert!((0..SHEETS).all(|i| !s.active().unwrap().wb.sheets[i].cells.is_resident()), "the summary read no data sheet");
 
+    // Formulas saved with no value are calculated on open, from sheets that stayed on disk.
+    let got = s.execute("cell.get", json!({"cell": "Totals!A5"})).unwrap();
+    assert_eq!(got["value"], 12.0, "=Data0!B5*2 was calculated: {got}");
+
     // Reading a cell reads its sheet (and the pass between commands puts it back).
     let got = s.execute("cell.get", json!({"cell": "Data3!A11"})).unwrap();
     assert_eq!(got["value"], "sheet 3 item 10 of a long bill of quantities");
@@ -112,6 +116,7 @@ fn a_workbook_several_times_the_budget_opens_edits_one_sheet_and_saves_intact() 
             assert_eq!(a.cells, b.cells, "sheet {} is intact", a.name);
         } else {
             assert_eq!(a.cells.len(), b.cells.len());
+            assert_eq!(a.value(CellRef::new(4, 0)), Value::Number(12.0), "the saved formula carries its value");
         }
     }
     std::fs::remove_dir_all(&dir).unwrap();

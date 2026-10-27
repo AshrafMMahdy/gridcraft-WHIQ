@@ -967,20 +967,44 @@ impl Calc {
         }
     }
 
-    /// WHIQ: the dependency graph of a workbook opened with sheets left on disk, built without
-    /// calculating anything (the values the file carries stand until an edit reaches them) and
-    /// without keeping the sheets it had to read: each one that was not in memory goes back to disk
-    /// as soon as its formulas are in the graph.
+    /// WHIQ: the dependency graph of a workbook opened with sheets left on disk, and its formulas
+    /// calculated a sheet at a time. A sheet read from disk is put back as soon as its formulas are
+    /// in the graph (and calculated), so the workbook is never all in memory; sheets with no formula
+    /// are not read at all unless a formula refers to them.
     pub fn load_graph(&mut self, wb: &mut Workbook) {
         self.graph = Graph::default();
+        let was_cold: Vec<bool> = wb.sheets.iter().map(|s| !s.cells.is_resident()).collect();
         for si in 0..wb.sheets.len() {
-            let was_cold = wb.sheets.get(si).is_some_and(|s| !s.cells.is_resident());
             self.add_sheet_nodes(wb, si);
-            if was_cold && let Some(sh) = wb.sheets.get_mut(si).and_then(Arc::get_mut) {
+            if was_cold.get(si).copied().unwrap_or(false)
+                && let Some(sh) = wb.sheets.get_mut(si).and_then(Arc::get_mut)
+            {
                 sh.cells.evict();
             }
         }
         self.graph.settle();
+        // The formulas of each sheet, calculated with the sheets they read (read when needed).
+        let mut by_sheet: Vec<Vec<Key>> = vec![Vec::new(); wb.sheets.len()];
+        for k in self.graph.nodes.keys() {
+            if let Some(v) = by_sheet.get_mut(k.0) {
+                v.push(*k);
+            }
+        }
+        for keys in by_sheet {
+            if keys.is_empty() {
+                continue;
+            }
+            self.run(wb, keys, true);
+            // Sheets the calculation read go back; so does this one, if it came from disk.
+            for (i, cold) in was_cold.iter().enumerate() {
+                if *cold && let Some(sh) = wb.sheets.get_mut(i).and_then(Arc::get_mut) {
+                    // Values written back make a sheet differ from its source: spill it.
+                    if sh.cells.is_resident() && sh.cells.spill().is_err() {
+                        log::warn!("sheet \"{}\" stays in memory, it could not be written to disk", sh.name);
+                    }
+                }
+            }
+        }
     }
 
     /// Recalculates every formula (F9 / Ctrl+Alt+F9, and after loading).
