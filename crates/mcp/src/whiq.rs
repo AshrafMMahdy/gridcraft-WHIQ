@@ -581,10 +581,11 @@ pub(crate) fn dispatch_extra(b: &mut dyn Backend, name: &str, a: &Args) -> Resul
             };
             gridcraft_engine::core::progress::step_in("round trip: saving and comparing", 1, 2);
             let kind = gridcraft_engine::xlsx::XlsxKind::from_path(path);
+            static SCRATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let scratch = std::env::temp_dir().join(format!(
                 "gridcraft-roundtrip-{}-{}.xlsx",
                 std::process::id(),
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+                SCRATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
             let r = (|| -> Result<Value, String> {
                 {

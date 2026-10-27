@@ -49,6 +49,7 @@ impl PosFile {
 }
 
 impl Read for PosFile {
+    #[cfg_attr(not(any(unix, windows)), allow(unused_variables, unreachable_code))]
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         #[cfg(unix)]
         let n = std::os::unix::fs::FileExt::read_at(&*self.file, buf, self.pos)?;
