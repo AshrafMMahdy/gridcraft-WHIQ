@@ -686,13 +686,25 @@ mod tests {
     }
 
     #[test]
-    fn whiq_a_lost_spill_is_said_not_read_as_empty() {
+    fn whiq_a_spill_file_a_cleaner_deletes_still_reads_and_a_damaged_one_is_said() {
         let mut s = CellStore::new();
         s.set(c(1, 1), Cell::value(1.0.into()));
         assert!(s.spill().unwrap());
-        let path = s.describe_source().unwrap();
-        std::fs::remove_file(path.trim_start_matches("spill file ")).unwrap();
-        assert!(s.get(c(1, 1)).is_none());
-        assert!(s.load_failure().is_some_and(|m| m.contains("spill file")), "{:?}", s.load_failure());
+        let path = s.describe_source().unwrap().trim_start_matches("spill file ").to_string();
+        // Deleted behind our back (a temp cleaner): the handle we hold still reads it.
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&path).unwrap();
+            assert_eq!(s.get(c(1, 1)).map(|x| x.value.clone()), Some(Value::Number(1.0)));
+            assert!(s.load_failure().is_none());
+        }
+        // Damaged in place (truncated): said, never read as an empty sheet.
+        let mut t = CellStore::new();
+        t.set(c(2, 2), Cell::value(2.0.into()));
+        assert!(t.spill().unwrap());
+        let path = t.describe_source().unwrap().trim_start_matches("spill file ").to_string();
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(0).unwrap();
+        assert!(t.get(c(2, 2)).is_none());
+        assert!(t.load_failure().is_some_and(|m| m.contains("spill file")), "{:?}", t.load_failure());
     }
 }
