@@ -1229,16 +1229,24 @@ fn evict(server: &mut Server, shared: &Shared, reason: String) {
         "evict"
     };
     // Every open workbook with unsaved work, each to its own recovered file.
-    let recovered = snap.as_ref().filter(|s| s.dirty).and_then(|s| shared.autosave(s, kind));
-    let others: Vec<PathBuf> =
-        snap.as_ref().map(|s| s.others.iter().filter(|d| d.dirty).filter_map(|d| shared.autosave(d, kind)).collect()).unwrap_or_default();
+    let recoveries: Vec<crate::whiq::EvictedDoc> = snap
+        .iter()
+        .flat_map(|s| s.all())
+        .map(|d| crate::whiq::EvictedDoc {
+            handle: d.handle.clone(),
+            recovered: d.dirty.then(|| shared.autosave(d, kind)).flatten(),
+            original: d.path.clone(),
+        })
+        .collect();
+    let recovered = recoveries.first().and_then(|d| d.recovered.clone());
+    let others: Vec<PathBuf> = recoveries.iter().skip(1).filter_map(|d| d.recovered.clone()).collect();
     for p in recovered.iter().chain(others.iter()) {
         // The `evicted` answer names them: no separate announcement.
         let text = p.display().to_string();
         lock(&shared.unannounced).retain(|r| r["path"] != text.as_str());
     }
     server.backend().reset();
-    let ev = Eviction { reason, recovered, others, original: snap.and_then(|s| s.path) };
+    let ev = Eviction { reason, recovered, others, original: snap.and_then(|s| s.path), docs: recoveries };
     eprintln!("gridcraft-cli: {}", ev.reason);
     server.state_mut().evicted = Some(ev.clone());
     *lock(&shared.evicted) = Some(ev);

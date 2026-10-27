@@ -76,6 +76,17 @@ pub struct Eviction {
     pub others: Vec<PathBuf>,
     /// The file the document came from, if any.
     pub original: Option<String>,
+    /// WHIQ: every document that was open, by handle, with its own recovered file and original:
+    /// a save names its document and gets that document's work.
+    pub docs: Vec<EvictedDoc>,
+}
+
+/// One document closed by an eviction.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EvictedDoc {
+    pub handle: String,
+    pub recovered: Option<PathBuf>,
+    pub original: Option<String>,
 }
 
 impl Eviction {
@@ -123,8 +134,21 @@ fn save_evicted(name: &str, a: &Value, ev: &Eviction, overwrite: bool) -> Option
         }
         _ => return None,
     };
-    let source = ev.recovered.as_ref().map(|p| p.display().to_string()).or_else(|| ev.original.clone())?;
-    let target = params.get("path").and_then(Value::as_str).map(String::from).or_else(|| ev.original.clone())?;
+    // The document the call names (the active one when it names none).
+    let want = a.get("document").and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(crate::backend::handle_of)));
+    let (recovered, original) = match (&want, ev.docs.is_empty()) {
+        (_, true) => (ev.recovered.clone(), ev.original.clone()),
+        (Some(h), false) => match ev.docs.iter().find(|d| &d.handle == h) {
+            Some(d) => (d.recovered.clone(), d.original.clone()),
+            None => {
+                let open: Vec<&str> = ev.docs.iter().map(|d| d.handle.as_str()).collect();
+                return Some(Err(format!("no workbook closed by the eviction has the handle `{h}` (they were: {})", open.join(", "))));
+            }
+        },
+        (None, false) => ev.docs.first().map_or((None, None), |d| (d.recovered.clone(), d.original.clone())),
+    };
+    let source = recovered.as_ref().map(|p| p.display().to_string()).or_else(|| original.clone())?;
+    let target = params.get("path").and_then(Value::as_str).map(String::from).or_else(|| original.clone())?;
     let kind = |p: &str| gridcraft_engine::io::FileKind::from_path(p);
     let xlsx_family = |p: &str| kind(p) == Some(gridcraft_engine::io::FileKind::Xlsx);
     if !(xlsx_family(&source) && xlsx_family(&target))
@@ -155,7 +179,7 @@ fn save_evicted(name: &str, a: &Value, ev: &Eviction, overwrite: bool) -> Option
             "path": abs(&target),
             "bytes": bytes,
             "saved_from": abs(&source),
-            "evicted": {"reason": ev.reason, "recovered_path": ev.recovered.as_ref().map(|p| p.display().to_string()), "original_path": ev.original},
+            "evicted": {"reason": ev.reason, "recovered_path": recovered.as_ref().map(|p| p.display().to_string()), "original_path": original},
             "next_step": format!(
                 "saved. The workbook had been closed by the server ({}); the save wrote its work from {source}. Call open_workbook {{path: \"{}\"}} to edit it further",
                 ev.reason,

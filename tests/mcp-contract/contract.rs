@@ -307,6 +307,27 @@ fn a_save_after_a_memory_eviction_writes_the_auto_saved_work() {
     assert_eq!(cells_of(&out, "A1"), json!([["precious"]]));
 }
 
+/// WHIQ: a save after an eviction saves the workbook the call NAMES, not whichever was evicted first.
+#[test]
+fn a_save_after_an_eviction_saves_the_workbook_it_names() {
+    let dir = folder("evict-names");
+    let mut m = start(&dir, &[]);
+    let a = m.ok("build_workbook", json!({"sheets": [{"name": "A", "rows": [["work A"]]}]}))["document"].as_str().unwrap().to_string();
+    let b = m.ok("build_workbook", json!({"sheets": [{"name": "B", "rows": [["work B"]]}]}))["document"].as_str().unwrap().to_string();
+    m.ok("set_cell", json!({"cell": "B1", "input": "more A", "document": a}));
+    m.ok("set_cell", json!({"cell": "B1", "input": "more B", "document": b}));
+    m.ok("evict", json!({}));
+    let (out_b, out_a) = (dir.join("b-saved.xlsx"), dir.join("a-saved.xlsx"));
+    let s = m.ok("save_workbook", json!({"path": out_b.to_str().unwrap(), "document": b}));
+    assert!(s["saved_from"].is_string(), "{s}");
+    assert_eq!(cells_of(&out_b, "A1:B1"), json!([["work B", "more B"]]));
+    m.ok("save_workbook", json!({"path": out_a.to_str().unwrap(), "document": a}));
+    assert_eq!(cells_of(&out_a, "A1:B1"), json!([["work A", "more A"]]));
+    // A handle the eviction did not close is an error, not another workbook's work.
+    let e = m.err("save_workbook", json!({"path": dir.join("c.xlsx").to_str().unwrap(), "document": "doc-999"}));
+    assert_eq!(e["code"], "failed", "{e}");
+}
+
 /// WHIQ: a whole range in one call, as a CSV file (read_range answers a window per call).
 #[test]
 fn export_range_writes_a_whole_range_as_csv() {
