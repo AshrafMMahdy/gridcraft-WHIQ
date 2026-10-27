@@ -2329,6 +2329,9 @@ mod tests {
 
     #[test]
     fn right_to_left_sheets_put_column_a_on_the_right() {
+        if !gridcraft_text::fonts_for_tests() {
+            return;
+        }
         let mut s = s();
         s.execute("cell.set", json!({"cell": "A1", "input": "1"})).unwrap();
         s.execute("cell.set", json!({"cell": "C1", "input": "x"})).unwrap();

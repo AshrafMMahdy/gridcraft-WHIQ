@@ -46,7 +46,7 @@ use gridcraft_core::DateSystem;
 use gridcraft_model::Workbook;
 
 pub use crypto::{DecryptError, check_encryption, decrypt};
-pub use csv::{MAX_CSV_BYTES, read_csv, write_csv, write_csv_limited, write_csv_range_into};
+pub use csv::{read_csv, write_csv, write_csv_range_into};
 pub use ods::read_ods;
 pub use passthrough::rebase_links;
 pub use xls::read_xls;
@@ -296,7 +296,7 @@ mod whiq_stream_tests {
         let sh = wb.sheet(0).unwrap();
         let mut out = Vec::new();
         let r = gridcraft_core::RangeRef::parse("A1:B3").unwrap();
-        let rows = crate::write_csv_range_into(r, b',', &mut out, |c| sh.value(c).display()).unwrap();
+        let rows = crate::write_csv_range_into(sh, r, b',', &mut out, |c| sh.value(c).display()).unwrap();
         assert_eq!(rows, 3);
         let text = String::from_utf8(out).unwrap();
         assert_eq!(text.lines().count(), 3);

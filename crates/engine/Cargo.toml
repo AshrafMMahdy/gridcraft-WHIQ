@@ -27,6 +27,10 @@ gridcraft-text = { workspace = true }
 gridcraft-raster = { workspace = true }
 image = { workspace = true }
 
+# WHIQ: the free space of the disk an export is about to fill (a stated refusal, not a full disk).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+fs4 = { version = "1.1", default-features = false, features = ["sync"] }
+
 [dev-dependencies]
 gridcraft-xlsx = { workspace = true, features = ["test-support"] }
 zip = { workspace = true }

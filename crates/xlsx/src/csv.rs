@@ -8,9 +8,6 @@ use gridcraft_model::{Cell, NumFmt, Sheet, StyleId, Workbook};
 
 use crate::{CsvOptions, IoError};
 
-/// The largest CSV or tab-separated file written (bytes).
-pub const MAX_CSV_BYTES: usize = 512 << 20;
-
 /// Windows-1252 code points for bytes 0x80–0x9F (others map to Latin-1).
 const CP1252: [u32; 32] = [
     0x20AC, 0x81, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x8D, 0x017D, 0x8F, 0x90, 0x2018, 0x2019,
@@ -191,35 +188,80 @@ pub fn read_csv(bytes: &[u8], opts: &CsvOptions) -> Result<Workbook, IoError> {
 /// each cell's field text: the caller decides how values look (Save As CSV writes them as
 /// displayed, number formats applied); quoting is done here.
 ///
-/// The output is capped at [`MAX_CSV_BYTES`]: two cells far apart make the used range, and so the
-/// file, as big as the whole rectangle between them (`A1` and `XFD1048576` are 16 GiB of commas).
-/// An export that would pass the cap is refused before anything is allocated, or as soon as the
-/// text written so far passes it, with [`IoError::TooLarge`]; accepted exports keep every field in
-/// its place.
+/// WHIQ: rows are written ragged (see [`write_csv_range_into`]), so two cells far apart make a
+/// file of a few bytes, not the whole rectangle between them (`A1` and `XFD1048576` were 16 GiB of
+/// commas), and there is no size cap: the file is as big as the data.
 pub fn write_csv(sheet: &Sheet, delimiter: u8, cell_text: impl FnMut(CellRef) -> String) -> Result<Vec<u8>, IoError> {
-    write_csv_limited(sheet, delimiter, MAX_CSV_BYTES, cell_text)
+    let mut out = Vec::new();
+    if let Some(r) = sheet.used_range() {
+        write_csv_range_into(sheet, r, delimiter, &mut out, cell_text)?;
+    }
+    Ok(out)
+}
+
+/// The spilled arrays crossing each row of a range, for rows asked in increasing order.
+struct RowSpills {
+    /// Spill ranges that reach the range, by first row.
+    all: Vec<RangeRef>,
+    next: usize,
+    active: Vec<RangeRef>,
+}
+
+impl RowSpills {
+    fn new(sheet: &Sheet, range: RangeRef) -> Self {
+        let mut all: Vec<RangeRef> = sheet
+            .spill_ranges
+            .values()
+            .filter(|s| s.end.row >= range.start.row && s.start.row <= range.end.row && s.end.col >= range.start.col && s.start.col <= range.end.col)
+            .copied()
+            .collect();
+        all.sort_by_key(|s| s.start.row);
+        RowSpills { all, next: 0, active: Vec::new() }
+    }
+
+    fn at(&mut self, row: u32) -> &[RangeRef] {
+        while let Some(s) = self.all.get(self.next).filter(|s| s.start.row <= row) {
+            self.active.push(*s);
+            self.next += 1;
+        }
+        self.active.retain(|s| s.end.row >= row);
+        &self.active
+    }
 }
 
 /// WHIQ: the cells of `range` as CSV streamed into `w` a row at a time: no size cap (the disk is
 /// the bound) and nothing held but one row. Returns the rows written.
+///
+/// Rows are RAGGED: the empty cells at the end of a row are dropped (the row ends at its last
+/// non-empty cell) and a row with no text is an empty line, so a sparse sheet costs what its data
+/// costs, not the area of its used range. Every line starts at the range's first column, and a
+/// reader puts each field back in its cell (a row with fewer fields leaves the rest empty). Only
+/// the cells that exist (stored, or spilled into) are asked for their text.
 pub fn write_csv_range_into(
+    sheet: &Sheet,
     range: RangeRef,
     delimiter: u8,
     w: &mut dyn std::io::Write,
     mut cell_text: impl FnMut(CellRef) -> String,
 ) -> Result<u64, IoError> {
     let delim = if delimiter == 0 { ',' } else { delimiter as char };
+    let (c0, c1) = (range.start.col, range.end.col);
+    let mut spills = RowSpills::new(sheet, range);
     let mut line = String::new();
     let mut rows = 0u64;
     for row in range.start.row..=range.end.row {
         // WHIQ: a safe point for `cancel` in a long export.
         gridcraft_core::cancel::checkpoint();
         line.clear();
-        for col in range.start.col..=range.end.col {
-            if col > range.start.col {
-                line.push(delim);
+        // The column of the last field written (the line starts "before" the first column).
+        let mut prev: Option<u32> = None;
+        let mut field = |col: u32, t: String, line: &mut String| {
+            if t.is_empty() {
+                return;
             }
-            let t = cell_text(CellRef::new(row, col));
+            let gap = col - prev.unwrap_or(c0);
+            line.extend(std::iter::repeat_n(delim, gap as usize));
+            prev = Some(col);
             if t.contains(delim) || t.contains('"') || t.contains('\n') || t.contains('\r') {
                 line.push('"');
                 line.push_str(&t.replace('"', "\"\""));
@@ -227,47 +269,24 @@ pub fn write_csv_range_into(
             } else {
                 line.push_str(&t);
             }
+        };
+        let crossing = spills.at(row);
+        if crossing.is_empty() {
+            for (col, _) in sheet.cells.row(row, c0, c1) {
+                field(col, cell_text(CellRef::new(row, col)), &mut line);
+            }
+        } else {
+            // Spilled values are not stored cells: walk the columns up to the last one that can
+            // hold anything.
+            let spill_end = crossing.iter().map(|s| s.end.col.min(c1)).max().unwrap_or(c0);
+            let stored_end = sheet.cells.row(row, c0, c1).map(|(c, _)| c).last().unwrap_or(c0);
+            for col in c0..=spill_end.max(stored_end) {
+                field(col, cell_text(CellRef::new(row, col)), &mut line);
+            }
         }
         line.push_str("\r\n");
         w.write_all(line.as_bytes()).map_err(|e| IoError::Zip(format!("writing the CSV: {e}")))?;
         rows += 1;
     }
     Ok(rows)
-}
-
-/// [`write_csv`] with the output cap `limit` (bytes) given.
-pub fn write_csv_limited(sheet: &Sheet, delimiter: u8, limit: usize, mut cell_text: impl FnMut(CellRef) -> String) -> Result<Vec<u8>, IoError> {
-    let delim = if delimiter == 0 { ',' } else { delimiter as char };
-    let mut out = String::new();
-    let Some(r) = sheet.used_range() else { return Ok(Vec::new()) };
-    let too_large =
-        |what: String| IoError::TooLarge(format!("the CSV would be {what}, over the limit of {} MiB; export a smaller range", limit >> 20));
-    // Every row has a delimiter between its fields and a CRLF, whatever the cells hold: a lower
-    // bound on the output that needs no cell text.
-    let (rows, cols) = (u64::from(r.end.row - r.start.row) + 1, u64::from(r.end.col - r.start.col) + 1);
-    let per_row = (cols - 1).saturating_mul(delim.len_utf8() as u64).saturating_add(2);
-    let least = rows.saturating_mul(per_row);
-    if least > limit as u64 {
-        return Err(too_large(format!("at least {} MiB ({rows} rows by {cols} columns)", least >> 20)));
-    }
-    for row in r.start.row..=r.end.row {
-        for col in r.start.col..=r.end.col {
-            if col > r.start.col {
-                out.push(delim);
-            }
-            let t = cell_text(CellRef::new(row, col));
-            if t.contains(delim) || t.contains('"') || t.contains('\n') || t.contains('\r') {
-                out.push('"');
-                out.push_str(&t.replace('"', "\"\""));
-                out.push('"');
-            } else {
-                out.push_str(&t);
-            }
-        }
-        out.push_str("\r\n");
-        if out.len() > limit {
-            return Err(too_large(format!("more than {} MiB (stopped at row {})", limit >> 20, row + 1)));
-        }
-    }
-    Ok(out.into_bytes())
 }

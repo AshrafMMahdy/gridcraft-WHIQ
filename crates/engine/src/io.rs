@@ -280,10 +280,8 @@ pub fn source_dir(path: &str) -> Option<std::path::PathBuf> {
 /// bytes).
 #[cfg(not(target_arch = "wasm32"))]
 pub fn export_csv_range(wb: &Workbook, sh: &Sheet, range: Option<RangeRef>, delimiter: u8, path: &str) -> Result<(u64, u64)> {
-    if let Some(r) = range
-        && let Some(why) = sparse_export_refusal(r, sh.cells.len() as u64)
-    {
-        return Err(EngineError::Other(why));
+    if let Some(r) = range {
+        check_disk_for_csv(wb, sh, r, delimiter, path)?;
     }
     let mut rows = 0;
     let mut n = 0;
@@ -291,7 +289,7 @@ pub fn export_csv_range(wb: &Workbook, sh: &Sheet, range: Option<RangeRef>, deli
         {
             let mut w = std::io::BufWriter::with_capacity(1 << 20, &mut *f);
             if let Some(r) = range {
-                rows = gridcraft_xlsx::write_csv_range_into(r, delimiter, &mut w, |c| csv_text(wb, sh, c))
+                rows = gridcraft_xlsx::write_csv_range_into(sh, r, delimiter, &mut w, |c| csv_text(wb, sh, c))
                     .map_err(|e| EngineError::Other(e.to_string()))?;
             }
             std::io::Write::flush(&mut w).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
@@ -302,23 +300,50 @@ pub fn export_csv_range(wb: &Workbook, sh: &Sheet, range: Option<RangeRef>, deli
     Ok((rows, n))
 }
 
-/// A delimited export streams to the file, whatever the size of the data; what it refuses is the
-/// expansion of a sparse sheet: a rectangle past [`SPARSE_EXPORT_BYTES`] of which almost every cell
-/// is empty (two cells at opposite corners of the grid would write 17 GB of commas). The reason
-/// gives the numbers and the way (a range).
-const SPARSE_EXPORT_BYTES: u64 = 4 << 30;
-
-fn sparse_export_refusal(r: RangeRef, cells: u64) -> Option<String> {
+/// WHIQ: a delimited export streams to the file whatever the size of the data, and its rows are
+/// ragged, so a sparse sheet costs what its data costs. The one refusal left is the disk's: when
+/// the folder cannot hold the file. The size of the text is known only by writing it, so the
+/// check is cheap in the usual case (an estimate from the shape of the data, below the free
+/// space: go ahead; a disk that fills up part way is reported by the write, with the temporary
+/// file removed) and exact when the estimate reaches the free space (the text is counted first,
+/// nothing written).
+#[cfg(not(target_arch = "wasm32"))]
+fn check_disk_for_csv(wb: &Workbook, sh: &Sheet, r: RangeRef, delimiter: u8, path: &str) -> Result<()> {
+    let Some(free) = free_space_for(path) else { return Ok(()) };
     let rows = u64::from(r.end.row.saturating_sub(r.start.row)) + 1;
-    let cols = u64::from(r.end.col.saturating_sub(r.start.col)) + 1;
-    let bytes = rows.saturating_mul(cols.saturating_add(1));
-    (bytes > SPARSE_EXPORT_BYTES && cells.saturating_mul(64) < bytes).then(|| {
-        format!(
-            "the CSV would be at least {} MiB ({rows} rows by {cols} columns), almost all of it empty cells, over the limit for a sparse sheet ({} MiB); export the part that holds data (a range)",
-            bytes >> 20,
-            SPARSE_EXPORT_BYTES >> 20
-        )
-    })
+    let estimate = rows.saturating_mul(2).saturating_add(sh.cells.len() as u64);
+    if estimate < free {
+        return Ok(());
+    }
+    struct Count(u64);
+    impl std::io::Write for Count {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0 += b.len() as u64;
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    gridcraft_xlsx::write_csv_range_into(sh, r, delimiter, &mut count, |c| csv_text(wb, sh, c)).map_err(|e| EngineError::Other(e.to_string()))?;
+    if count.0 > free {
+        return Err(EngineError::Other(format!(
+            "{path}: the CSV is {} MiB and the disk has {} MiB free; free space or export to another drive inside the write root (nothing was written)",
+            count.0 >> 20,
+            free >> 20
+        )));
+    }
+    Ok(())
+}
+
+/// Free bytes on the disk that holds `path`'s folder (`None` when the system does not say).
+#[cfg(not(target_arch = "wasm32"))]
+fn free_space_for(path: &str) -> Option<u64> {
+    let path = crate::file_access::resolve_relative(path, crate::file_access::Access::Write);
+    let abs = std::path::absolute(&path).ok()?;
+    let dir = abs.parent()?;
+    fs4::available_space(dir).ok()
 }
 
 /// One cell's text in a delimited file.
@@ -918,7 +943,7 @@ mod tests {
 
     /// Cut-list rows as a CAD/CAM program exports them: `;`-separated, CRLF, part codes in the last
     /// two columns, a part name containing a comma.
-    const CUT_LIST: &str = "1;511;184;P3_L1_led;2162PE;16;1MM_2162PE;1MM_2162PE;;;1244121406FB;\r\n\
+    const CUT_LIST: &str = "1;511;184;P3_L1_led;2162PE;16;1MM_2162PE;1MM_2162PE;;;1244121406FB\r\n\
                             1;562.5;510;Komoda, lijevo;2162PE;19;1MM_2162PE;;;;12441214071A;124412140710\r\n";
 
     #[test]
@@ -1022,7 +1047,7 @@ mod tests {
         sh.cols.insert(1, LineInfo { size: Some(1.0), ..Default::default() });
         sh.show_formulas = true;
         let csv = String::from_utf8(save_bytes(&wb, "out.csv").unwrap()).unwrap();
-        assert_eq!(csv, "2026-01-01,\"$1,234.50\",12.5%,1 1/2,007,#N/A,TRUE\r\n2026-01-02,12345678.90,-0.25,\"1,234,567\",,,\r\n");
+        assert_eq!(csv, "2026-01-01,\"$1,234.50\",12.5%,1 1/2,007,#N/A,TRUE\r\n2026-01-02,12345678.90,-0.25,\"1,234,567\"\r\n");
         let tsv = String::from_utf8(save_bytes(&wb, "out.tsv").unwrap()).unwrap();
         assert!(tsv.starts_with("2026-01-01\t$1,234.50\t12.5%\t"), "{tsv}");
     }
@@ -1072,15 +1097,29 @@ mod tests {
         }
     }
 
-    /// A delimited export streams whatever the data: only the blank expansion of a sparse sheet
-    /// past 4 GiB is refused.
+    /// Two cells at the grid's opposite corners (17 GB of commas when rows were padded) export to
+    /// a few MB, with no refusal, and read back to the same two cells.
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn whiq_a_csv_export_refuses_blank_expansion_not_data() {
-        let all = RangeRef::new(CellRef::new(0, 0), CellRef::new(1_048_575, 16_383));
-        assert!(sparse_export_refusal(all, 2).is_some_and(|m| m.contains("1048576 rows by 16384 columns") && m.contains("over the limit")));
-        // The same rectangle full of data is a real (17 GB) export: not refused.
-        assert!(sparse_export_refusal(all, 1_048_576 * 16_384).is_none());
-        // 8.4 M cells of a BOQ, or a wide sheet below 4 GiB, whatever the fill.
-        assert!(sparse_export_refusal(RangeRef::new(CellRef::new(0, 0), CellRef::new(500_000, 11)), 10).is_none());
+    fn whiq_a_two_corner_sheet_exports_small_and_reads_back() {
+        let mut wb = Workbook::new();
+        let last = CellRef::new(gridcraft_core::MAX_ROWS - 1, gridcraft_core::MAX_COLS - 1);
+        wb.sheet_mut(0).unwrap().set_value(CellRef::new(0, 0), gridcraft_core::Value::text("a"));
+        wb.sheet_mut(0).unwrap().set_value(last, gridcraft_core::Value::text("b"));
+        let dir = std::env::temp_dir().join(format!("gridcraft-two-corners-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("corners.csv");
+        let path = path.to_str().unwrap();
+        let sh = wb.sheet(0).unwrap();
+        let (rows, bytes) = export_csv_range(&wb, sh, sh.used_range(), b',', path).unwrap();
+        assert_eq!(rows, u64::from(gridcraft_core::MAX_ROWS));
+        assert!(bytes < 3 << 20, "{bytes} bytes");
+        let (back, _) = open_bytes("corners.csv", &std::fs::read(path).unwrap()).unwrap();
+        let back = back.sheet(0).unwrap();
+        assert_eq!(back.cells.len(), 2);
+        assert_eq!(back.value(CellRef::new(0, 0)), gridcraft_core::Value::text("a"));
+        assert_eq!(back.value(last), gridcraft_core::Value::text("b"));
+        assert!(free_space_for(path).is_some_and(|f| f > 0), "the free space of the disk is known");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
