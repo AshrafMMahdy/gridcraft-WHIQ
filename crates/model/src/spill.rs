@@ -13,14 +13,98 @@ use crate::store::{Band, CellStore, ColdCells};
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
-/// Where spill files go: `GRIDCRAFT_SPILL_DIR`, else a folder of the program's own data (not the
-/// system's temporary folder, which cleaners empty), one per process.
-pub fn spill_dir() -> PathBuf {
-    let own = format!("pid-{}", std::process::id());
-    match std::env::var_os("GRIDCRAFT_SPILL_DIR") {
-        Some(d) if !d.is_empty() => PathBuf::from(d).join(own),
-        _ => data_dir().unwrap_or_else(std::env::temp_dir).join("gridcraft").join("spill").join(own),
+static BASE: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Fix the folder all processes' spill folders are in (before the first sheet is spilled).
+pub fn set_spill_base(base: Option<PathBuf>) {
+    if let Ok(mut b) = BASE.lock() {
+        *b = base;
     }
+}
+
+/// The folder all processes' spill folders are in: `GRIDCRAFT_SPILL_DIR`, else a folder of the
+/// program's own data (not the system's temporary folder, which cleaners empty).
+pub fn spill_base() -> PathBuf {
+    if let Some(b) = BASE.lock().ok().and_then(|b| b.clone()) {
+        return b;
+    }
+    match std::env::var_os("GRIDCRAFT_SPILL_DIR") {
+        Some(d) if !d.is_empty() => PathBuf::from(d),
+        _ => data_dir().unwrap_or_else(std::env::temp_dir).join("gridcraft").join("spill"),
+    }
+}
+
+const LOCK_NAME: &str = "lock";
+
+/// The lock of this process's spill folder, held until it exits.
+static CLAIM: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
+
+/// The spill folder of THIS process: `pid-<pid>` under [`spill_base`], with a lock file held open
+/// and locked for as long as the process lives, which is what tells another process the folder is
+/// in use. Claiming it empties it: what is in it is the leftover of a crashed process of the same PID.
+pub fn spill_dir() -> PathBuf {
+    let dir = spill_base().join(format!("pid-{}", std::process::id()));
+    CLAIM.get_or_init(|| {
+        std::fs::create_dir_all(&dir).ok()?;
+        let f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(dir.join(LOCK_NAME)).ok()?;
+        f.try_lock().ok()?;
+        empty_folder(&dir);
+        Some(f)
+    });
+    dir
+}
+
+/// Remove everything in `dir` but the lock file.
+fn empty_folder(dir: &std::path::Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        if e.file_name() == LOCK_NAME {
+            continue;
+        }
+        let p = e.path();
+        let _ = if e.file_type().is_ok_and(|t| t.is_dir()) { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+    }
+}
+
+/// Remove the spill folders of processes that are gone: a folder whose lock file nobody holds (the
+/// system releases the lock when a process dies, so a reused PID is no problem). A folder of a live
+/// process (its lock is held) is never touched, whatever its age; one with no lock file is left for
+/// a minute (it is being made), then goes. Cells in these files are customer data in plain text, so
+/// a crash must not leave them behind. Returns how many files.
+pub fn sweep_stale() -> usize {
+    let base = spill_base();
+    let Ok(rd) = std::fs::read_dir(&base) else { return 0 };
+    let mine = spill_dir();
+    let mut n = 0;
+    for e in rd.flatten() {
+        let path = e.path();
+        if path == mine || !path.is_dir() {
+            continue;
+        }
+        // `held` keeps the lock while the folder goes; `free` says the folder is nobody's.
+        let mut held = None;
+        let free = match std::fs::OpenOptions::new().read(true).write(true).open(path.join(LOCK_NAME)) {
+            Ok(f) => {
+                let got = f.try_lock().is_ok();
+                held = got.then_some(f);
+                got
+            }
+            // No lock file (a folder of an older build, or one still being made): free once it is
+            // not young. (A directory cannot be opened as a file on Windows, so no handle.)
+            Err(_) => !e
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok())
+                .is_none_or(|d| d < std::time::Duration::from_secs(60)),
+        };
+        if free {
+            n += std::fs::read_dir(&path).map(|r| r.flatten().filter(|x| x.file_name() != LOCK_NAME).count()).unwrap_or(0);
+            drop(held);
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+    n
 }
 
 /// The per-user data folder: `%LOCALAPPDATA%`, `$XDG_DATA_HOME`, or `~/.local/share`.

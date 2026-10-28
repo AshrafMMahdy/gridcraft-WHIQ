@@ -637,6 +637,11 @@ fn mcp(args: &[String]) -> Result<(), String> {
         gridcraft_engine::core::memory::set_budget((n * 1024.0 * 1024.0) as u64);
         gridcraft_engine::core::memory::set_probe(gridcraft_mcp::whiq::rss_bytes);
     }
+    // WHIQ: spill folders (cells kept on disk) a killed process left behind go; a live one's never.
+    let swept = gridcraft_engine::model::spill::sweep_stale();
+    if swept > 0 {
+        eprintln!("gridcraft-cli: removed {swept} stale spill file(s) from {}", gridcraft_engine::model::spill::spill_base().display());
+    }
     if let Some(n) = either("idle-evict-secs", "evict-idle-secs")? {
         config.idle_evict = Some(std::time::Duration::from_secs_f64(n.max(0.05)));
     }
