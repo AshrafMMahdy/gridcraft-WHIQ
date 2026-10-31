@@ -912,6 +912,9 @@ sequence fuzzer included), `gridcraft-xlsx` 185 + `lazy_sheets` 1, `gridcraft-cl
 text 6, raster 3, pdf 18, chart 36; `cargo fmt --check` and `cargo clippy --no-deps --all-targets -D
 warnings` on model / formula / xlsx / chart / raster / engine / mcp / cli. Not run this round: `ui-egui`
 and the desktop app (no space for their builds on the shared disk), `cargo xtask wasm`.
+Stdio smoke of the release binary (Linux x86_64, craft-fonts at 43913056, `CRAFT_FONTS_REQUIRED=1`): one
+case per fix, 21 checks, all passed; `render_sheet` of poi-57181 "General" in 0.7 s with `drawing cells`
+progress notifications.
 
 ## Tests
 
