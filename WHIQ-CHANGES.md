@@ -565,6 +565,113 @@ driver (RSS of the process; BOQ-like sheets with shared strings and a formula co
 | **`export_range`** (new tool): a range (default the used range) written as a CSV file in one call, any size; answers with `path`, `rows`, `columns`, `bytes`. `file.exportCsv` takes `range`. | `mcp/src/whiq.rs`, `engine/src/cmd/file.rs`, `engine/src/io.rs` (`export_csv_range`) | `contract.rs` `export_range_writes_a_whole_range_as_csv` |
 | **`roundtrip_check` compares binary parts by their zip CRC-32 and size** and saves into a scratch file (neither package in memory). | `mcp/src/roundtrip.rs`, `whiq.rs` | `roundtrip.rs` tests |
 
+## Preview, reading and batches through the engine (2026-10-30, `whiq-v0.7.4`)
+
+The owner's decision (third ledger item 13): the platform's Preview tab is drawn by the engines,
+not by bespoke platform code, and each engine is a complete MCP. GridCraft takes over the
+platform's Excel preview renderer (`shared/render/xlsx.ts`, `xlsxChart.ts`, `xlsxFormula.ts`:
+exceljs, a hand-rolled formula evaluator for chart data, a 2,000-row / 60-column cap) and draws it
+from its own model, with no cap. The agent reads, searches and edits in bulk through the same
+server.
+
+- **`render_preview`** (new tool) / **`file.previewHtml`** (new command; `crates/engine/src/preview.rs`,
+  `cmd/preview.rs`): one self-contained HTML page with the structure the pane shows today (`.head`
+  file name, `.bar` of `.tab` / `.tab.on`, one `.sheet` per tab with `id="s<i>"`, `show(i)`,
+  `.chart`, `.cap`), the cells as the sheet shows them: values with their number formats (and
+  format colours), fills, fonts, borders (both cells of an edge carry the line, so a gridline never
+  wins over a drawn border), alignment (General as the painter decides it, right-to-left text and
+  sheets), wrap, indent, merged cells (`rowspan` / `colspan`, cut to the window), column widths and
+  row heights (`<col>` / `<tr>` in pixels), hidden rows and columns left out, frozen panes as sticky
+  rows and columns (drawn first when the window is scrolled past them), row numbers and column
+  letters (sticky), conditional formats (fills, colour scales, data bars, icons), table styles,
+  notes / comments (`title`, a red corner), safe hyperlinks (http, https, mailto), sparklines, and
+  charts, pictures and shapes where they sit on the sheet. Charts are inline SVG from the same
+  primitives the PNG and PDF painters draw (`gridcraft_chart::to_svg`, `crates/chart/src/svg.rs`),
+  so every chart kind is drawn, formulas behind them computed by the engine. Each formula cell
+  carries its formula (`data-f="=SUM(B2:B9)"`) and every cell with content its address (`data-c`);
+  each row its number (`data-r`). Nothing is fetched.
+  **Windows, no cap**: `{sheet?, row_start?, row_count?, col_start?, col_count?}` (1-based; column
+  by number or letters); without one, the first screenful (100 rows × 30 columns, reaching the
+  charts) of the first visible sheet, and in a page the first screenful of the other sheets too
+  (60,000 cells together; a sheet still on disk and over 16 MB is not read for it: its tab says it
+  is drawn when asked for). The answer: `html`, `window {sheet, sheet_index, row_start, row_count,
+  col_start, col_count, range, rows, columns, more_rows, more_columns, next_rows?, next_columns?,
+  frozen?, truncated}`, `sheets [{index, name, visibility, used_range, rows, columns, first_row,
+  first_column, cells, frozen, charts, images, right_to_left, in_memory}]`, `cells`, `bytes`. A
+  window over `max_cells` (default 100,000, at most 2,000,000) comes back in part with the next one.
+  `format: page | sheet | rows` (a whole page, the sheet's div to swap in, or the body rows to
+  append). The page's script posts `{source: "gridcraft-preview", type: "sheet" | "more", sheet,
+  row_start, row_end, rows…}` to its parent when a tab is shown and when the sheet is scrolled near
+  the end of its window, for the pane to ask for the next one. `path` previews a file without
+  touching the agent's workbook: the open workbook with that file (unsaved edits included), else
+  the file opened once and kept open for the next windows (`document`, `opened`), the active
+  workbook the same after the call. `html_path` writes the page into a file. The HTML is
+  `structuredContent.html` and the second content block, never cut by `--max-result-bytes`.
+  CLI: `gridcraft-cli preview <file> <out.html> [--sheet S] [--rows START:COUNT] [--cols
+  START:COUNT] [--format page|sheet|rows]`.
+- **`export_markdown`** (new tool) / **`sheet.markdown`** (new command): sheets as Markdown tables
+  (the row number first, column letters as the header, values as displayed, `|` escaped, line
+  breaks as `<br>`, empty rows left out unless `keep_empty_rows`), any size: a page is
+  `row_count` rows (the caller's page size) and at most `max_bytes` (default
+  `--max-result-bytes`); `next {sheet, row_start, continue_sheets?}` says where to go on. Without
+  `sheet` every visible sheet in order under `## Name (A1:F200)`, so one call reads a small
+  workbook whole. `formulas: true` gives formula text. `sheets` lists every sheet's used range,
+  rows and columns. `path` / `document` as for `render_preview`. The text is
+  `structuredContent.markdown` and the second content block. CLI: `gridcraft-cli markdown <file>`.
+- **`batch`** (new tool): a list of operations in one call, in order, as ONE undo step:
+  `{tool, args}` (or the tool's arguments beside `tool`), `{command, params}` (any engine command)
+  or a short `op` (write, set, format, merge / unmerge {range, center?}, chart, conditional_format,
+  validation, table, sort, filter, insert_rows…). Transactional by default: when an operation fails
+  the workbook (cells, selection, undo and redo) is put back as it was before the batch and the
+  error says `failed_at`, `rolled_back: true` and every `results` entry so far; `keepGoing: true`
+  runs the rest and keeps what worked (`failed`, each result `ok`); `transactional: false` stops at
+  the failure and keeps what ran (WordCraft's batch). A `cancel` between operations undoes the
+  batch (`stopped_at`). Tools that open, close or watch documents are refused inside a batch
+  (`unsupported`). `commands` is accepted for `ops` and `keep_going` for `keepGoing` (the other
+  forks' names). Engine: `Session::mark` / `rollback_to` / `squash_since`
+  (`crates/engine/src/lib.rs`); backend: `begin_batch` / `end_batch` (`backend.rs`, `headless.rs`).
+  `write_range` already writes any 2-D block in one call (100,000 cells measured; the request
+  line may be 16 MB) and `format_range` takes a comma list of ranges.
+- **Working a workbook fully** (new tools, each a thin call of an existing command):
+  `find {what, sheet?, look_in: values|formulas, match_case?, whole_cell?}` → every match `{sheet,
+  cell, value}` across sheets (hidden ones too; none is an empty list), `find_replace {what, with,
+  sheet?, match_case?, whole_cell?}` → `{replaced, cells}`, `list_comments {sheet?}`
+  (`review.listComments`, new), `add_comment {cell, text, note?}`, `delete_comment {cell}`,
+  `define_name {name, refers_to, scope?, comment?, old_name?}`, `delete_name {name, scope?}`,
+  `delete_sheet {sheet}`, `delete_chart {chart?, sheet?}`, `delete_table {table, clear?}`.
+  `_meta["whiq/files"]`: `render_preview` and `export_markdown` `{read: ["path"], opens: false}`.
+
+Coverage (each row tested on a real .xlsx built, saved, opened by a fresh server, worked, saved and
+opened again; `crates/mcp/src/tests.rs`):
+
+| Capability | Tools | Test |
+|---|---|---|
+| Read values, formulas, formats (displayed text, style) | `read_range` (`formulas`, `formatted`), `get_cell`, `export_markdown` | `coverage_read_…` |
+| Read comments and notes | `list_comments`, `get_cell` | `coverage_read_…` |
+| Read charts, tables, names, merges, hidden sheets, validations, conditional formats | `inspect_workbook` (and `render_preview` `sheets`) | `coverage_read_…` |
+| A picture of a range / the pane's preview | `render_range` (PNG), `render_preview` (HTML) | `coverage_read_…`, `render_preview_draws_a_window_and_says_how_to_page` |
+| Create sheets, rows, columns, cells, formulas | `add_sheet`, `insert_rows`, `insert_columns`, `set_cell`, `write_range` | `coverage_create_…` |
+| Create tables, charts, validations, conditional formats, comments, names | `create_table`, `insert_chart`, `data_validation`, `conditional_format`, `add_comment`, `define_name` | `coverage_create_…` |
+| Edit all of those in one call | `batch` (tools, ops, commands: `chart.set`, `table.style`, `table.resize`, `review.replyComment`…), `format_range`, `rename_sheet` | `coverage_edit_everything_in_one_batch` |
+| Delete cells, rows, columns, sheets, charts, tables, comments, names | `write_range` (null) / `edit.clearContents`, `delete_rows`, `delete_columns`, `delete_sheet`, `delete_chart`, `delete_table`, `delete_comment`, `delete_name` | `coverage_delete_…` |
+| Search across sheets, find and replace | `find`, `find_replace` | `coverage_search_across_sheets_and_replace` |
+| Bulk: 100,000 cells in one call; a 50-operation mixed batch | `write_range`, `batch` | `one_call_writes_a_hundred_thousand_cells`, `a_fifty_operation_batch_runs_in_one_call_as_one_undo_step`, `a_failing_batch_is_rolled_back_unless_keep_going` |
+
+Tests: engine `preview::tests` (a 300,000-row sheet: first screenful, a window at row 250,001, the
+last rows, `max_cells` paging, a 200,000-row window in one call; merges, number formats with
+colours, formulas on cells, shared borders, frozen panes; a chart as SVG where it sits; tabs for
+every sheet; Markdown paged by rows and bytes), chart `svg::tests`, and the MCP tests above
+(`render_preview_and_export_markdown_read_a_file_and_leave_the_active_workbook` too).
+
+Status (Linux x86_64, 2026-10-30, debug build, without craft-fonts): `gridcraft-engine` lib 321
+passed, `gridcraft-mcp` lib 39 passed, `gridcraft-chart` `svg` 1 passed, the stdio contract
+suite (`cargo test -p gridcraft-cli --test mcp_contract`) 34 passed; `cargo fmt --check`,
+`cargo clippy --no-deps -D warnings` on chart / engine / mcp / cli, and `cargo check --target
+wasm32-unknown-unknown` on engine and chart clean. (`cargo clippy` without `--no-deps` stops on
+upstream's `crates/model/src/spill.rs` `SystemTime::now` with the newer clippy 1.97: not touched
+here.) The preview was also looked at in headless Chromium (a 60-row sheet with a frozen header,
+data bars, a column and a pie chart on the grid; a merged title and Arabic text).
+
 ## Tests
 
 - `cargo test` runs everything; the WHIQ-specific suites:

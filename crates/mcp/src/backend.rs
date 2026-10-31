@@ -84,6 +84,16 @@ pub trait Backend {
     fn select_document(&mut self, _handle: &str) -> Result<(), Vec<String>> {
         Err(vec![])
     }
+    /// WHIQ: remember where the active workbook stands, for a `batch` that is undone as a whole
+    /// when one of its operations fails. False when the backend cannot roll back.
+    fn begin_batch(&mut self) -> bool {
+        false
+    }
+    /// WHIQ: end a `batch`: `keep` true makes its changes one undo step (`label`), false puts the
+    /// workbook back as it was at [`Backend::begin_batch`]. True when that was done.
+    fn end_batch(&mut self, _keep: bool, _label: &str) -> bool {
+        false
+    }
     /// WHIQ: the automation read and write roots in force.
     fn roots(&self) -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
         (None, None)

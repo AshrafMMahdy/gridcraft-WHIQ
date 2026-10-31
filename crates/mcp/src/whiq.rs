@@ -55,6 +55,8 @@ pub(crate) fn files_meta(name: &str) -> Option<Value> {
         "open_workbook" => (&["path"], true),
         "new_workbook" | "build_workbook" => (&[], true),
         "roundtrip_check" => (&["path"], false),
+        // WHIQ: a preview or read of a file names it; the call leaves the active workbook as it was.
+        "render_preview" | "export_markdown" => (&["path"], false),
         _ => return None,
     };
     Some(json!({"read": read, "opens": opens}))
@@ -243,9 +245,12 @@ fn tool(name: &str, title: &str, desc: &str, schema: Value, hints: Hints) -> Val
     })
 }
 
+/// WHIQ: tools whose answer carries one large text (kept whole, sent as its own content block).
+const BIG_TEXT: &[(&str, &str)] = &[("render_preview", "html"), ("export_markdown", "markdown")];
+
 /// Tools that write files: they take `overwrite`.
 pub(crate) const WRITES_FILES: &[&str] =
-    &["save_workbook", "export_pdf", "render_range", "render_sheet", "build_workbook", "screenshot", "export_range"];
+    &["save_workbook", "export_pdf", "render_range", "render_sheet", "build_workbook", "screenshot", "export_range", "render_preview"];
 
 /// Tools that work without an open document (they stay available after an eviction).
 const NEEDS_NO_DOCUMENT: &[&str] = &[
@@ -261,6 +266,9 @@ const NEEDS_NO_DOCUMENT: &[&str] = &[
     "cancel",
     "evict",
     "roundtrip_check",
+    // WHIQ: these read a file named by `path` (an open workbook by `document` otherwise).
+    "render_preview",
+    "export_markdown",
 ];
 
 /// Tools that run on the dispatcher thread, never queued behind document work.
@@ -347,7 +355,222 @@ pub fn definitions() -> Vec<Value> {
     ];
     v.extend(more_definitions());
     v.extend(editing_definitions());
+    v.extend(preview_definitions());
     v
+}
+
+/// WHIQ: the preview the platform's pane shows, the reading the agent does, and batches.
+fn preview_definitions() -> Vec<Value> {
+    let window = || {
+        json!({
+            "path": string("An .xlsx/.xlsm/.csv… file to read (inside the read root). It is opened once and kept open (its `document` handle comes back) so the next windows are quick; the active workbook stays the active one. Default: the `document` workbook"),
+            "document": string("An open workbook's handle (default: the active one, when no `path` is given)"),
+            "sheet": {"type": ["string", "integer"], "description": "Sheet name (any case) or 0-based index (default: the first visible sheet)"},
+            "row_start": int("First row of the window, 1-based (default 1)"),
+            "row_count": int("Rows in the window (default: a screenful, 100); no limit on the sheet's size"),
+            "col_start": {"type": ["integer", "string"], "description": "First column, 1-based or letters (\"AA\"); default 1"},
+            "col_count": int("Columns in the window (default: the used columns, at most 30)"),
+        })
+    };
+    let mut preview = window();
+    for (k, v) in [
+        (
+            "format",
+            enumeration(
+                "page (default): a whole self-contained HTML page with every visible sheet's tab; sheet: the window's <div class=\"sheet on\"> alone, to swap into a page; rows: the window's <tr> rows alone, to append under a table drawn with the same columns",
+                &["page", "sheet", "rows"],
+            ),
+        ),
+        ("headings", boolean("Row numbers and column letters (default true)")),
+        ("other_sheets", boolean("In a page, also draw the first screenful of the other sheets so their tabs show at once (default true)")),
+        (
+            "max_cells",
+            int("Most cells this window may draw (default 100000, at most 2000000); a larger window comes back in part with `window.next_rows`"),
+        ),
+        ("title", string("Name on the page (default: the file name)")),
+        ("html_path", string("Write the HTML into this file (inside the write root) instead of returning it")),
+    ] {
+        preview[k] = v;
+    }
+    let mut md = window();
+    md["row_count"] = int("Page size: most rows in this answer (default: as many as fit in max_bytes)");
+    md["col_count"] = int("Columns to read (default: through the last used column)");
+    for (k, v) in [
+        (
+            "continue_sheets",
+            boolean("Go on into the sheets after `sheet` (default: true when no sheet is named, so one call reads a whole small workbook)"),
+        ),
+        ("formulas", boolean("Formula text (\"=SUM(B2:B9)\") instead of values for formula cells")),
+        ("keep_empty_rows", boolean("Keep rows with nothing in them (default false: they are left out; every row carries its number)")),
+    ] {
+        md[k] = v;
+    }
+    vec![
+        tool(
+            "render_preview",
+            "Render preview",
+            "The workbook as one self-contained HTML page for a preview pane, drawn by GridCraft from its own model: sheet tabs, \
+             cell values as displayed (number formats), fills, fonts, borders, alignment, merged cells, column widths, row \
+             heights, frozen panes (sticky), conditional formats, table styles, sparklines, charts as inline SVG and pictures \
+             where they sit; each formula cell carries its formula (data-f). No row or column limit: the call draws a window \
+             (sheet, row_start, row_count, col_start, col_count; default the first screenful of the first sheet) and answers \
+             with `window` (what was drawn, `more_rows`, `next_rows`) and `sheets` (each sheet's used range, rows and \
+             columns) so the pane pages as the user scrolls. The HTML is `structuredContent.html` (and the second content \
+             block).",
+            obj(preview, &[]),
+            // Like render_range: it can write a file (`html_path`).
+            crate::tools::OVERWRITE,
+        ),
+        tool(
+            "export_markdown",
+            "Export as Markdown",
+            "A sheet's content as Markdown tables (the row number first, column letters as the header; values as \
+             displayed) for reading, any size: pages by `row_start` / `row_count` and by `max_bytes`, and `next` says where to \
+             go on ({sheet, row_start}). Without `sheet` it reads every visible sheet in order, each under a `## Sheet (A1:F200)` \
+             heading. The answer lists every sheet's used range, rows and columns (`sheets`). The text is \
+             `structuredContent.markdown` (and the second content block).",
+            obj(md, &[]),
+            crate::tools::READ,
+        ),
+        tool(
+            "find",
+            "Find",
+            "Find text or a value across the workbook (or one `sheet`) and answer with every match: {sheet, cell, value}. \
+             Matches the displayed text by default (look_in: formulas matches formula text, e.g. \"VLOOKUP\"); \
+             match_case and whole_cell as in Excel's Find. No match is an empty list, not an error.",
+            obj(
+                json!({
+                    "what": string("The text or number to find"),
+                    "sheet": string("Only this sheet (default: every sheet)"),
+                    "look_in": enumeration("values (default: what the cells show) or formulas (formula text, constants as typed)", &["values", "formulas"]),
+                    "match_case": boolean("Match upper and lower case exactly (default false)"),
+                    "whole_cell": boolean("The whole cell must match (default false: a part of it is enough)"),
+                    "by_columns": boolean("List matches column by column (default: row by row)"),
+                }),
+                &["what"],
+            ),
+            crate::tools::READ,
+        ),
+        tool(
+            "find_replace",
+            "Find and replace",
+            "Replace text in every cell that contains it, across the workbook (or one `sheet`), as Excel's Replace All: \
+             constants and formula text (\"Sheet1\" → \"Data\" in references too). Answers {replaced, cells: [{sheet, \
+             cell}]}; one undo step.",
+            obj(
+                json!({
+                    "what": string("The text to find"),
+                    "with": string("The replacement (\"\" removes it)"),
+                    "sheet": string("Only this sheet (default: every sheet)"),
+                    "match_case": boolean("Match upper and lower case exactly (default false)"),
+                    "whole_cell": boolean("Replace only cells whose whole content matches (default false)"),
+                }),
+                &["what", "with"],
+            ),
+            crate::tools::OVERWRITE,
+        ),
+        tool(
+            "add_comment",
+            "Add comment",
+            "Add a comment (threaded, default) or a note (`note: true`) to a cell; `caller` (or --author) is its author.",
+            obj(
+                json!({
+                    "cell": string("Cell, e.g. \"B7\" or \"Sheet2!C3\""),
+                    "text": string("The comment's text"),
+                    "note": boolean("A note (the yellow kind) instead of a threaded comment"),
+                }),
+                &["cell", "text"],
+            ),
+            crate::tools::ADD,
+        ),
+        tool(
+            "list_comments",
+            "List comments",
+            "Every comment and note in the workbook (or one `sheet`): {sheet, cell, kind: comment|note, author, text, replies, resolved}.",
+            obj(json!({"sheet": string("Only this sheet (default: every sheet)")}), &[]),
+            crate::tools::READ,
+        ),
+        tool(
+            "delete_comment",
+            "Delete comment",
+            "Delete the comment or note on a cell (get_cell shows it; inspect_workbook lists them per sheet).",
+            obj(json!({"cell": string("Cell, e.g. \"B7\" or \"Sheet2!C3\"")}), &["cell"]),
+            crate::tools::OVERWRITE,
+        ),
+        tool(
+            "define_name",
+            "Define name",
+            "Create a named range or constant (or change one, with `old_name`): {name, refers_to: \"=Sheet1!$A$2:$A$20\", scope?}. \
+             inspect_workbook lists the names.",
+            obj(
+                json!({
+                    "name": string("The name, e.g. \"Rates\""),
+                    "refers_to": string("What it stands for: \"=Sheet1!$B$2:$B$13\", \"=0.15\""),
+                    "scope": string("\"Workbook\" (default) or a sheet name"),
+                    "comment": string("A description"),
+                    "old_name": string("Change this existing name instead of adding one"),
+                }),
+                &["name", "refers_to"],
+            ),
+            crate::tools::SET,
+        ),
+        tool(
+            "delete_name",
+            "Delete name",
+            "Delete a defined name (formulas that use it show #NAME?).",
+            obj(json!({"name": string("The name"), "scope": string("\"Workbook\" or a sheet name (default: every scope)")}), &["name"]),
+            crate::tools::OVERWRITE,
+        ),
+        tool(
+            "delete_sheet",
+            "Delete sheet",
+            "Delete a worksheet with everything on it (a workbook keeps at least one visible sheet). Undo brings it back.",
+            obj(json!({"sheet": string("The sheet to delete (name or 0-based index)")}), &["sheet"]),
+            crate::tools::ANY,
+        ),
+        tool(
+            "delete_chart",
+            "Delete chart",
+            "Delete a chart: by its `chart` id (inspect_workbook lists each sheet's charts with their ids), default the last chart of the sheet.",
+            obj(json!({"chart": int("The chart's id"), "sheet": string("Sheet name (default: the active sheet)")}), &[]),
+            crate::tools::OVERWRITE,
+        ),
+        tool(
+            "delete_table",
+            "Delete table",
+            "Remove a formatted table (Excel's Convert to Range): its cells and their look stay, the table, its filter \
+             buttons and structured references go. clear: true also clears its cells.",
+            obj(
+                json!({"table": string("The table's name (inspect_workbook lists them)"), "clear": boolean("Also clear the cells it covered (default false)")}),
+                &["table"],
+            ),
+            crate::tools::OVERWRITE,
+        ),
+        tool(
+            "batch",
+            "Batch",
+            "Apply a list of operations in ONE call, in order, as one undo step: any tool that edits the workbook \
+             ({\"tool\": \"write_range\", \"args\": {…}}, or the tool's arguments next to `tool`), any command \
+             ({\"command\": \"home.mergeCenter\", \"params\": {\"range\": \"A1:D1\"}}), or a short `op`: write \
+             (write_range), set (set_cell), format (format_range), merge / unmerge {range, center?}, chart (insert_chart), \
+             conditional_format, validation, table, sort, filter, insert_rows, delete_rows, insert_columns, delete_columns, \
+             add_sheet, rename_sheet, recalculate. Transactional by default: when one fails, the workbook is put back as it \
+             was before the batch (`rolled_back`) and the error says which (`failed_at`, `results`). keepGoing: true runs the \
+             rest past a failure and keeps what worked. Example: {\"ops\": [{\"op\": \"write\", \"range\": \"A1\", \
+             \"values\": [[\"Item\", \"Cost\"], [\"Rent\", 1200]]}, {\"op\": \"format\", \"range\": \"A1:B1\", \
+             \"bold\": true, \"fillColor\": \"#DDEBF7\"}, {\"op\": \"merge\", \"range\": \"D1:F1\"}]}",
+            obj(
+                json!({
+                    "ops": {"type": "array", "description": "The operations, in order: {tool, args?} | {op, …args} | {command, params?}", "items": {"type": "object"}},
+                    "commands": {"type": "array", "description": "Same as ops (WordCraft's and DeckCraft's name)", "items": {"type": "object"}},
+                    "keepGoing": boolean("Run the rest past a failure and keep what worked (default false)"),
+                    "transactional": boolean("Put the workbook back as it was when an operation fails (default true unless keepGoing)"),
+                }),
+                &[],
+            ),
+            crate::tools::ANY,
+        ),
+    ]
 }
 
 const PAPERS: &[&str] = &["Letter", "Legal", "A4", "A3", "A5", "Tabloid", "Executive", "Ledger", "B5"];
@@ -968,6 +1191,14 @@ pub fn run_tool(b: &mut dyn Backend, st: &mut CallState, name: &str, args: &Valu
             let max = raw.get("max_bytes").and_then(Value::as_u64).map_or(st.settings.max_result_bytes, |m| (m as usize).clamp(1024, 64 << 20));
             let from =
                 raw.get("continue_from").and_then(Value::as_u64).filter(|_| !def["inputSchema"]["properties"]["offset"].is_object()).unwrap_or(0);
+            // WHIQ: a preview's HTML and a read's Markdown are paged by their tools (window,
+            // max_bytes), not cut by the result trim; they also come as their own content block.
+            let mut big = None;
+            if let (Some(key), Some(o)) = (BIG_TEXT.iter().find(|(t, _)| *t == name).map(|(_, k)| *k), v.as_object_mut())
+                && let Some(Value::String(t)) = o.remove(key)
+            {
+                big = Some((key, t));
+            }
             let mut v = contract::trim_from(v, from as usize, max);
             warnings.append(&mut st.notices);
             if !v.is_object() && (reports.iter().any(|r| r.previous_renamed_to.is_some()) || !warnings.is_empty()) {
@@ -1003,6 +1234,12 @@ pub fn run_tool(b: &mut dyn Backend, st: &mut CallState, name: &str, args: &Valu
             }
             let image = v.as_object_mut().and_then(|o| o.remove("__image"));
             let mut r = ToolResult::json(&v);
+            if let Some((key, text)) = big {
+                if let Some(s) = r.structured.as_mut().and_then(Value::as_object_mut) {
+                    s.insert(key.to_string(), json!(text));
+                }
+                r.content.push(json!({"type": "text", "text": text}));
+            }
             if let Some(img) = image {
                 r.content.push(json!({"type": "image", "data": img["data"], "mimeType": img["mimeType"]}));
             }
@@ -1069,6 +1306,80 @@ fn dispatch(b: &mut dyn Backend, st: &mut CallState, name: &str, a: &Args, warni
         "debug_panic" => provoked_panic(),
         "read_range" => read_range(b, st, a),
         "export_range" => export_range(b, a),
+        "render_preview" => render_preview(b, st, a),
+        "export_markdown" => export_markdown(b, st, a),
+        "batch" => batch(b, st, a, warnings),
+        "find" => find(b, a),
+        "list_comments" => b.call("review.listComments", pick(a, &["sheet"])).map_err(|e| classify(b, name, a, &e)),
+        "find_replace" => find_replace(b, a),
+        "add_comment" | "delete_comment" => {
+            let cell = a.get("cell").and_then(Value::as_str).unwrap_or("").to_string();
+            let (sheet, at) = split_sheet(&cell);
+            let mut sa = a.clone();
+            if let Some(sh) = sheet {
+                sa.insert("sheet".into(), json!(sh));
+            }
+            let at = at.to_string();
+            let (id, mut p) = match (name, a.get("note").and_then(Value::as_bool).unwrap_or(false)) {
+                ("delete_comment", _) => ("review.deleteComment", json!({})),
+                (_, true) => ("review.newNote", pick(a, &["text"])),
+                _ => ("review.newComment", pick(a, &["text"])),
+            };
+            p["cell"] = json!(at);
+            with_sheet(b, &sa, |b| exec(b, id, p)).map_err(|e| classify(b, name, a, &e))
+        }
+        "define_name" => {
+            let mut p = pick(a, &["name", "scope", "comment"]);
+            if let Some(r) = a.get("refers_to") {
+                p["refersTo"] = r.clone();
+            }
+            if let Some(o) = a.get("old_name") {
+                p["oldName"] = o.clone();
+                if let Some(sc) = a.get("scope") {
+                    p["oldScope"] = sc.clone();
+                }
+            }
+            exec(b, "formulas.defineName", p).map_err(|e| classify(b, name, a, &e))
+        }
+        "delete_name" => exec(b, "formulas.deleteName", pick(a, &["name", "scope"])).map_err(|e| classify(b, name, a, &e)),
+        "delete_sheet" => {
+            let p = match a.get("sheet") {
+                Some(Value::String(t)) => match t.trim().parse::<u64>() {
+                    Ok(i) if !sheet_names(b).iter().any(|n| n == t.trim()) => json!({"sheet": i}),
+                    _ => json!({"sheet": t}),
+                },
+                Some(v) => json!({"sheet": v}),
+                None => json!({}),
+            };
+            exec(b, "home.deleteSheet", p).map_err(|e| classify(b, name, a, &e))
+        }
+        "delete_chart" => with_sheet(b, a, |b| exec(b, "chart.delete", pick(a, &["chart"]))).map_err(|e| classify(b, name, a, &e)),
+        "delete_table" => {
+            let table = a.get("table").and_then(Value::as_str).unwrap_or("").to_string();
+            let info = b.call("document.inspect", json!({})).map_err(|e| classify(b, name, a, &e))?;
+            let found = info["sheets"].as_array().into_iter().flatten().find_map(|sh| {
+                sh["tables"].as_array().into_iter().flatten().find(|t| t["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(&table))).map(|t| {
+                    (
+                        sh["name"].as_str().unwrap_or("").to_string(),
+                        t["name"].as_str().unwrap_or("").to_string(),
+                        t["range"].as_str().unwrap_or("").to_string(),
+                    )
+                })
+            });
+            let Some((sheet, tname, range)) = found else {
+                return Err(ToolError::new("not_found", format!("there is no table `{table}`"), "inspect_workbook lists each sheet's tables"));
+            };
+            let mut v = exec(b, "table.convertToRange", json!({"table": tname})).map_err(|e| classify(b, name, a, &e))?;
+            if a.get("clear").and_then(Value::as_bool) == Some(true) && !range.is_empty() {
+                exec(b, "edit.clearAll", json!({"range": format!("{}!{range}", quote_sheet(&sheet))})).map_err(|e| classify(b, name, a, &e))?;
+            }
+            if !v.is_object() {
+                v = json!({});
+            }
+            v["deleted"] = json!(tname);
+            v["range"] = json!(format!("{}!{range}", quote_sheet(&sheet)));
+            Ok(v)
+        }
         "list_commands" => {
             let v = b.call("engine.commands", pick(a, &["search"])).map_err(|e| classify(b, name, a, &e))?;
             Ok(paged(v, a))
@@ -1080,6 +1391,328 @@ fn dispatch(b: &mut dyn Backend, st: &mut CallState, name: &str, a: &Args, warni
         "execute_command" => execute_command(b, a, warnings),
         _ => crate::tools::dispatch(b, name, a).map_err(|e| classify(b, name, a, &e)),
     }
+}
+
+// ---------------------------------------------------------------- preview, Markdown, batch
+
+/// Whether two paths name the same file (relative ones inside `root`).
+fn same_file(a: &str, b: &str, root: Option<&Path>) -> bool {
+    let abs = |p: &str| {
+        let pb = PathBuf::from(p);
+        let pb = match root {
+            Some(r) if pb.is_relative() => r.join(&pb),
+            _ => pb,
+        };
+        std::fs::canonicalize(&pb).unwrap_or(pb)
+    };
+    abs(a) == abs(b)
+}
+
+/// Runs `f` on the workbook a call names: the file `path` (the open workbook with that file, else
+/// the file opened and kept open), else the `document` / active one. The active workbook is the
+/// same after the call. Returns `f`'s answer and, for a `path`, `{document, opened, path}`.
+fn on_file(
+    b: &mut dyn Backend,
+    st: &CallState,
+    a: &Args,
+    tool: &str,
+    f: impl FnOnce(&mut dyn Backend) -> Result<Value, ToolError>,
+) -> Result<(Value, Option<Value>), ToolError> {
+    let Some(path) = a.get("path").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty()).map(str::to_string) else {
+        if let Some(ev) = &st.evicted {
+            return Err(ev.error());
+        }
+        return f(b).map(|v| (v, None));
+    };
+    let before = b.active_document();
+    let root = b.roots().0;
+    let open: Vec<(String, Option<String>)> =
+        b.snapshot().map(|s| s.open.iter().map(|o| (o.handle.clone(), o.path.clone())).collect()).unwrap_or_default();
+    let found = open.iter().find(|(_, p)| p.as_deref().is_some_and(|p| same_file(p, &path, root.as_deref()))).map(|(h, _)| h.clone());
+    let (handle, opened) = match found {
+        Some(h) => {
+            if b.select_document(&h).is_err() && b.has_handles() {
+                return Err(ToolError::new("not_found", format!("{path} was open but could not be selected"), "call again"));
+            }
+            (h, false)
+        }
+        None => {
+            exec(b, "file.open", json!({"path": path})).map_err(|e| classify(b, tool, a, &e))?;
+            (b.active_document().unwrap_or_default(), true)
+        }
+    };
+    let r = f(b);
+    if let Some(prev) = before
+        && prev != handle
+    {
+        let _ = b.select_document(&prev);
+    }
+    let v = r?;
+    Ok((v, Some(json!({"document": handle, "opened": opened, "path": path}))))
+}
+
+/// render_preview: the engine's `file.previewHtml` on the workbook the call names.
+fn render_preview(b: &mut dyn Backend, st: &CallState, a: &Args) -> Result<Value, ToolError> {
+    let mut p = pick(a, &["sheet", "row_start", "row_count", "col_start", "col_count", "format", "headings", "other_sheets", "max_cells", "title"]);
+    if let Some(h) = a.get("html_path") {
+        p["path"] = h.clone();
+    }
+    let (mut v, file) = on_file(b, st, a, "render_preview", |b| exec(b, "file.previewHtml", p).map_err(|e| classify(b, "render_preview", a, &e)))?;
+    if let Some(f) = file {
+        v["document"] = f["document"].clone();
+        v["opened"] = f["opened"].clone();
+        v["source"] = f["path"].clone();
+    }
+    let w = &v["window"];
+    v["next_step"] = json!(if w["more_rows"] == true {
+        format!(
+            "draw the next rows with render_preview {{sheet: {}, row_start: {}, row_count: {}}} (format \"rows\" appends to this table)",
+            w["sheet"], w["next_rows"]["row_start"], w["row_count"]
+        )
+    } else {
+        "the window holds the rest of the sheet; other sheets: pass `sheet`".to_string()
+    });
+    Ok(v)
+}
+
+/// export_markdown: the engine's `sheet.markdown`, paged by rows and bytes.
+fn export_markdown(b: &mut dyn Backend, st: &CallState, a: &Args) -> Result<Value, ToolError> {
+    let mut p = pick(a, &["sheet", "continue_sheets", "row_start", "row_count", "col_start", "col_count", "formulas", "keep_empty_rows"]);
+    p["max_bytes"] = json!(a.get("max_bytes").and_then(Value::as_u64).map_or(st.settings.max_result_bytes as u64, |m| m.clamp(1024, 64 << 20)));
+    let (mut v, file) = on_file(b, st, a, "export_markdown", |b| exec(b, "sheet.markdown", p).map_err(|e| classify(b, "export_markdown", a, &e)))?;
+    if let Some(f) = file {
+        v["document"] = f["document"].clone();
+        v["opened"] = f["opened"].clone();
+        v["source"] = f["path"].clone();
+    }
+    v["next_step"] = json!(match v.get("next") {
+        Some(n) => format!(
+            "call export_markdown again with sheet: {}, row_start: {}{} for the next page",
+            n["sheet"],
+            n["row_start"],
+            if n["continue_sheets"] == true { ", continue_sheets: true" } else { "" }
+        ),
+        None => "that is everything asked for".to_string(),
+    });
+    Ok(v)
+}
+
+/// find: every match of `what` as {sheet, cell, value}; none is an empty list.
+fn find(b: &mut dyn Backend, a: &Args) -> Result<Value, ToolError> {
+    let mut p = json!({
+        "what": a.get("what").map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())).unwrap_or_default(),
+        "all": true,
+        "lookIn": a.get("look_in").and_then(Value::as_str).unwrap_or("values"),
+        "matchCase": a.get("match_case").and_then(Value::as_bool).unwrap_or(false),
+        "wholeCell": a.get("whole_cell").and_then(Value::as_bool).unwrap_or(false),
+        "byColumns": a.get("by_columns").and_then(Value::as_bool).unwrap_or(false),
+    });
+    let one_sheet = a.get("sheet").and_then(Value::as_str).is_some();
+    p["within"] = json!(if one_sheet { "sheet" } else { "workbook" });
+    match with_sheet(b, a, |b| exec(b, "edit.find", p)) {
+        Ok(mut v) => {
+            v["next_step"] = json!("get_cell or read_range on a match for more; find_replace to change them");
+            Ok(v)
+        }
+        Err(e) if e.contains("couldn't find") => Ok(json!({"count": 0, "results": [], "note": "no cell matches"})),
+        Err(e) => Err(classify(b, "find", a, &e)),
+    }
+}
+
+/// find_replace: Replace All (the cells changed are found first, so the answer names them).
+fn find_replace(b: &mut dyn Backend, a: &Args) -> Result<Value, ToolError> {
+    let what = a.get("what").map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())).unwrap_or_default();
+    let with = a.get("with").map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())).unwrap_or_default();
+    let case = a.get("match_case").and_then(Value::as_bool).unwrap_or(false);
+    let whole = a.get("whole_cell").and_then(Value::as_bool).unwrap_or(false);
+    let within = if a.get("sheet").and_then(Value::as_str).is_some() { "sheet" } else { "workbook" };
+    let probe = json!({"what": what, "all": true, "lookIn": "formulas", "matchCase": case, "wholeCell": whole, "within": within});
+    let cells = match with_sheet(b, a, |b| exec(b, "edit.find", probe)) {
+        Ok(v) => v["results"].as_array().cloned().unwrap_or_default().into_iter().map(|r| json!({"sheet": r["sheet"], "cell": r["cell"]})).collect(),
+        Err(e) if e.contains("couldn't find") => vec![],
+        Err(e) => return Err(classify(b, "find_replace", a, &e)),
+    };
+    if cells.is_empty() {
+        return Ok(json!({"replaced": 0, "cells": [], "note": "no cell contains it"}));
+    }
+    let p = json!({"what": what, "with": with, "matchCase": case, "wholeCell": whole, "all": true, "within": within});
+    let mut v = with_sheet(b, a, |b| exec(b, "edit.replace", p)).map_err(|e| classify(b, "find_replace", a, &e))?;
+    v["cells"] = json!(cells);
+    Ok(v)
+}
+
+/// Tools a batch does not run (they open, close or watch documents, or are batches).
+const NOT_IN_BATCH: &[&str] = &[
+    "batch",
+    "cancel",
+    "evict",
+    "server_status",
+    "job_status",
+    "list_jobs",
+    "open_workbook",
+    "new_workbook",
+    "build_workbook",
+    "close_workbook",
+    "undo",
+    "redo",
+    "debug_sleep",
+    "debug_panic",
+];
+
+/// One operation of a batch: its label and its answer.
+fn batch_op(
+    b: &mut dyn Backend,
+    st: &mut CallState,
+    defs: &[Value],
+    op: &Value,
+    warnings: &mut Vec<String>,
+) -> Result<(String, Value), (String, ToolError)> {
+    let Some(o) = op.as_object() else {
+        return Err((
+            "?".into(),
+            ToolError::new("invalid_argument", "each operation is an object", "e.g. {\"op\": \"write\", \"range\": \"A1\", \"values\": [[1]]}"),
+        ));
+    };
+    if let Some(cmd) = o.get("command").and_then(Value::as_str).filter(|_| !o.contains_key("tool") && !o.contains_key("op")) {
+        let mut a = Map::new();
+        a.insert("command".into(), json!(cmd));
+        a.insert("params".into(), o.get("params").cloned().filter(|p| !p.is_null()).unwrap_or(json!({})));
+        return execute_command(b, &a, warnings).map(|v| (cmd.to_string(), v)).map_err(|e| (cmd.to_string(), e));
+    }
+    // The key that names the operation (`type` only when neither `tool` nor `op` is there: it is
+    // also an argument of charts and validations).
+    let name_key = ["tool", "op", "type"].into_iter().find(|k| o.get(*k).is_some_and(Value::is_string)).unwrap_or("tool");
+    let raw_name = o.get(name_key).and_then(Value::as_str).unwrap_or("").to_string();
+    let mut args: Map<String, Value> = match o.get("args").or_else(|| o.get("arguments")) {
+        Some(Value::Object(m)) => m.clone(),
+        _ => o
+            .iter()
+            .filter(|(k, _)| k.as_str() != name_key && !matches!(k.as_str(), "args" | "arguments"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    };
+    if args.remove("document").is_some() {
+        warnings.push(format!("`{raw_name}`: a batch acts on one workbook; the operation's `document` was ignored"));
+    }
+    let sq = contract::squash(&raw_name);
+    // Merges are commands, not tools.
+    if matches!(sq.as_str(), "merge" | "mergecells" | "mergecenter" | "mergeacross" | "unmerge" | "unmergecells") {
+        let center = args.get("center").and_then(Value::as_bool).unwrap_or(sq == "mergecenter");
+        let id = match sq.as_str() {
+            "unmerge" | "unmergecells" => "home.unmergeCells",
+            "mergeacross" => "home.mergeAcross",
+            _ if center => "home.mergeCenter",
+            _ => "home.mergeCells",
+        };
+        let p = pick(&args, &["range"]);
+        return exec(b, id, p).map(|v| (raw_name.clone(), v)).map_err(|e| (raw_name.clone(), classify(b, "batch", &args, &e)));
+    }
+    let alias = match sq.as_str() {
+        "write" | "values" | "setvalues" => Some("write_range"),
+        "set" | "cell" => Some("set_cell"),
+        "format" | "style" => Some("format_range"),
+        "chart" => Some("insert_chart"),
+        "cf" | "conditional" | "conditionalformat" => Some("conditional_format"),
+        "validation" | "validate" => Some("data_validation"),
+        "table" => Some("create_table"),
+        "sort" => Some("sort_range"),
+        "recalc" => Some("recalculate"),
+        _ => None,
+    };
+    let known: Vec<String> = defs.iter().filter_map(|d| d["name"].as_str().map(str::to_string)).collect();
+    let Some(name) = alias.map(str::to_string).or_else(|| contract::normalize_tool_name(&raw_name, &known)) else {
+        let near = contract::closest(&raw_name, known.iter().map(String::as_str), 3);
+        return Err((
+            raw_name.clone(),
+            ToolError::new(
+                "not_found",
+                format!("there is no tool or op `{raw_name}`"),
+                "use a tool name from tools/list, a short op (write, format, merge, chart…) or {command, params}",
+            )
+            .with("closest", json!(near)),
+        ));
+    };
+    if NOT_IN_BATCH.contains(&name.as_str()) {
+        return Err((
+            name.clone(),
+            ToolError::new("unsupported", format!("`{name}` cannot run inside a batch"), "call it on its own, before or after the batch"),
+        ));
+    }
+    let Some(def) = defs.iter().find(|d| d["name"] == name.as_str()) else {
+        return Err((name.clone(), ToolError::new("not_found", format!("there is no tool `{name}`"), "call tools/list")));
+    };
+    let (a, mut fixes) = contract::normalize_args(&def["inputSchema"], &args);
+    warnings.append(&mut fixes);
+    if let Err(e) = check_arguments(&name, &Value::Object(a.clone())) {
+        return Err((name.clone(), invalid_argument(def, &e)));
+    }
+    dispatch(b, st, &name, &a, warnings).map(|v| (name.clone(), v)).map_err(|e| (name.clone(), e))
+}
+
+/// batch: a list of operations in one call, one undo step, undone as a whole on a failure
+/// (unless keepGoing / transactional: false).
+fn batch(b: &mut dyn Backend, st: &mut CallState, a: &Args, warnings: &mut Vec<String>) -> Result<Value, ToolError> {
+    let ops = a.get("ops").or_else(|| a.get("commands")).and_then(Value::as_array).cloned().unwrap_or_default();
+    if ops.is_empty() {
+        return Err(ToolError::new(
+            "invalid_argument",
+            "batch needs `ops`: a list of operations",
+            "pass {\"ops\": [{\"op\": \"write\", \"range\": \"A1\", \"values\": [[1, 2]]}, {\"op\": \"format\", \"range\": \"A1:B1\", \"bold\": true}]}",
+        ));
+    }
+    let keep_going = a.get("keepGoing").or_else(|| a.get("keep_going")).and_then(Value::as_bool).unwrap_or(false);
+    let transactional = a.get("transactional").and_then(Value::as_bool).unwrap_or(!keep_going);
+    let defs = all_definitions();
+    let total = ops.len();
+    let label = format!("Batch ({total} operations)");
+    b.begin_batch();
+    let mut results = Vec::with_capacity(total);
+    let mut failed = 0usize;
+    for (i, op) in ops.iter().enumerate() {
+        gridcraft_engine::core::progress::step_in("batch operations", i as u64, total as u64);
+        // A safe point between operations: the whole batch is undone.
+        if gridcraft_engine::core::cancel::requested() {
+            let rolled = b.end_batch(false, &label);
+            return Err(ToolError::new(
+                "cancelled",
+                format!("cancelled before operation {} of {total}", i + 1),
+                if rolled {
+                    "the workbook is as it was before the batch: send it again to do it"
+                } else {
+                    "the operations before it ran (see results)"
+                },
+            )
+            .with("results", json!(results))
+            .with("stopped_at", json!(i))
+            .with("rolled_back", json!(rolled)));
+        }
+        match batch_op(b, st, &defs, op, warnings) {
+            Ok((name, v)) => results.push(json!({"index": i, "op": name, "ok": true, "result": v})),
+            Err((name, e)) => {
+                failed += 1;
+                results.push(json!({"index": i, "op": name, "ok": false, "error": e.to_value()}));
+                if e.code == "cancelled" || !keep_going {
+                    let rolled = if transactional {
+                        b.end_batch(false, &label)
+                    } else {
+                        b.end_batch(true, &label);
+                        false
+                    };
+                    let next = if rolled {
+                        "nothing of the batch was kept (the workbook is as it was before it): fix that operation and send the batch again".to_string()
+                    } else {
+                        format!("{}; the operations before it ran (see results); send the rest as a new batch", e.next_step)
+                    };
+                    return Err(ToolError::new(&e.code, format!("operation {} of {total} (`{name}`) failed: {}", i + 1, e.reason), next)
+                        .with("results", json!(results))
+                        .with("failed_at", json!(i))
+                        .with("rolled_back", json!(rolled)));
+                }
+            }
+        }
+    }
+    b.end_batch(true, &label);
+    Ok(json!({"results": results, "ran": total, "ok": total - failed, "failed": failed, "transactional": transactional, "undo_steps": 1}))
 }
 
 /// The contract tests' way to prove a panic inside a call loses no work (test hooks only).

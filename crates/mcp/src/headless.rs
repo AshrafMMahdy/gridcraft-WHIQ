@@ -18,6 +18,8 @@ pub struct Headless {
     /// WHIQ: the folders this session's commands may read and write (`--automation-read-root`,
     /// `--automation-write-root`); `None` confines nothing.
     roots: Option<Arc<AutomationRoots>>,
+    /// WHIQ: the workbook as it stood when a `batch` began.
+    batch_mark: Option<gridcraft_engine::CallMark>,
 }
 
 impl Default for Headless {
@@ -31,12 +33,12 @@ impl Headless {
     pub fn new() -> Self {
         let mut session = Session::new();
         session.new_workbook();
-        Self { session, roots: None }
+        Self { session, roots: None, batch_mark: None }
     }
 
     /// A session wrapping an existing one (e.g. with a file already open).
     pub fn with_session(session: Session) -> Self {
-        Self { session, roots: None }
+        Self { session, roots: None, batch_mark: None }
     }
 
     /// Confine every file the session's commands read and write to `roots`.
@@ -140,6 +142,21 @@ impl Backend for Headless {
             if wb.props.author.is_empty() {
                 wb.props.author = name.to_string();
             }
+        }
+    }
+
+    fn begin_batch(&mut self) -> bool {
+        self.batch_mark = self.session.mark();
+        self.batch_mark.is_some()
+    }
+
+    fn end_batch(&mut self, keep: bool, label: &str) -> bool {
+        let Some(m) = self.batch_mark.take() else { return false };
+        if keep {
+            self.session.squash_since(&m, label);
+            true
+        } else {
+            self.session.rollback_to(m)
         }
     }
 

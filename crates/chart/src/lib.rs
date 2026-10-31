@@ -15,6 +15,7 @@ mod raster;
 mod render;
 mod resolve;
 mod sparkline;
+mod svg;
 mod trend;
 
 #[cfg(test)]
@@ -28,6 +29,8 @@ pub use raster::rasterize;
 pub use render::{Swatch, legend_entries, render, supports_trendline};
 pub use resolve::{default_palette, resolve, series_color, series_plot_kind};
 pub use sparkline::render_sparkline;
+// WHIQ: the HTML preview draws charts as inline SVG.
+pub use svg::{to_svg, xml_escape};
 
 /// Straight (non-premultiplied) RGBA colour.
 pub type Rgba = [u8; 4];

@@ -20,6 +20,8 @@ pub mod paper;
 pub mod pivot;
 pub mod pivot_calc;
 pub mod pressure;
+// WHIQ: the workbook as preview HTML and Markdown, by windows.
+pub mod preview;
 pub mod sample;
 pub mod selection;
 pub mod tables;
@@ -63,6 +65,17 @@ pub enum EngineError {
 }
 
 pub type Result<T> = std::result::Result<T, EngineError>;
+
+/// WHIQ: the state of the active workbook at a point in time ([`Session::mark`]).
+#[derive(Clone, Debug)]
+pub struct CallMark {
+    uid: u64,
+    wb: Arc<Workbook>,
+    selection: Selection,
+    undo: Vec<HistoryEntry>,
+    redo: Vec<HistoryEntry>,
+    revision: u64,
+}
 
 #[derive(Clone, Debug)]
 pub struct HistoryEntry {
@@ -408,6 +421,51 @@ impl Session {
         #[cfg(not(target_arch = "wasm32"))]
         self.relieve_memory();
         result
+    }
+
+    /// WHIQ: where the active workbook stands now, for a batch of commands that is undone as a
+    /// whole when one fails ([`Session::rollback_to`]) or kept as one undo step
+    /// ([`Session::squash_since`]).
+    pub fn mark(&self) -> Option<CallMark> {
+        let d = self.active()?;
+        Some(CallMark {
+            uid: d.uid,
+            wb: d.wb.clone(),
+            selection: d.selection.clone(),
+            undo: d.undo.clone(),
+            redo: d.redo.clone(),
+            revision: d.revision,
+        })
+    }
+
+    /// WHIQ: the workbook of `m` back as it was (cells, selection, undo and redo); false when that
+    /// workbook is no longer open.
+    pub fn rollback_to(&mut self, m: CallMark) -> bool {
+        let Some(d) = self.docs.iter_mut().find(|d| d.uid == m.uid) else { return false };
+        if !Arc::ptr_eq(&d.wb, &m.wb) {
+            d.wb = m.wb;
+            d.calc.rebuild(&d.wb);
+        }
+        d.selection = m.selection;
+        d.undo = m.undo;
+        d.redo = m.redo;
+        d.revision = m.revision;
+        true
+    }
+
+    /// WHIQ: the undo steps recorded since `m` become one step labelled `label` (undo goes back to
+    /// the workbook of `m` at once).
+    pub fn squash_since(&mut self, m: &CallMark, label: &str) {
+        let Some(d) = self.docs.iter_mut().find(|d| d.uid == m.uid) else { return };
+        if Arc::ptr_eq(&d.wb, &m.wb) {
+            return;
+        }
+        d.undo = m.undo.clone();
+        d.undo.push(HistoryEntry { label: label.to_string(), wb: m.wb.clone(), selection: m.selection.clone() });
+        if d.undo.len() > UNDO_LIMIT {
+            d.undo.remove(0);
+        }
+        d.redo.clear();
     }
 
     pub fn run(&mut self, id: &str, params: Json) -> std::result::Result<Json, String> {

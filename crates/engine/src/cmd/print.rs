@@ -855,11 +855,11 @@ impl Canvas for Mirror<'_> {
     }
 }
 
-fn rgb_of(c: Color, wb: &Workbook) -> Option<Rgb> {
+pub(crate) fn rgb_of(c: Color, wb: &Workbook) -> Option<Rgb> {
     c.resolve(&wb.theme)
 }
 
-fn numfmt_rgb(c: gridcraft_numfmt::FormatColor) -> Rgb {
+pub(crate) fn numfmt_rgb(c: gridcraft_numfmt::FormatColor) -> Rgb {
     use gridcraft_numfmt::FormatColor as F;
     match c {
         F::Black | F::Indexed(_) => [0, 0, 0],
@@ -880,13 +880,13 @@ fn blend(fg: [u8; 4]) -> Rgb {
 }
 
 /// The effective look of a cell: own style, table style, conditional formats.
-struct Look {
-    style: Style,
-    fill: Option<Rgb>,
-    cf: Option<crate::cf::CfLook>,
+pub(crate) struct Look {
+    pub(crate) style: Style,
+    pub(crate) fill: Option<Rgb>,
+    pub(crate) cf: Option<crate::cf::CfLook>,
 }
 
-fn cell_look(wb: &Workbook, si: usize, sh: &Sheet, c: CellRef, cf: &mut Option<crate::cf::CfCache>) -> Look {
+pub(crate) fn cell_look(wb: &Workbook, si: usize, sh: &Sheet, c: CellRef, cf: &mut Option<crate::cf::CfCache>) -> Look {
     let mut style = match sh.table_at(c) {
         Some(t) => crate::tables::table_cell_style(wb, si, t, c),
         None => wb.styles.get(sh.style_id(c)).clone(),
@@ -1512,7 +1512,7 @@ fn draw_text(
 }
 
 /// Sheet pixel rectangle of an anchor.
-fn anchor_rect(sh: &Sheet, a: &Anchor) -> (f64, f64, f64, f64) {
+pub(crate) fn anchor_rect(sh: &Sheet, a: &Anchor) -> (f64, f64, f64, f64) {
     (sh.col_left(a.cell.col) + a.dx as f64, sh.row_top(a.cell.row) + a.dy as f64, a.width.max(0.0) as f64, a.height.max(0.0) as f64)
 }
 

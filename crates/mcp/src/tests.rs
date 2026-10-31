@@ -609,3 +609,408 @@ fn automation_roots_confine_the_headless_server() {
     assert!(e.contains("outside the read root"), "{e}");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+// ---------- WHIQ: preview, Markdown reads, bulk writes and batches ----------
+
+/// A tool's structuredContent (successful).
+fn structured(s: &mut Server, name: &str, args: Value) -> Value {
+    let r = call(s, name, args);
+    assert_eq!(r["isError"], false, "{name}: {r}");
+    r["structuredContent"].clone()
+}
+
+#[test]
+fn render_preview_draws_a_window_and_says_how_to_page() {
+    let mut s = server();
+    let rows: Vec<Value> = (1..=5000).map(|i| json!([format!("item {i}"), i, format!("=B{i}*2")])).collect();
+    structured(&mut s, "write_range", json!({"range": "A1", "values": rows}));
+    let r = call(&mut s, "render_preview", json!({}));
+    assert_eq!(r["isError"], false, "{r}");
+    let v = &r["structuredContent"];
+    let html = v["html"].as_str().unwrap();
+    assert!(html.starts_with("<!DOCTYPE html>") && html.contains("class=\"tab on\""));
+    assert!(html.contains("data-f=\"=B1*2\""));
+    // The HTML is its own content block; the first is the JSON without it.
+    let blocks = r["content"].as_array().unwrap();
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[1]["text"].as_str().unwrap(), html);
+    assert!(!blocks[0]["text"].as_str().unwrap().contains("<!DOCTYPE"));
+    assert_eq!(v["window"]["rows"], 5000);
+    assert_eq!(v["window"]["more_rows"], true);
+    assert_eq!(v["sheets"][0]["used_range"], "A1:C5000");
+    assert!(v["next_step"].as_str().unwrap().contains("row_start"));
+    // Far past the old 2,000-row cap, and big HTML is never trimmed by --max-result-bytes.
+    let v = structured(&mut s, "render_preview", json!({"sheet": 0, "row_start": 3001, "row_count": 2000, "format": "rows"}));
+    let html = v["html"].as_str().unwrap();
+    assert!(html.len() > crate::contract::MAX_RESULT_BYTES, "{}", html.len());
+    assert!(html.contains("data-r=\"3001\"") && html.contains("data-r=\"5000\"") && html.contains("item 5000"));
+    assert_eq!(v["window"]["more_rows"], false);
+}
+
+#[test]
+fn render_preview_and_export_markdown_read_a_file_and_leave_the_active_workbook() {
+    let mut s = server();
+    let path = tmp("preview-source.xlsx");
+    let _ = std::fs::remove_file(&path);
+    let source = structured(&mut s, "new_workbook", json!({}))["document"].clone();
+    structured(&mut s, "write_range", json!({"range": "A1", "values": [["Region", "Units"], ["North", 1200.5], ["South", 800]]}));
+    structured(&mut s, "format_range", json!({"range": "B2:B3", "numberFormat": "#,##0.00"}));
+    structured(&mut s, "save_workbook", json!({"path": path.to_str().unwrap(), "overwrite": true}));
+    let mine = structured(&mut s, "new_workbook", json!({}))["document"].clone();
+    structured(&mut s, "set_cell", json!({"cell": "A1", "input": "mine"}));
+    // The file is open here (it was saved from this server): that workbook is drawn.
+    let v = structured(&mut s, "render_preview", json!({"path": path.to_str().unwrap()}));
+    assert_eq!(v["opened"], false, "{v}");
+    assert_eq!(v["document"], source);
+    structured(&mut s, "close_workbook", json!({"document": source}));
+    assert_eq!(structured(&mut s, "get_cell", json!({"cell": "A1"}))["value"], "mine");
+    // Closed: the file is opened for the preview and kept open, the agent's workbook stays active.
+    let v = structured(&mut s, "render_preview", json!({"path": path.to_str().unwrap()}));
+    assert_eq!(v["opened"], true, "{v}");
+    let handle = v["document"].as_str().unwrap().to_string();
+    assert_ne!(Value::String(handle.clone()), mine);
+    assert!(v["html"].as_str().unwrap().contains(">1,200.50<"));
+    // The active workbook is still the agent's.
+    assert_eq!(structured(&mut s, "get_cell", json!({"cell": "A1"}))["value"], "mine");
+    // The next window reuses the open file.
+    let v = structured(&mut s, "export_markdown", json!({"path": path.to_str().unwrap()}));
+    assert_eq!(v["opened"], false, "{v}");
+    assert_eq!(v["document"], handle);
+    let md = v["markdown"].as_str().unwrap();
+    assert!(md.contains("| 2 | North | 1,200.50 |"), "{md}");
+    assert_eq!(v["sheets"][0]["used_range"], "A1:B3");
+    // And by handle, paged.
+    let v = structured(&mut s, "export_markdown", json!({"document": handle, "sheet": "Sheet1", "row_start": 2, "row_count": 1}));
+    assert!(v["markdown"].as_str().unwrap().contains("| 2 | North |") && !v["markdown"].as_str().unwrap().contains("| 3 |"));
+    assert_eq!(v["next"]["row_start"], 3);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn one_call_writes_a_hundred_thousand_cells() {
+    let mut s = server();
+    let rows: Vec<Value> = (0..1000).map(|r| Value::Array((0..100).map(|c| json!(r * 100 + c)).collect())).collect();
+    let v = structured(&mut s, "write_range", json!({"range": "A1", "values": rows.clone()}));
+    assert_eq!(v["cells"], 100_000);
+    assert_eq!(structured(&mut s, "get_cell", json!({"cell": "CV1000"}))["value"], 99_999.0);
+    // The same block as one operation of a batch.
+    let v = structured(&mut s, "batch", json!({"ops": [{"op": "write", "range": "Sheet1!A2001", "values": rows}]}));
+    assert_eq!(v["ok"], 1);
+    assert_eq!(v["results"][0]["result"]["cells"], 100_000);
+    assert_eq!(structured(&mut s, "get_cell", json!({"cell": "CV3000"}))["value"], 99_999.0);
+    // Many ranges formatted in one call.
+    structured(&mut s, "format_range", json!({"range": "A1:B2,D5:E6,CV1000", "bold": true, "fillColor": "#FFEB9C"}));
+    for c in ["A1", "B2", "E6", "CV1000"] {
+        assert_eq!(structured(&mut s, "get_cell", json!({"cell": c}))["style"]["font"]["bold"], true, "{c}");
+    }
+    assert_eq!(structured(&mut s, "get_cell", json!({"cell": "C3"}))["style"]["font"]["bold"], false);
+}
+
+#[test]
+fn a_fifty_operation_batch_runs_in_one_call_as_one_undo_step() {
+    let mut s = server();
+    let mut ops = vec![json!({"op": "write", "range": "A1", "values": [["Month", "Sales", "Cost"]]})];
+    for i in 0..12 {
+        ops.push(json!({"tool": "write_range", "args": {"range": format!("A{}", i + 2), "values": [[format!("M{}", i + 1), (i + 1) * 100, (i + 1) * 60]]}}));
+    }
+    for i in 0..12 {
+        ops.push(json!({"op": "format", "range": format!("B{}:C{}", i + 2, i + 2), "numberFormat": "#,##0", "fillColor": if i % 2 == 0 { "#F2F2F2" } else { "#FFFFFF" }}));
+    }
+    ops.push(json!({"op": "format", "range": "A1:C1", "bold": true, "fillColor": "#DDEBF7", "borders": "all"}));
+    ops.push(json!({"op": "merge", "range": "E1:H1", "center": true}));
+    ops.push(json!({"op": "set", "cell": "E1", "input": "Summary"}));
+    ops.push(json!({"op": "set", "cell": "E2", "input": "=SUM(B2:B13)"}));
+    ops.push(json!({"op": "chart", "range": "A1:B13", "type": "column", "title": "Sales", "at": "E4"}));
+    ops.push(json!({"op": "conditional_format", "range": "B2:B13", "rule": {"type": "cellIs", "operator": "greaterThan", "value": "600", "preset": "greenFill"}}));
+    ops.push(json!({"command": "home.italic", "params": {"range": "A2:A13", "on": true}}));
+    while ops.len() < 50 {
+        let n = ops.len();
+        ops.push(json!({"op": "set", "cell": format!("J{n}"), "input": n}));
+    }
+    assert_eq!(ops.len(), 50);
+    let v = structured(&mut s, "batch", json!({"ops": ops}));
+    assert_eq!(v["ran"], 50, "{v}");
+    assert_eq!(v["ok"], 50, "{v}");
+    assert_eq!(v["failed"], 0);
+    assert_eq!(structured(&mut s, "get_cell", json!({"cell": "E2"}))["value"], 7800.0);
+    let wb = structured(&mut s, "inspect_workbook", json!({}));
+    let sheet = &wb["sheets"][0];
+    assert_eq!(sheet["charts"].as_array().map_or_else(|| sheet["charts"].as_u64().unwrap_or(0) as usize, Vec::len), 1, "{sheet}");
+    // One undo takes the whole batch back.
+    structured(&mut s, "undo", json!({}));
+    assert!(structured(&mut s, "get_cell", json!({"cell": "A1"}))["value"].is_null());
+    structured(&mut s, "redo", json!({}));
+    assert_eq!(structured(&mut s, "get_cell", json!({"cell": "A1"}))["value"], "Month");
+}
+
+#[test]
+fn a_failing_batch_is_rolled_back_unless_keep_going() {
+    let mut s = server();
+    structured(&mut s, "set_cell", json!({"cell": "A1", "input": "before"}));
+    let ops = json!([
+        {"op": "set", "cell": "A1", "input": "changed"},
+        {"op": "write", "range": "B1", "values": [[1, 2, 3]]},
+        {"op": "set", "cell": "not a cell!!", "input": "x"},
+        {"op": "set", "cell": "C5", "input": "after"},
+    ]);
+    let r = call(&mut s, "batch", json!({"ops": ops}));
+    assert_eq!(r["isError"], true, "{r}");
+    let e = &r["structuredContent"]["error"];
+    assert_eq!(e["failed_at"], 2, "{e}");
+    assert_eq!(e["rolled_back"], true, "{e}");
+    assert_eq!(e["results"].as_array().unwrap().len(), 3);
+    assert_eq!(structured(&mut s, "get_cell", json!({"cell": "A1"}))["value"], "before");
+    assert!(structured(&mut s, "get_cell", json!({"cell": "B1"}))["value"].is_null());
+    // keepGoing: the failure is reported and the rest is kept.
+    let v = structured(&mut s, "batch", json!({"ops": ops, "keepGoing": true}));
+    assert_eq!(v["failed"], 1);
+    assert_eq!(v["ok"], 3);
+    assert_eq!(v["results"][2]["ok"], false);
+    assert_eq!(structured(&mut s, "get_cell", json!({"cell": "C5"}))["value"], "after");
+    // Tools that open or close documents are not batched; unknown ops name the closest.
+    let r = call(&mut s, "batch", json!({"ops": [{"tool": "open_workbook", "path": "x.xlsx"}]}));
+    assert_eq!(r["structuredContent"]["error"]["code"], "unsupported", "{r}");
+    let r = call(&mut s, "batch", json!({"ops": [{"tool": "wrte_range", "range": "A1", "values": [[1]]}]}));
+    assert_eq!(r["isError"], true, "{r}");
+    let r = call(&mut s, "batch", json!({}));
+    assert_eq!(r["structuredContent"]["error"]["code"], "invalid_argument", "{r}");
+}
+
+// ---------- WHIQ: working a workbook fully, like a person in Excel (coverage table) ----------
+//
+// Each test opens a real .xlsx written to disk (built, saved, then read back by a fresh server),
+// works it through the tools, saves it and reads the saved file back again.
+
+/// A saved workbook with values, formulas, formats, a merge, a table, a chart, a name, a comment,
+/// a note, a validation, a conditional format and a hidden sheet.
+fn coverage_fixture(name: &str) -> std::path::PathBuf {
+    let path = tmp(name);
+    let _ = std::fs::remove_file(&path);
+    let mut s = server();
+    structured(
+        &mut s,
+        "build_workbook",
+        json!({"sheets": [
+            {"name": "Sales", "header": ["Region", "Units", "Price", "Total"],
+             "rows": [["North", 10, 2.5, "=B2*C2"], ["South", 20, 3, "=B3*C3"], ["East", 30, 1.5, "=B4*C4"], ["West", 40, 2, "=B5*C5"]],
+             "columns": [{"width": 16}, {"format": "#,##0"}, {"format": "0.00"}, {"format": "#,##0.00"}],
+             "table": "TableStyleMedium2",
+             "charts": [{"type": "column", "title": "Units", "series": [{"name": "Units", "values": "B2:B5", "categories": "A2:A5"}], "at": "F2"}]},
+            {"name": "Notes", "rows": [["Title spanning", null, null], ["North has the lowest units"]], "merges": ["A1:C1"]},
+            {"name": "Secret", "rows": [["hidden value", 42]]}
+        ]}),
+    );
+    structured(&mut s, "execute_command", json!({"command": "sheet.hide", "params": {"sheet": "Secret"}}));
+    structured(&mut s, "define_name", json!({"name": "Units", "refers_to": "=Sales!$B$2:$B$5"}));
+    structured(&mut s, "set_cell", json!({"cell": "Sales!F1", "input": "=SUM(Units)"}));
+    structured(&mut s, "add_comment", json!({"cell": "Sales!A2", "text": "Check North", "caller": "Ann"}));
+    structured(&mut s, "add_comment", json!({"cell": "Notes!A2", "text": "a note", "note": true}));
+    structured(
+        &mut s,
+        "data_validation",
+        json!({"range": "Sales!B2:B5", "type": "whole", "operator": "between", "formula1": "0", "formula2": "1000"}),
+    );
+    structured(
+        &mut s,
+        "conditional_format",
+        json!({"range": "Sales!B2:B5", "rule": {"type": "cellIs", "operator": "greaterThan", "value": "15", "preset": "greenFill"}}),
+    );
+    structured(&mut s, "format_range", json!({"range": "Sales!A1:D1", "bold": true, "fillColor": "#DDEBF7"}));
+    structured(&mut s, "save_workbook", json!({"path": path.to_str().unwrap(), "overwrite": true}));
+    path
+}
+
+/// A fresh server with the fixture opened from disk.
+fn open_fixture(name: &str) -> (Server, std::path::PathBuf) {
+    let path = coverage_fixture(name);
+    let mut s = server();
+    structured(&mut s, "open_workbook", json!({"path": path.to_str().unwrap()}));
+    (s, path)
+}
+
+/// Saves and opens the file again in a fresh server (what is checked is what the file holds).
+fn save_and_reopen(s: &mut Server, path: &std::path::Path) -> Server {
+    structured(s, "save_workbook", json!({"path": path.to_str().unwrap(), "overwrite": true}));
+    let mut t = server();
+    structured(&mut t, "open_workbook", json!({"path": path.to_str().unwrap()}));
+    t
+}
+
+fn sheet_info(s: &mut Server, name: &str) -> Value {
+    let wb = structured(s, "inspect_workbook", json!({}));
+    wb["sheets"].as_array().unwrap().iter().find(|x| x["name"] == name).cloned().unwrap_or(Value::Null)
+}
+
+#[test]
+fn coverage_read_values_formulas_formats_comments_charts_tables_names_merges_hidden_sheets_picture() {
+    let (mut s, path) = open_fixture("cov-read.xlsx");
+    // Values and formulas.
+    let v = structured(&mut s, "read_range", json!({"range": "Sales!A1:D5"}));
+    assert_eq!(v["values"][4][3], 80.0, "{v}");
+    let v = structured(&mut s, "read_range", json!({"range": "Sales!D2:D3", "formulas": true}));
+    assert_eq!(v["values"][0][0], "=B2*C2");
+    // Formats: the displayed text and the cell's style.
+    let v = structured(&mut s, "read_range", json!({"range": "Sales!C2", "formatted": true}));
+    assert_eq!(v["values"][0][0], "2.50");
+    let c = structured(&mut s, "get_cell", json!({"cell": "Sales!A1"}));
+    assert_eq!(c["style"]["font"]["bold"], true, "{c}");
+    assert_eq!(structured(&mut s, "get_cell", json!({"cell": "Sales!D2"}))["style"]["num_fmt"], "#,##0.00");
+    // Comments and notes.
+    let v = structured(&mut s, "list_comments", json!({}));
+    assert_eq!(v["count"], 2, "{v}");
+    assert!(v["comments"].as_array().unwrap().iter().any(|c| c["cell"] == "A2" && c["text"] == "Check North" && c["kind"] == "comment"));
+    assert!(v["comments"].as_array().unwrap().iter().any(|c| c["sheet"] == "Notes" && c["kind"] == "note"));
+    assert!(structured(&mut s, "get_cell", json!({"cell": "Sales!A2"}))["comment"].to_string().contains("Check North"));
+    // Charts, tables, names, merges, hidden sheets.
+    let sales = sheet_info(&mut s, "Sales");
+    assert_eq!(sales["charts"][0]["title"], "Units", "{sales}");
+    assert_eq!(sales["tables"].as_array().unwrap().len(), 1);
+    assert_eq!(sales["validations"], 1);
+    assert_eq!(sales["conditionalFormats"], 1);
+    assert_eq!(sheet_info(&mut s, "Notes")["merges"][0], "A1:C1");
+    assert_eq!(sheet_info(&mut s, "Secret")["visibility"], "Hidden");
+    let wb = structured(&mut s, "inspect_workbook", json!({}));
+    assert!(wb["names"].as_array().unwrap().iter().any(|n| n["name"] == "Units" && n["refersTo"] == "=Sales!$B$2:$B$5"), "{wb}");
+    assert_eq!(structured(&mut s, "get_cell", json!({"cell": "Sales!F1"}))["value"], 100.0);
+    // A hidden sheet reads like any other.
+    assert_eq!(structured(&mut s, "read_range", json!({"range": "Secret!B1"}))["values"][0][0], 42.0);
+    // As Markdown, and as a picture for a visual check.
+    let md = structured(&mut s, "export_markdown", json!({"sheet": "Sales"}));
+    assert!(md["markdown"].as_str().unwrap().contains("| 5 | West | 40 | 2.00 | 80.00 |"), "{md}");
+    let r = call(&mut s, "render_range", json!({"range": "Sales!A1:D5"}));
+    assert_eq!(r["isError"], false, "{r}");
+    assert!(r["content"].as_array().unwrap().iter().any(|c| c["type"] == "image" && c["mimeType"] == "image/png"));
+    let p = structured(&mut s, "render_preview", json!({"sheet": "Sales"}));
+    assert!(p["html"].as_str().unwrap().contains("class=\"chart obj\""));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn coverage_create_sheets_rows_columns_cells_tables_charts_validations_conditional_formats_comments_names() {
+    let (mut s, path) = open_fixture("cov-create.xlsx");
+    structured(&mut s, "add_sheet", json!({"name": "Plan"}));
+    structured(&mut s, "write_range", json!({"range": "Plan!A1", "values": [["Task", "Days"], ["Dig", 3], ["Pour", 2], ["Cure", 7]]}));
+    structured(&mut s, "set_cell", json!({"cell": "Plan!B5", "input": "=SUM(B2:B4)"}));
+    structured(&mut s, "insert_rows", json!({"rows": "2", "sheet": "Plan"}));
+    structured(&mut s, "insert_columns", json!({"cols": "A", "sheet": "Plan"}));
+    structured(&mut s, "create_table", json!({"range": "Plan!B1:C5", "name": "PlanTable"}));
+    structured(&mut s, "insert_chart", json!({"range": "Plan!B1:C5", "type": "bar", "title": "Days"}));
+    structured(&mut s, "data_validation", json!({"range": "Plan!C3:C5", "type": "list", "formula1": "1,2,3,7"}));
+    structured(&mut s, "conditional_format", json!({"range": "Plan!C3:C5", "rule": {"type": "dataBar"}}));
+    structured(&mut s, "add_comment", json!({"cell": "Plan!B3", "text": "first task"}));
+    structured(&mut s, "define_name", json!({"name": "Days", "refers_to": "=Plan!$C$3:$C$5"}));
+    let mut t = save_and_reopen(&mut s, &path);
+    let plan = sheet_info(&mut t, "Plan");
+    assert_eq!(plan["tables"][0]["name"], "PlanTable", "{plan}");
+    assert_eq!(plan["charts"][0]["title"], "Days");
+    assert_eq!(plan["validations"], 1);
+    assert_eq!(plan["conditionalFormats"], 1);
+    assert_eq!(plan["comments"], 1);
+    // The inserted row and column moved the cells and the formula with them.
+    assert_eq!(structured(&mut t, "get_cell", json!({"cell": "Plan!B3"}))["value"], "Dig");
+    let total = structured(&mut t, "get_cell", json!({"cell": "Plan!C6"}));
+    assert_eq!(total["formula"], "=SUM(C3:C5)", "{total}");
+    assert_eq!(total["value"], 12.0);
+    let wb = structured(&mut t, "inspect_workbook", json!({}));
+    assert!(wb["names"].as_array().unwrap().iter().any(|n| n["name"] == "Days"));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn coverage_edit_everything_in_one_batch() {
+    let (mut s, path) = open_fixture("cov-edit.xlsx");
+    let sales = sheet_info(&mut s, "Sales");
+    let chart = sales["charts"][0]["id"].clone();
+    let table = sales["tables"][0]["name"].as_str().unwrap().to_string();
+    let v = structured(
+        &mut s,
+        "batch",
+        json!({"ops": [
+            {"op": "set", "cell": "Sales!B2", "input": 15},
+            {"op": "write", "range": "Sales!A6", "values": [["Central", 50, 4, "=B6*C6"]]},
+            {"op": "format", "range": "Sales!B2:B6", "italic": true, "fontColor": "#C00000", "numberFormat": "0"},
+            {"tool": "rename_sheet", "sheet": "Notes", "name": "Remarks"},
+            {"command": "sheet.activate", "params": {"sheet": "Sales"}},
+            {"command": "chart.set", "params": {"chart": chart, "type": "line", "title": "Units (line)"}},
+            {"command": "table.style", "params": {"table": table, "style": "TableStyleLight9"}},
+            {"command": "table.resize", "params": {"table": table, "range": "A1:D6"}},
+            {"op": "validation", "range": "Sales!C2:C6", "type": "decimal", "operator": "greaterThan", "formula1": "0"},
+            {"op": "conditional_format", "range": "Sales!D2:D6", "rule": {"type": "colorScale"}},
+            {"op": "merge", "range": "Remarks!A4:C4"},
+            {"op": "define_name", "name": "Units", "refers_to": "=Sales!$B$2:$B$6", "old_name": "Units"},
+            {"op": "execute_command", "command": "review.replyComment", "params": {"cell": "A2", "text": "done"}},
+        ]}),
+    );
+    assert_eq!(v["ok"], 13, "{v}");
+    let mut t = save_and_reopen(&mut s, &path);
+    let sales = sheet_info(&mut t, "Sales");
+    assert_eq!(sales["charts"][0]["title"], "Units (line)", "{sales}");
+    assert!(sales["charts"][0]["kind"].as_str().unwrap().starts_with("Line"), "{sales}");
+    assert_eq!(sales["tables"][0]["style"], "TableStyleLight9");
+    assert_eq!(sales["tables"][0]["range"], "A1:D6");
+    assert_eq!(sales["validations"], 2);
+    assert_eq!(sales["conditionalFormats"], 2);
+    assert!(sheet_info(&mut t, "Remarks")["merges"].as_array().unwrap().iter().any(|m| m == "A4:C4"));
+    assert_eq!(structured(&mut t, "get_cell", json!({"cell": "Sales!D6"}))["value"], 200.0);
+    assert_eq!(structured(&mut t, "get_cell", json!({"cell": "Sales!F1"}))["value"], 155.0, "the edited name");
+    let c = structured(&mut t, "list_comments", json!({"sheet": "Sales"}));
+    assert_eq!(c["comments"][0]["replies"][0]["text"], "done", "{c}");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn coverage_delete_cells_rows_columns_sheets_charts_tables_comments_names() {
+    let (mut s, path) = open_fixture("cov-delete.xlsx");
+    let table = sheet_info(&mut s, "Sales")["tables"][0]["name"].as_str().unwrap().to_string();
+    structured(&mut s, "write_range", json!({"range": "Sales!C2", "values": [[null]]}));
+    structured(&mut s, "execute_command", json!({"command": "edit.clearContents", "params": {"range": "Sales!C3"}}));
+    structured(&mut s, "delete_rows", json!({"rows": "5", "sheet": "Sales"}));
+    structured(&mut s, "delete_columns", json!({"cols": "E", "sheet": "Sales"}));
+    structured(&mut s, "delete_chart", json!({"sheet": "Sales"}));
+    structured(&mut s, "delete_table", json!({"table": table}));
+    structured(&mut s, "delete_comment", json!({"cell": "Sales!A2"}));
+    structured(&mut s, "delete_name", json!({"name": "Units"}));
+    structured(&mut s, "delete_sheet", json!({"sheet": "Notes"}));
+    let mut t = save_and_reopen(&mut s, &path);
+    let wb = structured(&mut t, "inspect_workbook", json!({}));
+    let names: Vec<&str> = wb["sheets"].as_array().unwrap().iter().filter_map(|x| x["name"].as_str()).collect();
+    assert_eq!(names, ["Sales", "Secret"], "{wb}");
+    assert!(wb["names"].as_array().unwrap().iter().all(|n| n["name"] != "Units"), "{wb}");
+    let sales = sheet_info(&mut t, "Sales");
+    assert_eq!(sales["charts"].as_array().unwrap().len(), 0, "{sales}");
+    assert_eq!(sales["tables"].as_array().unwrap().len(), 0);
+    assert_eq!(sales["comments"], 0);
+    assert!(structured(&mut t, "get_cell", json!({"cell": "Sales!C2"}))["value"].is_null());
+    assert!(structured(&mut t, "get_cell", json!({"cell": "Sales!C3"}))["value"].is_null());
+    // Row 5 (West) is gone; the table's cells stay as plain cells.
+    assert_eq!(structured(&mut t, "read_range", json!({"range": "Sales!A2:A5"}))["values"], json!([["North"], ["South"], ["East"], [null]]));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn coverage_search_across_sheets_and_replace() {
+    let (mut s, path) = open_fixture("cov-search.xlsx");
+    let v = structured(&mut s, "find", json!({"what": "north"}));
+    let hits: Vec<(String, String)> = v["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| (h["sheet"].as_str().unwrap().to_string(), h["cell"].as_str().unwrap().to_string()))
+        .collect();
+    assert!(hits.contains(&("Sales".into(), "A2".into())) && hits.contains(&("Notes".into(), "A2".into())), "{v}");
+    // A value as shown, a formula's text, one sheet, a hidden sheet, and nothing found.
+    assert_eq!(structured(&mut s, "find", json!({"what": "80.00", "whole_cell": true}))["results"][0]["cell"], "D5");
+    assert_eq!(structured(&mut s, "find", json!({"what": "B3*C3", "look_in": "formulas"}))["results"][0]["cell"], "D3");
+    assert_eq!(structured(&mut s, "find", json!({"what": "north", "sheet": "Notes"}))["count"], 1);
+    assert_eq!(structured(&mut s, "find", json!({"what": 42, "whole_cell": true}))["results"][0]["sheet"], "Secret");
+    assert_eq!(structured(&mut s, "find", json!({"what": "no such text"}))["count"], 0);
+    // Replace across sheets: the answer names the cells changed.
+    let v = structured(&mut s, "find_replace", json!({"what": "North", "with": "Nord", "match_case": true}));
+    assert_eq!(v["replaced"], 2, "{v}");
+    assert_eq!(v["cells"].as_array().unwrap().len(), 2);
+    let mut t = save_and_reopen(&mut s, &path);
+    assert_eq!(structured(&mut t, "get_cell", json!({"cell": "Sales!A2"}))["value"], "Nord");
+    assert_eq!(structured(&mut t, "get_cell", json!({"cell": "Notes!A2"}))["value"], "Nord has the lowest units");
+    assert_eq!(structured(&mut t, "find", json!({"what": "North"}))["count"], 0);
+    let _ = std::fs::remove_file(&path);
+}

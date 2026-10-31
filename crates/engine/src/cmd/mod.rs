@@ -15,6 +15,8 @@ pub mod insert;
 pub mod inspect;
 pub(crate) mod looks;
 pub mod pivot;
+// WHIQ: preview HTML and Markdown reads by windows.
+pub mod preview;
 pub mod print;
 pub mod review;
 pub mod sheet;
@@ -147,6 +149,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(analysis::specs());
         v.extend(print::specs());
         v.extend(build::specs());
+        v.extend(preview::specs());
         v
     })
 }

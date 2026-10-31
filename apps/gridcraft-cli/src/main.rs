@@ -10,6 +10,8 @@
 //! gridcraft-cli build <spec.json> [--out FILE]
 //! gridcraft-cli recalculate <file> [--out FILE] [--json]
 //! gridcraft-cli render <file> <out.png> [--range A1:F20] [--sheet S] [--scale 2]
+//! gridcraft-cli preview <file> <out.html> [--sheet S] [--rows START:COUNT] [--cols START:COUNT] [--format page|sheet|rows]
+//! gridcraft-cli markdown <file> [--sheet S] [--rows START:COUNT] [--formulas]
 //! gridcraft-cli commands [--json] [--search X]
 //! gridcraft-cli functions [--json] [--search X] [--category C]
 //! gridcraft-cli mcp [--connect PORT] [--in FILE | --sample NAME] [--automation-read-root DIR]
@@ -52,6 +54,11 @@ const USAGE: &str = "usage:
                      recalculate every formula; list error cells; --out saves the recalculated workbook
   gridcraft-cli render <file> <out.png> [--range A1:F20] [--sheet S] [--scale 2]
                      a PNG of a range (shaped Arabic, charts, right-to-left sheets)
+  gridcraft-cli preview <file> <out.html> [--sheet S] [--rows START:COUNT] [--cols START:COUNT]
+                     [--format page|sheet|rows] [--max-cells N]
+                     the preview pane's self-contained HTML of a window of a sheet (file.previewHtml)
+  gridcraft-cli markdown <file> [--sheet S] [--rows START:COUNT] [--formulas] [--max-bytes N]
+                     sheets as Markdown tables, paged (sheet.markdown)
   gridcraft-cli commands [--json] [--search X]
   gridcraft-cli functions [--json] [--search X] [--category C]
   gridcraft-cli mcp [--connect PORT] [--in FILE | --sample NAME] [--author NAME]
@@ -101,6 +108,8 @@ fn main() -> ExitCode {
         Some("build") => build(rest),
         Some("recalculate" | "recalc") => recalculate(rest),
         Some("render") => render(rest),
+        Some("preview") => preview(rest),
+        Some("markdown" | "md") => markdown(rest),
         Some("commands") => commands(rest),
         Some("functions") => functions(rest),
         Some("mcp") => mcp(rest),
@@ -513,6 +522,82 @@ fn render(args: &[String]) -> Result<(), String> {
     }
     let r = exec(&mut s, "file.renderPng", p)?;
     eprintln!("wrote {out} ({}×{} pixels, {})", r["width"], r["height"], r["range"].as_str().unwrap_or(""));
+    Ok(())
+}
+
+/// `--rows 201:100` → (201, Some(100)); `--rows 201` → (201, None).
+fn window_arg(v: Option<&str>, what: &str) -> Result<(Option<Value>, Option<Value>), String> {
+    let Some(v) = v else { return Ok((None, None)) };
+    let (a, b) = v.split_once(':').map_or((v, None), |(a, b)| (a, Some(b)));
+    let start = if a.trim().is_empty() { None } else { Some(json!(a.trim())) };
+    let count = match b.map(str::trim).filter(|b| !b.is_empty()) {
+        Some(b) => Some(json!(b.parse::<u64>().map_err(|_| format!("--{what} START:COUNT needs a number of {what}, not `{b}`"))?)),
+        None => None,
+    };
+    Ok((start, count))
+}
+
+fn preview(args: &[String]) -> Result<(), String> {
+    let a = Args::parse(args, &["sheet", "rows", "cols", "format", "max-cells"], &["no-headings"])?;
+    let path = a.pos(0, "<file>")?;
+    let out = a.pos(1, "<out.html>")?;
+    a.no_extra(2)?;
+    let mut s = open(path)?;
+    let mut p = json!({"path": out, "headings": !a.has("no-headings")});
+    if let Some(sh) = a.opt("sheet") {
+        p["sheet"] = json!(sh);
+    }
+    let (rs, rc) = window_arg(a.opt("rows"), "rows")?;
+    let (cs, cc) = window_arg(a.opt("cols"), "cols")?;
+    for (k, v) in [("row_start", rs), ("row_count", rc), ("col_start", cs), ("col_count", cc)] {
+        if let Some(v) = v {
+            p[k] = v;
+        }
+    }
+    if let Some(f) = a.opt("format") {
+        p["format"] = json!(f);
+    }
+    if let Some(n) = a.opt("max-cells") {
+        p["max_cells"] = json!(n.parse::<u64>().map_err(|_| format!("--max-cells needs a number, not `{n}`"))?);
+    }
+    let r = exec(&mut s, "file.previewHtml", p)?;
+    let w = &r["window"];
+    eprintln!(
+        "wrote {out} ({} bytes): {} {} of {} rows × {} columns{}",
+        r["bytes"],
+        w["sheet"].as_str().unwrap_or(""),
+        w["range"].as_str().unwrap_or(""),
+        w["rows"],
+        w["columns"],
+        if w["more_rows"] == true { format!("; next: --rows {}:{}", w["next_rows"]["row_start"], w["row_count"]) } else { String::new() }
+    );
+    Ok(())
+}
+
+fn markdown(args: &[String]) -> Result<(), String> {
+    let a = Args::parse(args, &["sheet", "rows", "max-bytes"], &["formulas"])?;
+    let path = a.pos(0, "<file>")?;
+    a.no_extra(1)?;
+    let mut s = open(path)?;
+    let mut p = json!({"formulas": a.has("formulas"), "max_bytes": 64u64 << 20});
+    if let Some(sh) = a.opt("sheet") {
+        p["sheet"] = json!(sh);
+    }
+    let (rs, rc) = window_arg(a.opt("rows"), "rows")?;
+    if let Some(v) = rs {
+        p["row_start"] = v;
+    }
+    if let Some(v) = rc {
+        p["row_count"] = v;
+    }
+    if let Some(n) = a.opt("max-bytes") {
+        p["max_bytes"] = json!(n.parse::<u64>().map_err(|_| format!("--max-bytes needs a number, not `{n}`"))?);
+    }
+    let r = exec(&mut s, "sheet.markdown", p)?;
+    outln!("{}", r["markdown"].as_str().unwrap_or(""));
+    if let Some(n) = r.get("next") {
+        eprintln!("more: --sheet {} --rows {}", n["sheet"], n["row_start"]);
+    }
     Ok(())
 }
 
