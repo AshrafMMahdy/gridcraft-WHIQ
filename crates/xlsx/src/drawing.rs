@@ -124,7 +124,9 @@ fn mime_for(name: &str) -> &'static str {
 pub fn read_drawing(cx: &mut Ctx<'_>, part: &str, sheet: &mut Sheet) -> Result<(), IoError> {
     let Some(x) = cx.optional_xml(part)? else { return Ok(()) };
     let rels = cx.pkg.rels(part)?;
-    for a in &x.children {
+    // WHIQ: the anchors as written, so an untouched chart keeps its anchor on save.
+    let fragments = cx.pkg.read_limited(part, 16 << 20).ok().flatten().and_then(|b| crate::passthrough::top_level_fragments(&b)).unwrap_or_default();
+    for (ai, a) in x.children.iter().enumerate() {
         let Some(anchor) = read_anchor(a, sheet) else { continue };
         // Objects in markup-compatibility blocks: the first choice (chartex frames), else the
         // fallback.
@@ -170,6 +172,26 @@ pub fn read_drawing(cx: &mut Ctx<'_>, part: &str, sheet: &mut Sheet) -> Result<(
                                 Some(mut ch) => {
                                     ch.id = cx.next_object_id();
                                     ch.anchor = anchor;
+                                    if !chartex {
+                                        // An anchor holding the chart alone is kept with it.
+                                        let alone = a
+                                            .children
+                                            .iter()
+                                            .filter(|o| {
+                                                matches!(
+                                                    o.name.as_str(),
+                                                    "pic" | "graphicFrame" | "sp" | "cxnSp" | "grpSp" | "AlternateContent" | "contentPart"
+                                                )
+                                            })
+                                            .count()
+                                            == 1;
+                                        cx.chart_sources.push(crate::passthrough::ChartSource {
+                                            chart_id: ch.id,
+                                            part: target.clone(),
+                                            anchor_xml: fragments.get(ai).filter(|_| alone).cloned(),
+                                            anchor_rid: rid.to_string(),
+                                        });
+                                    }
                                     sheet.charts.push(ch);
                                 }
                                 None => cx.warn(format!("chart {target} has no supported plot and was skipped")),
@@ -318,6 +340,9 @@ pub enum Obj<'a> {
     Shape(&'a Shape),
     /// WHIQ: a table slicer's frame, by its slicer name.
     Slicer(&'a gridcraft_model::Slicer, String),
+    /// WHIQ: an anchor element kept as the source file wrote it (its relationship id already
+    /// rewritten); its drawing-object id is renumbered.
+    Kept(String),
 }
 
 /// The drawing part for a sheet's objects (relationship ids already assigned).
@@ -328,7 +353,12 @@ pub fn write_drawing(sheet: &Sheet, theme: &Theme, objs: &[Obj<'_>]) -> String {
     for (i, o) in objs.iter().enumerate() {
         let id = i + 2;
         let close_tag;
+        if let Obj::Kept(x) = o {
+            s.push_str(&crate::kept::renumber_object(x, id));
+            continue;
+        }
         match o {
+            Obj::Kept(_) => continue,
             Obj::Image(img, rid) => {
                 let (open, close) = anchor_open(sheet, &img.anchor);
                 close_tag = close;

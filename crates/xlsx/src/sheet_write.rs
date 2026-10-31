@@ -593,10 +593,18 @@ fn write_sheet_with(wb: &Workbook, si: usize, selected: bool, out: &mut Out, sin
                 drels.add_uri(crate::chartex::REL_CHARTEX, &format!("../charts/chartEx{n}.xml"))
             } else {
                 let name = format!("xl/charts/chart{}.xml", out.charts);
-                out.part(&name, Some(CT_CHART), crate::chart::write_chart(wb, si, ch).into_bytes());
+                // WHIQ: a chart the edit did not touch is written back as the file had it.
+                let kept = crate::kept::kept_chart(sheet, ch).is_some_and(|k| crate::kept::write_kept_chart(out, k, wb, si, &name));
+                if !kept {
+                    out.part(&name, Some(CT_CHART), crate::chart::write_chart(wb, si, ch).into_bytes());
+                }
                 drels.add("chart", &format!("../charts/chart{}.xml", out.charts))
             };
-            objs.push(Obj::Chart(ch, rid));
+            // WHIQ: and its anchor as the file had it while the chart has not moved.
+            match crate::kept::kept_anchor(sheet, ch, &rid).filter(|_| !crate::chartex::is_chartex(ch.kind)) {
+                Some(x) => objs.push(Obj::Kept(x)),
+                None => objs.push(Obj::Chart(ch, rid)),
+            }
         }
         for sh in &sheet.shapes {
             objs.push(Obj::Shape(sh));

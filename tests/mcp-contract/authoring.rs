@@ -395,3 +395,119 @@ fn pivot_and_slicers_survive_open_edit_save_reopen() {
     let out = std::process::Command::new(binary()).args(["check", book.to_str().unwrap()]).output().unwrap();
     assert!(out.status.success(), "check: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
 }
+
+// ---------------------------------------------------------------- a customer's file, edited in place
+
+/// The theme of the customer fixture: original content (GridCraft contributors), laid out as theme
+/// parts are, with what a regenerated theme used to lose: effect styles (a shadow, a 3-D scene),
+/// gradient fills and a per-script font table (Arabic, Hebrew, Japanese…).
+const CUSTOMER_THEME: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Harbour"><a:themeElements><a:clrScheme name="Harbour"><a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1><a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1><a:dk2><a:srgbClr val="1B2A3A"/></a:dk2><a:lt2><a:srgbClr val="E9EEF2"/></a:lt2><a:accent1><a:srgbClr val="2A6F97"/></a:accent1><a:accent2><a:srgbClr val="C8553D"/></a:accent2><a:accent3><a:srgbClr val="7A9E7E"/></a:accent3><a:accent4><a:srgbClr val="E8B04B"/></a:accent4><a:accent5><a:srgbClr val="6C5B7B"/></a:accent5><a:accent6><a:srgbClr val="3E8E8E"/></a:accent6><a:hlink><a:srgbClr val="1F5FA8"/></a:hlink><a:folHlink><a:srgbClr val="7B4FA0"/></a:folHlink></a:clrScheme><a:fontScheme name="Harbour"><a:majorFont><a:latin typeface="Carlito"/><a:ea typeface=""/><a:cs typeface=""/><a:font script="Arab" typeface="Amiri"/><a:font script="Hebr" typeface="Noto Sans Hebrew"/><a:font script="Jpan" typeface="Noto Sans JP"/><a:font script="Hans" typeface="Noto Sans SC"/></a:majorFont><a:minorFont><a:latin typeface="Carlito"/><a:ea typeface=""/><a:cs typeface=""/><a:font script="Arab" typeface="Noto Naskh Arabic"/><a:font script="Hebr" typeface="Noto Sans Hebrew"/><a:font script="Jpan" typeface="Noto Sans JP"/><a:font script="Hans" typeface="Noto Sans SC"/></a:minorFont></a:fontScheme><a:fmtScheme name="Harbour"><a:fillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:gradFill rotWithShape="1"><a:gsLst><a:gs pos="0"><a:schemeClr val="phClr"><a:tint val="60000"/><a:satMod val="110000"/></a:schemeClr></a:gs><a:gs pos="100000"><a:schemeClr val="phClr"><a:shade val="80000"/></a:schemeClr></a:gs></a:gsLst><a:lin ang="5400000" scaled="0"/></a:gradFill><a:gradFill rotWithShape="1"><a:gsLst><a:gs pos="0"><a:schemeClr val="phClr"><a:tint val="90000"/></a:schemeClr></a:gs><a:gs pos="100000"><a:schemeClr val="phClr"><a:shade val="70000"/></a:schemeClr></a:gs></a:gsLst><a:path path="circle"><a:fillToRect l="50000" t="50000" r="50000" b="50000"/></a:path></a:gradFill></a:fillStyleLst><a:lnStyleLst><a:ln w="6350"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln><a:ln w="12700"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln><a:ln w="19050"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln></a:lnStyleLst><a:effectStyleLst><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst><a:outerShdw blurRad="38100" dist="19050" dir="5400000" rotWithShape="0"><a:srgbClr val="000000"><a:alpha val="40000"/></a:srgbClr></a:outerShdw></a:effectLst></a:effectStyle><a:effectStyle><a:effectLst><a:outerShdw blurRad="50800" dist="25400" dir="5400000" rotWithShape="0"><a:srgbClr val="000000"><a:alpha val="35000"/></a:srgbClr></a:outerShdw></a:effectLst><a:scene3d><a:camera prst="orthographicFront"><a:rot lat="0" lon="0" rev="0"/></a:camera><a:lightRig rig="threePt" dir="t"/></a:scene3d><a:sp3d><a:bevelT w="63500" h="25400"/></a:sp3d></a:effectStyle></a:effectStyleLst><a:bgFillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"><a:tint val="95000"/></a:schemeClr></a:solidFill><a:gradFill rotWithShape="1"><a:gsLst><a:gs pos="0"><a:schemeClr val="phClr"><a:tint val="93000"/></a:schemeClr></a:gs><a:gs pos="100000"><a:schemeClr val="phClr"><a:shade val="94000"/></a:schemeClr></a:gs></a:gsLst><a:lin ang="16200000" scaled="1"/></a:gradFill></a:bgFillStyleLst></a:fmtScheme></a:themeElements><a:objectDefaults/><a:extraClrSchemeLst/></a:theme>"#;
+
+/// The chart of the customer fixture as openpyxl writes one: the chart namespace as the default,
+/// a line style on each series (`spPr` / `a:ln` / `a:prstDash`), and a stale value cache on the
+/// first series (a save refills it from the cells).
+const CUSTOMER_CHART: &str = r#"<chartSpace xmlns="http://schemas.openxmlformats.org/drawingml/2006/chart"><chart><title><tx><rich><a:bodyPr xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"/><a:p xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:pPr><a:defRPr/></a:pPr><a:r><a:t>Budget against forecast</a:t></a:r></a:p></rich></tx></title><plotArea><barChart><barDir val="col"/><grouping val="clustered"/><ser><idx val="0"/><order val="0"/><tx><strRef><f>Cost!B1</f></strRef></tx><spPr><a:ln xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:prstDash val="solid"/></a:ln></spPr><cat><numRef><f>Cost!$A$2:$A$4</f></numRef></cat><val><numRef><f>Cost!$B$2:$B$4</f><numCache><formatCode>General</formatCode><ptCount val="3"/><pt idx="0"><v>10</v></pt><pt idx="1"><v>20</v></pt><pt idx="2"><v>30</v></pt></numCache></numRef></val></ser><ser><idx val="1"/><order val="1"/><tx><strRef><f>Cost!C1</f></strRef></tx><spPr><a:ln xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:prstDash val="dash"/></a:ln></spPr><cat><numRef><f>Cost!$A$2:$A$4</f></numRef></cat><val><numRef><f>Cost!$C$2:$C$4</f></numRef></val></ser><gapWidth val="150"/><axId val="10"/><axId val="100"/></barChart><catAx><axId val="10"/><scaling><orientation val="minMax"/></scaling><axPos val="l"/><majorTickMark val="none"/><minorTickMark val="none"/><crossAx val="100"/><lblOffset val="100"/></catAx><valAx><axId val="100"/><scaling><orientation val="minMax"/></scaling><axPos val="l"/><majorGridlines/><majorTickMark val="none"/><minorTickMark val="none"/><crossAx val="10"/></valAx></plotArea><legend><legendPos val="r"/></legend><plotVisOnly val="1"/><dispBlanksAs val="gap"/></chart></chartSpace>"#;
+
+/// A customer's workbook laid out as openpyxl writes one (default namespaces, inline strings, a
+/// one-cell chart anchor, the indexed colour palette, an empty `workbookProtection`, created and
+/// modified dates), with [`CUSTOMER_THEME`] and [`CUSTOMER_CHART`].
+fn openpyxl_customer(path: &Path) {
+    let rel = |id: &str, ty: &str, target: &str| {
+        format!("<Relationship Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/{ty}\" Target=\"{target}\" Id=\"{id}\"/>")
+    };
+    let rels = |body: String| format!("<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">{body}</Relationships>");
+    let palette: String = (0..64).map(|i| format!("<rgbColor rgb=\"00{:06X}\"/>", (i * 0x040404) & 0xFFFFFF)).collect();
+    let row = |r: u32, a: &str, b: u32, c: u32| {
+        format!("<row r=\"{r}\"><c r=\"A{r}\" t=\"inlineStr\"><is><t>{a}</t></is></c><c r=\"B{r}\"><v>{b}</v></c><c r=\"C{r}\"><v>{c}</v></c></row>")
+    };
+    let parts: Vec<(&str, String)> = vec![
+        ("[Content_Types].xml", "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/><Override PartName=\"/xl/theme/theme1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.theme+xml\"/><Override PartName=\"/docProps/core.xml\" ContentType=\"application/vnd.openxmlformats-package.core-properties+xml\"/><Override PartName=\"/docProps/app.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.extended-properties+xml\"/><Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/><Override PartName=\"/xl/drawings/drawing1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.drawing+xml\"/><Override PartName=\"/xl/charts/chart1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.drawingml.chart+xml\"/><Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/></Types>".into()),
+        ("_rels/.rels", rels(format!("{}<Relationship Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties\" Target=\"docProps/core.xml\" Id=\"rId2\"/>{}", rel("rId1", "officeDocument", "xl/workbook.xml"), rel("rId3", "extended-properties", "docProps/app.xml")))),
+        ("docProps/app.xml", "<Properties xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/extended-properties\"><Application>Microsoft Excel Compatible / Openpyxl 3.1.5</Application><AppVersion>3.1</AppVersion></Properties>".into()),
+        ("docProps/core.xml", "<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\"><dc:creator xmlns:dc=\"http://purl.org/dc/elements/1.1/\">openpyxl</dc:creator><dcterms:created xmlns:dcterms=\"http://purl.org/dc/terms/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"dcterms:W3CDTF\">2026-10-31T02:51:54Z</dcterms:created><dcterms:modified xmlns:dcterms=\"http://purl.org/dc/terms/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"dcterms:W3CDTF\">2026-10-31T02:51:54Z</dcterms:modified></cp:coreProperties>".into()),
+        ("xl/workbook.xml", "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><workbookPr/><workbookProtection/><bookViews><workbookView visibility=\"visible\" minimized=\"0\" showHorizontalScroll=\"1\" showVerticalScroll=\"1\" showSheetTabs=\"1\" tabRatio=\"600\" firstSheet=\"0\" activeTab=\"0\" autoFilterDateGrouping=\"1\"/></bookViews><sheets><sheet xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" name=\"Cost\" sheetId=\"1\" state=\"visible\" r:id=\"rId1\"/></sheets><definedNames/><calcPr calcId=\"124519\" fullCalcOnLoad=\"1\"/></workbook>".into()),
+        ("xl/_rels/workbook.xml.rels", rels(format!("{}{}{}", rel("rId1", "worksheet", "/xl/worksheets/sheet1.xml"), rel("rId2", "styles", "styles.xml"), rel("rId3", "theme", "theme/theme1.xml")))),
+        ("xl/styles.xml", format!("<styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><fonts count=\"1\"><font><name val=\"Calibri\"/><family val=\"2\"/><color theme=\"1\"/><sz val=\"11\"/><scheme val=\"minor\"/></font></fonts><fills count=\"2\"><fill><patternFill/></fill><fill><patternFill patternType=\"gray125\"/></fill></fills><borders count=\"1\"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs><cellXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" pivotButton=\"0\" quotePrefix=\"0\" xfId=\"0\"/></cellXfs><cellStyles count=\"1\"><cellStyle name=\"Normal\" xfId=\"0\" builtinId=\"0\" hidden=\"0\"/></cellStyles><tableStyles count=\"0\" defaultTableStyle=\"TableStyleMedium9\" defaultPivotStyle=\"PivotStyleLight16\"/><colors><indexedColors>{palette}</indexedColors></colors></styleSheet>")),
+        ("xl/theme/theme1.xml", CUSTOMER_THEME.into()),
+        ("xl/worksheets/sheet1.xml", format!("<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetPr><outlinePr summaryBelow=\"1\" summaryRight=\"1\"/><pageSetUpPr/></sheetPr><dimension ref=\"A1:C4\"/><sheetViews><sheetView workbookViewId=\"0\"><selection activeCell=\"A1\" sqref=\"A1\"/></sheetView></sheetViews><sheetFormatPr baseColWidth=\"8\" defaultRowHeight=\"15\"/><sheetData><row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>Package</t></is></c><c r=\"B1\" t=\"inlineStr\"><is><t>Budget</t></is></c><c r=\"C1\" t=\"inlineStr\"><is><t>Forecast</t></is></c></row>{}{}{}</sheetData><pageMargins left=\"0.75\" right=\"0.75\" top=\"1\" bottom=\"1\" header=\"0.5\" footer=\"0.5\"/><drawing xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:id=\"rId1\"/></worksheet>", row(2, "Frame", 10, 12), row(3, "Facade", 20, 18), row(4, "Lifts", 30, 31))),
+        ("xl/worksheets/_rels/sheet1.xml.rels", rels(rel("rId1", "drawing", "/xl/drawings/drawing1.xml"))),
+        ("xl/drawings/drawing1.xml", "<wsDr xmlns=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\"><oneCellAnchor><from><col>5</col><colOff>0</colOff><row>1</row><rowOff>0</rowOff></from><ext cx=\"6480000\" cy=\"3240000\"/><graphicFrame><nvGraphicFramePr><cNvPr id=\"1\" name=\"Chart 1\"/><cNvGraphicFramePr/></nvGraphicFramePr><xfrm/><a:graphic xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><a:graphicData uri=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:id=\"rId1\"/></a:graphicData></a:graphic></graphicFrame><clientData/></oneCellAnchor></wsDr>".into()),
+        ("xl/drawings/_rels/drawing1.xml.rels", rels(rel("rId1", "chart", "/xl/charts/chart1.xml"))),
+        ("xl/charts/chart1.xml", CUSTOMER_CHART.into()),
+    ];
+    let mut w = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+    let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    for (name, data) in parts {
+        w.start_file(name, opts).unwrap();
+        w.write_all(data.as_bytes()).unwrap();
+    }
+    w.finish().unwrap();
+}
+
+/// The chart part a saved workbook's first drawing names.
+fn chart_part_of(path: &Path) -> String {
+    let rels = zip_text(path, "xl/drawings/_rels/drawing1.xml.rels");
+    let target = rels.split("Target=\"").nth(1).and_then(|t| t.split('"').next()).unwrap().to_string();
+    zip_text(path, &format!("xl/charts/{}", target.rsplit('/').next().unwrap()))
+}
+
+#[test]
+fn a_customer_file_edited_in_place_keeps_what_the_edit_did_not_touch() {
+    let dir = folder("customer-openpyxl");
+    let original = dir.join("customer.xlsx");
+    openpyxl_customer(&original);
+    let mut m = start(&dir, "Editor");
+    // What the engine itself says a save would change: none of these parts any more.
+    let rc = m.ok("roundtrip_check", json!({"path": "customer.xlsx"}));
+    let problems: Vec<String> = rc["problems"].as_array().unwrap().iter().map(|p| p.as_str().unwrap().to_string()).collect();
+    for part in ["xl/theme/", "xl/charts/", "xl/drawings/", "workbookProtection", "docProps/core.xml", "colors", "indexedColors", "rgbColor"] {
+        assert!(!problems.iter().any(|p| p.contains(part)), "roundtrip_check still reports {part}: {problems:#?}");
+    }
+    // Edit one cell and save.
+    m.ok("open_workbook", json!({"path": "customer.xlsx"}));
+    m.ok("set_cell", json!({"cell": "Cost!B2", "input": "99"}));
+    m.ok("save_workbook", json!({"path": "edited.xlsx"}));
+    let edited = dir.join("edited.xlsx");
+    // The theme, verbatim: effect styles and the per-script font table.
+    let theme = zip_text(&edited, "xl/theme/theme1.xml");
+    assert_eq!(theme, CUSTOMER_THEME);
+    assert!(theme.contains("<a:font script=\"Arab\" typeface=\"Noto Naskh Arabic\"/>") && theme.contains("<a:effectStyleLst>"));
+    // The chart as the file had it (line styles, namespaces), its stale cache refilled from the
+    // edited cell and nothing else changed.
+    let chart = chart_part_of(&edited);
+    assert_eq!(chart, CUSTOMER_CHART.replace("<pt idx=\"0\"><v>10</v></pt>", "<pt idx=\"0\"><v>99</v></pt>"));
+    assert!(chart.contains("<a:prstDash val=\"dash\"/>"));
+    // The anchor as it was: one cell and an extent, the chart named by its new relationship.
+    let drawing = zip_text(&edited, "xl/drawings/drawing1.xml");
+    assert!(drawing.contains("<oneCellAnchor") && drawing.contains("<ext cx=\"6480000\" cy=\"3240000\"/>"), "{drawing}");
+    assert!(!drawing.contains("twoCellAnchor"), "{drawing}");
+    // The palette, the empty protection element, the creation date kept and the save time set.
+    let styles = zip_text(&edited, "xl/styles.xml");
+    assert_eq!(styles.matches("<rgbColor ").count(), 64, "{styles}");
+    assert!(styles.contains("<colors><indexedColors>"));
+    assert!(zip_text(&edited, "xl/workbook.xml").contains("<workbookProtection/>"));
+    let core = zip_text(&edited, "docProps/core.xml");
+    assert!(core.contains(">2026-10-31T02:51:54Z</dcterms:created>"), "{core}");
+    let modified = core.split("<dcterms:modified").nth(1).and_then(|t| t.split('>').nth(1)).and_then(|t| t.split('<').next()).unwrap_or("");
+    assert!(modified.len() == 20 && modified.ends_with('Z') && modified != "2026-10-31T02:51:54Z", "modified is the save time: {core}");
+    // The edit is there, the workbook reads back, and the engine's own diff of the two files finds
+    // nothing lost in those parts.
+    assert_eq!(cells_of(&edited, "B2:B4"), json!([[99.0], [20.0], [30.0]]));
+    let rc = m.ok("roundtrip_check", json!({"path": "edited.xlsx"}));
+    let problems: Vec<String> = rc["problems"].as_array().unwrap().iter().map(|p| p.as_str().unwrap().to_string()).collect();
+    assert!(!problems.iter().any(|p| p.contains("theme") || p.contains("charts/") || p.contains("drawing")), "{problems:#?}");
+
+    // Moving the chart's data (a row inserted above it) changes the chart and its anchor: both are
+    // written from the model then, references and position following the edit.
+    m.ok("insert_rows", json!({"rows": "1", "sheet": "Cost"}));
+    m.ok("save_workbook", json!({"path": "moved.xlsx"}));
+    let moved = dir.join("moved.xlsx");
+    let chart = chart_part_of(&moved);
+    assert!(chart.contains("$B$3:$B$5"), "{chart}");
+    let drawing = zip_text(&moved, "xl/drawings/drawing1.xml");
+    assert!(drawing.contains("twoCellAnchor") && drawing.contains("<xdr:row>2</xdr:row>"), "{drawing}");
+    // The theme and palette still stand (the edit did not touch them).
+    assert_eq!(zip_text(&moved, "xl/theme/theme1.xml"), CUSTOMER_THEME);
+    m.close();
+}

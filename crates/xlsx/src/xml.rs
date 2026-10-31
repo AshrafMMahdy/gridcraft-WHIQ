@@ -305,6 +305,41 @@ pub fn parse_streaming_skipping<R: std::io::BufRead>(
 // ---------------------------------------------------------------- writing helpers
 
 /// Escapes text content.
+/// WHIQ: an element written back as XML (local names, as read; for elements of the part's default
+/// namespace whose attributes carry no prefix: `<colors>`, `<workbookProtection>`).
+pub fn el_xml(e: &El) -> String {
+    let mut out = String::new();
+    el_xml_into(e, &mut out, 0);
+    out
+}
+
+fn el_xml_into(e: &El, out: &mut String, depth: usize) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    out.push('<');
+    out.push_str(&e.name);
+    for (k, v) in &e.attrs {
+        out.push(' ');
+        out.push_str(k);
+        out.push_str("=\"");
+        out.push_str(&esc_attr(v));
+        out.push('"');
+    }
+    if e.children.is_empty() && e.text.is_empty() {
+        out.push_str("/>");
+        return;
+    }
+    out.push('>');
+    out.push_str(&esc(&e.text));
+    for c in &e.children {
+        el_xml_into(c, out, depth + 1);
+    }
+    out.push_str("</");
+    out.push_str(&e.name);
+    out.push('>');
+}
+
 pub fn esc(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
     for c in s.chars() {

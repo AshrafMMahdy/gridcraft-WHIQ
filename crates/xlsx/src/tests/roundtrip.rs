@@ -31,6 +31,8 @@ fn sample() -> Workbook {
         keywords: "k".into(),
         description: "d".into(),
         last_modified_by: "Agent".into(),
+        created: "2026-01-02T03:04:05Z".into(),
+        modified: "2026-10-31T08:09:10Z".into(),
     };
     wb.theme.colors[4] = 0x112233;
     wb.theme.minor_font = "Aptos".into();

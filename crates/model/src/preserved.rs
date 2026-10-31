@@ -58,6 +58,28 @@ pub struct PreservedSheet {
     pub before: usize,
 }
 
+/// WHIQ: a chart kept as the source file wrote it. While the model's chart is unchanged (its
+/// fingerprint matches), a save writes this part back byte for byte (cached values refreshed) with
+/// the parts behind it, and the drawing anchor as it was while the chart has not moved, so a
+/// customer's chart keeps everything GridCraft does not model (line styles, colours, layout…).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PreservedChart {
+    /// The model chart's id.
+    pub id: u32,
+    /// The chart as read (without its id and anchor), to tell whether it was edited.
+    pub fingerprint: String,
+    /// The anchor as read, to tell whether the chart was moved or resized.
+    pub anchor_fingerprint: String,
+    /// The chart part and its relationships (ids unchanged).
+    pub part: PreservedPart,
+    /// The parts behind the chart's relationships (style, colours, shapes, embedded data).
+    pub parts: Vec<PreservedPart>,
+    /// The drawing's anchor element for the chart, namespace declarations included.
+    pub anchor_xml: Option<String>,
+    /// The drawing relationship id the anchor names the chart by.
+    pub anchor_rid: String,
+}
+
 /// Unmodelled content kept for one owner (the workbook, which also holds package-root content,
 /// or one sheet).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -75,6 +97,8 @@ pub struct Preserved {
     pub vml: Option<PreservedPart>,
     /// Chart sheets, in file order (workbook owner only).
     pub sheets: Vec<PreservedSheet>,
+    /// WHIQ: the sheet's charts as the source file wrote them (sheet owner only).
+    pub charts: Vec<PreservedChart>,
 }
 
 impl Preserved {
@@ -85,9 +109,11 @@ impl Preserved {
             && self.elements.is_empty()
             && self.vml.is_none()
             && self.sheets.is_empty()
+            && self.charts.is_empty()
     }
     /// Total bytes held.
     pub fn byte_len(&self) -> usize {
-        self.parts.iter().chain(self.vml.iter()).fold(0usize, |n, p| n.saturating_add(p.data.len()))
+        let charts = self.charts.iter().flat_map(|c| std::iter::once(&c.part).chain(c.parts.iter()));
+        self.parts.iter().chain(self.vml.iter()).chain(charts).fold(0usize, |n, p| n.saturating_add(p.data.len()))
     }
 }

@@ -64,7 +64,8 @@ fn claim_folder(base: &Path, pid: u32, waits: &[std::time::Duration]) -> Option<
     }
     static SALT: AtomicU64 = AtomicU64::new(0);
     for _ in 0..16 {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+        // WHIQ: the clock through core (wasm-safe; the std clock is a disallowed method here).
+        let nanos = gridcraft_core::date::unix_now_ms().map_or(0, |ms| (ms * 1_000_000.0) as u64);
         let r = nanos ^ SALT.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed).rotate_left(17);
         let dir = base.join(format!("pid-{pid}-{:08x}", r as u32));
         if let Some(f) = lock_in(&dir) {

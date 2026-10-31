@@ -37,6 +37,12 @@ pub struct Ctx<'a> {
     pub table_file_ids: Vec<(u32, String)>,
     /// `sheetId` → model sheet name (PivotTable slicers name their PivotTables' sheets by id).
     pub sheet_ids: Vec<(u32, String)>,
+    /// WHIQ: the charts of the sheet being read, to keep as the file wrote them
+    /// ([`crate::passthrough::KeptReader::charts`]).
+    pub chart_sources: Vec<crate::passthrough::ChartSource>,
+    /// WHIQ: workbook-level XML kept verbatim while the model's view of it is unchanged (the theme
+    /// part, the indexed colour palette, `workbookProtection`).
+    pub kept_xml: Vec<gridcraft_model::PreservedXml>,
 }
 
 impl Ctx<'_> {
@@ -102,6 +108,8 @@ fn read_package(pkg: Package<'_>) -> Result<(Workbook, ReadReport), IoError> {
         slicer_frames: vec![],
         table_file_ids: vec![],
         sheet_ids: vec![],
+        chart_sources: vec![],
+        kept_xml: vec![],
     };
     let root_rels = cx.pkg.rels("")?;
     let wb_part = find_rel(&root_rels, "officeDocument").map(|r| r.target.clone()).unwrap_or_else(|| "xl/workbook.xml".into());
@@ -141,6 +149,10 @@ fn read_package(pkg: Package<'_>) -> Result<(Workbook, ReadReport), IoError> {
     }
     if let Some(r) = find_rel(&wb_rels, "styles").cloned() {
         if let Some(x) = cx.optional_xml(&r.target)? {
+            // WHIQ: the palette as the file wrote it (indexed and recently used colours).
+            if let Some(c) = x.child("colors") {
+                cx.kept_xml.push(gridcraft_model::PreservedXml { slot: "colors".into(), xml: xml::el_xml(c) });
+            }
             let StylesIn { xfs, dxfs, palette, named, num_fmts } = read_styles(&x, &checkboxes);
             cx.num_fmts = num_fmts;
             // Cell format 0 is the Normal style: its font is what every unformatted cell shows.
@@ -159,6 +171,13 @@ fn read_package(pkg: Package<'_>) -> Result<(Workbook, ReadReport), IoError> {
         && let Some(x) = cx.optional_xml(&r.target)?
     {
         wb.theme = crate::theme::read_theme(&x);
+        // WHIQ: the theme part as written (effect styles, the per-script font table…), written back
+        // verbatim while the model's theme is the one read from it.
+        if let Ok(Some(raw)) = cx.pkg.read_limited(&r.target, 8 << 20)
+            && let Ok(text) = String::from_utf8(raw)
+        {
+            cx.kept_xml.push(gridcraft_model::PreservedXml { slot: "theme".into(), xml: text });
+        }
     }
     // Shared strings, streamed item by item. WHIQ: a workbook whose sheets stay on disk does not
     // hold them: a sheet read whole loads them when it needs them, a sheet read later takes the
@@ -206,6 +225,8 @@ fn read_package(pkg: Package<'_>) -> Result<(Workbook, ReadReport), IoError> {
     if let Some(p) = wb_xml.child("workbookProtection") {
         wb.protected_structure = p.flag("lockStructure", false);
         wb.structure_password = if wb.protected_structure { crate::sheet_read::read_password(p, "workbook") } else { None };
+        // WHIQ: written back as it was (an empty element too) while the protection is unchanged.
+        cx.kept_xml.push(gridcraft_model::PreservedXml { slot: "workbookProtection".into(), xml: xml::el_xml(p) });
     }
     let active_tab = wb_xml.path(&["bookViews", "workbookView"]).and_then(|v| v.attr_u32("activeTab")).unwrap_or(0) as usize;
 
@@ -271,6 +292,7 @@ fn read_package(pkg: Package<'_>) -> Result<(Workbook, ReadReport), IoError> {
             Err(e) => cx.warn(format!("PivotTables on sheet \"{name}\" could not be read: {e}")),
         }
         sheet.preserved = kept.sheet(&mut cx, &rel.target, &name);
+        kept.charts(&mut cx, &mut sheet);
         sheet.visibility = match se.attr("state") {
             Some("hidden") => Visibility::Hidden,
             Some("veryHidden") => Visibility::VeryHidden,
@@ -377,6 +399,8 @@ fn read_package(pkg: Package<'_>) -> Result<(Workbook, ReadReport), IoError> {
         wb.props.last_modified_by = get("lastModifiedBy");
         wb.props.keywords = get("keywords");
         wb.props.description = get("description");
+        wb.props.created = get("created").trim().to_string();
+        wb.props.modified = get("modified").trim().to_string();
     }
     if let Some(r) = find_rel(&root_rels, "extended-properties").cloned()
         && let Ok(Some(x)) = cx.pkg.read_xml(&r.target)
@@ -398,6 +422,14 @@ fn read_package(pkg: Package<'_>) -> Result<(Workbook, ReadReport), IoError> {
         }
     }
     wb.preserved = kept.workbook(&mut cx, &wb_part, &wb_xml, &file_to_model);
+    // WHIQ: the workbook XML kept verbatim, and each kept chart's fingerprint (the charts as read,
+    // names resolved), so a save can tell an untouched chart from an edited one.
+    if !cx.kept_xml.is_empty() {
+        let mut p = wb.preserved.take().map(|a| (*a).clone()).unwrap_or_default();
+        p.elements.append(&mut cx.kept_xml);
+        wb.preserved = Some(Arc::new(p));
+    }
+    crate::passthrough::fingerprint_kept_charts(&mut wb);
     // Calls of LAMBDA names are spelled like the names (the parser upper-cases them).
     wb.apply_name_call_case();
     wb.styles = cx.styles;

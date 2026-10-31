@@ -29,7 +29,7 @@ use std::fmt::Write as _;
 use std::path::{Component, Path};
 use std::sync::Arc;
 
-use gridcraft_model::{Preserved, PreservedPart, PreservedRel, PreservedSheet, PreservedXml, Sheet, Visibility, Workbook};
+use gridcraft_model::{Preserved, PreservedChart, PreservedPart, PreservedRel, PreservedSheet, PreservedXml, Sheet, Visibility, Workbook};
 use quick_xml::events::attributes::Attribute;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::QName;
@@ -173,7 +173,7 @@ fn rewritten(r: &PreservedRel) -> bool {
     !r.external && REWRITTEN.contains(&kind(&r.rel_type).to_ascii_lowercase().as_str())
 }
 
-fn rels_part_name(part: &str) -> String {
+pub(crate) fn rels_part_name(part: &str) -> String {
     let (dir, file) = package::split_dir(part);
     if dir.is_empty() { format!("_rels/{file}.rels") } else { format!("{dir}/_rels/{file}.rels") }
 }
@@ -458,6 +458,42 @@ impl KeptReader {
             p.elements.push(PreservedXml { slot: "ext".into(), xml: x });
         }
         (!p.is_empty()).then(|| Arc::new(p))
+    }
+
+    /// WHIQ: the sheet's charts (read into `cx.chart_sources` with the drawing) kept as the file
+    /// wrote them: each chart part with the style, colour and shape parts behind it, and its anchor.
+    /// A chart whose parts can't be kept is written from the model on save, as before.
+    pub fn charts(&mut self, cx: &mut Ctx<'_>, sheet: &mut Sheet) {
+        let sources = std::mem::take(&mut cx.chart_sources);
+        if sources.is_empty() || !self.on {
+            return;
+        }
+        let mut kept = vec![];
+        for src in sources {
+            let root = PreservedRel { id: String::new(), rel_type: format!("{NS_REL}/chart"), target: src.part.clone(), external: false };
+            match self.closure(cx, &root, &HashSet::new(), CHART_SHEET_GRAPH) {
+                Ok(mut parts) => {
+                    let Some(i) = parts.iter().position(|p| normalize(&p.name) == normalize(&src.part)) else { continue };
+                    let part = parts.remove(i);
+                    kept.push(PreservedChart {
+                        id: src.chart_id,
+                        fingerprint: String::new(),
+                        anchor_fingerprint: String::new(),
+                        part,
+                        parts,
+                        anchor_xml: src.anchor_xml,
+                        anchor_rid: src.anchor_rid,
+                    });
+                }
+                Err(why) => cx.warn(format!("sheet \"{}\": a chart is written from the model on save ({why})", sheet.name)),
+            }
+        }
+        if kept.is_empty() {
+            return;
+        }
+        let mut p = sheet.preserved.take().map(|a| (*a).clone()).unwrap_or_default();
+        p.charts = kept;
+        sheet.preserved = Some(Arc::new(p));
     }
 
     /// Sheet-level content of the sheet part `part`.
@@ -830,6 +866,109 @@ fn map_start(e: &BytesStart<'_>, prefixes: &mut HashSet<Vec<u8>>, map: &mut dyn 
     Some(out)
 }
 
+/// WHIQ: a chart met while reading a drawing, to keep as the file wrote it.
+#[derive(Clone, Debug)]
+pub struct ChartSource {
+    pub chart_id: u32,
+    /// The chart part's name.
+    pub part: String,
+    /// The drawing's anchor element holding the chart alone (namespace declarations added).
+    pub anchor_xml: Option<String>,
+    /// The drawing relationship id of the chart.
+    pub anchor_rid: String,
+}
+
+/// WHIQ: what tells an edited chart from the one read (everything but its id and anchor).
+pub(crate) fn chart_fingerprint(ch: &gridcraft_model::Chart) -> String {
+    let neutral = gridcraft_model::Chart { id: 0, anchor: gridcraft_model::Anchor::default(), ..ch.clone() };
+    format!("{neutral:?}")
+}
+
+/// WHIQ: what tells a moved or resized chart from the one read.
+pub(crate) fn anchor_fingerprint(a: &gridcraft_model::Anchor) -> String {
+    format!("{a:?}")
+}
+
+/// WHIQ: each kept chart's fingerprints, from the charts as the read left them (names resolved).
+/// A kept chart whose model chart is gone is dropped.
+pub fn fingerprint_kept_charts(wb: &mut Workbook) {
+    for sh in wb.sheets.iter_mut() {
+        if sh.preserved.as_ref().is_none_or(|p| p.charts.is_empty()) {
+            continue;
+        }
+        let sheet = Arc::make_mut(sh);
+        let Some(old) = sheet.preserved.take() else { continue };
+        let mut p = (*old).clone();
+        for k in p.charts.iter_mut() {
+            if let Some(ch) = sheet.charts.iter().find(|c| c.id == k.id) {
+                k.fingerprint = chart_fingerprint(ch);
+                k.anchor_fingerprint = anchor_fingerprint(&ch.anchor);
+            }
+        }
+        p.charts.retain(|k| !k.fingerprint.is_empty());
+        sheet.preserved = (!p.is_empty()).then(|| Arc::new(p));
+    }
+}
+
+/// WHIQ: the root's element children as XML text, each with the root's namespace declarations
+/// (the default one too) it does not declare itself. `None` when the XML is damaged.
+pub(crate) fn top_level_fragments(bytes: &[u8]) -> Option<Vec<String>> {
+    let data = xml::to_utf8(bytes);
+    let text = std::str::from_utf8(&data).ok()?;
+    let mut reader = Reader::from_str(text);
+    let mut decls: Vec<(String, String)> = vec![];
+    let mut default_ns: Option<String> = None;
+    let mut out = vec![];
+    let mut in_root = false;
+    loop {
+        let start = usize::try_from(reader.buffer_position()).ok()?;
+        match reader.read_event().ok()? {
+            Event::Eof => break,
+            Event::Start(e) if !in_root => {
+                in_root = true;
+                for a in e.attributes().with_checks(false).flatten() {
+                    let (Ok(v), key) = (std::str::from_utf8(&a.value), a.key.as_ref()) else { continue };
+                    if v.contains('"') {
+                        continue;
+                    }
+                    if key == b"xmlns" {
+                        default_ns = Some(v.to_string());
+                    } else if let Some(p) = key.strip_prefix(b"xmlns:")
+                        && let Ok(p) = std::str::from_utf8(p)
+                    {
+                        decls.push((p.to_string(), v.to_string()));
+                    }
+                }
+            }
+            Event::Start(e) => {
+                reader.read_to_end(e.name()).ok()?;
+                let end = usize::try_from(reader.buffer_position()).ok()?;
+                out.push(with_default_ns(&with_decls(text.get(start..end)?, &decls), default_ns.as_deref()));
+            }
+            Event::Empty(_) if in_root => {
+                let end = usize::try_from(reader.buffer_position()).ok()?;
+                out.push(with_default_ns(&with_decls(text.get(start..end)?, &decls), default_ns.as_deref()));
+            }
+            Event::End(_) => break,
+            _ => {}
+        }
+    }
+    Some(out)
+}
+
+/// Declares the root's default namespace on a fragment that doesn't declare one.
+fn with_default_ns(frag: &str, ns: Option<&str>) -> String {
+    let Some(ns) = ns else { return frag.to_string() };
+    let head = frag.get(..frag.find('>').unwrap_or(frag.len())).unwrap_or("");
+    if head.contains("xmlns=") {
+        return frag.to_string();
+    }
+    let Some(name_end) = frag.char_indices().skip(1).find(|(_, c)| c.is_whitespace() || *c == '/' || *c == '>').map(|(i, _)| i) else {
+        return frag.to_string();
+    };
+    format!("{} xmlns=\"{}\"{}", frag.get(..name_end).unwrap_or(""), esc_attr(ns), frag.get(name_end..).unwrap_or(""))
+}
+
 // ---------------------------------------------------------------- writing
 
 /// Names given to kept parts while a package is written.
@@ -868,14 +1007,14 @@ impl KeptOut {
 }
 
 /// Original part name (normalized) → written part name.
-type NameMap = HashMap<String, String>;
+pub(crate) type NameMap = HashMap<String, String>;
 
 fn rel_target(r: &PreservedRel, names: &NameMap) -> Option<String> {
     if r.external { Some(r.target.clone()) } else { names.get(&normalize(&r.target)).map(|n| format!("/{n}")) }
 }
 
 /// A kept part's relationships, ids unchanged, targets renamed.
-fn part_rels_xml(rels: &[PreservedRel], names: &NameMap) -> String {
+pub(crate) fn part_rels_xml(rels: &[PreservedRel], names: &NameMap) -> String {
     let mut s = format!("{XML_DECL}<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">");
     for r in rels {
         let Some(target) = rel_target(r, names) else { continue };
@@ -892,7 +1031,7 @@ fn part_rels_xml(rels: &[PreservedRel], names: &NameMap) -> String {
     s
 }
 
-fn write_parts(out: &mut Out, parts: &[PreservedPart]) -> NameMap {
+pub(crate) fn write_parts(out: &mut Out, parts: &[PreservedPart]) -> NameMap {
     let mut names = NameMap::new();
     for p in parts {
         names.entry(normalize(&p.name)).or_insert_with(|| out.kept.claim(&p.name));

@@ -257,6 +257,9 @@ pub fn save_to_path(wb: &Workbook, path: &str, kind: Option<FileKind>) -> Result
         return Ok(bytes.len() as u64);
     }
     let xk = gridcraft_xlsx::XlsxKind::from_path(path);
+    // WHIQ: the file says when it was created (kept from the file it was read from) and saved (now).
+    let stamped = stamp_saved(wb);
+    let wb = &stamped;
     let mut n = 0;
     write_file_with(path, &mut |f| {
         {
@@ -268,6 +271,27 @@ pub fn save_to_path(wb: &Workbook, path: &str, kind: Option<FileKind>) -> Result
         Ok(())
     })?;
     Ok(n)
+}
+
+/// WHIQ: `wb` with its save time (`modified`) set to now, and `created` too when it has none.
+#[cfg(not(target_arch = "wasm32"))]
+fn stamp_saved(wb: &Workbook) -> Workbook {
+    let mut w = wb.clone();
+    if let Some(now) = w3cdtf_now() {
+        if w.props.created.is_empty() {
+            w.props.created = now.clone();
+        }
+        w.props.modified = now;
+    }
+    w
+}
+
+/// Now as W3CDTF (`2026-10-31T08:09:10Z`), the form OOXML core properties take.
+pub fn w3cdtf_now() -> Option<String> {
+    let secs = (gridcraft_core::date::unix_now_ms()? / 1000.0).floor() as i64;
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let (y, m, d) = gridcraft_core::date::civil_from_days(days);
+    Some(format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60))
 }
 
 #[cfg(target_arch = "wasm32")]

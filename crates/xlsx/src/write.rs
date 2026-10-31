@@ -373,7 +373,10 @@ pub fn write_xlsx_into<W: std::io::Write + std::io::Seek>(wb: &Workbook, kind: X
     let mut w = format!("{XML_DECL}<workbook xmlns=\"{NS_MAIN}\" xmlns:r=\"{NS_REL}\">");
     w.push_str(&crate::passthrough::workbook_elements(wb, "fileVersion"));
     w.push_str(if wb.date_system == gridcraft_core::DateSystem::D1904 { "<workbookPr date1904=\"1\"/>" } else { "<workbookPr/>" });
-    if wb.protected_structure {
+    if let Some(x) = crate::kept::kept_protection(wb) {
+        // WHIQ: as the file had it (an empty element too) while the protection is unchanged.
+        w.push_str(&x);
+    } else if wb.protected_structure {
         let pw = wb.structure_password.as_ref().map(|h| crate::sheet_write::password_attrs(h, "workbook")).unwrap_or_default();
         let _ = write!(w, "<workbookProtection{pw} lockStructure=\"1\"/>");
     }
@@ -427,7 +430,8 @@ pub fn write_xlsx_into<W: std::io::Write + std::io::Seek>(wb: &Workbook, kind: X
     out.part(
         "xl/theme/theme1.xml",
         Some("application/vnd.openxmlformats-officedocument.theme+xml"),
-        crate::theme::write_theme(&wb.theme).into_bytes(),
+        // WHIQ: the theme part as the file had it while the model's theme is the one read.
+        crate::kept::kept_theme(wb).unwrap_or_else(|| crate::theme::write_theme(&wb.theme).into_bytes()),
     );
     wb_rels.add("theme", "theme/theme1.xml");
     let mut sst = format!("{XML_DECL}<sst xmlns=\"{NS_MAIN}\" count=\"{}\" uniqueCount=\"{}\">", out.sst.count, out.sst.list.len());
@@ -480,6 +484,12 @@ pub fn write_xlsx_into<W: std::io::Write + std::io::Seek>(wb: &Workbook, kind: X
     ] {
         if !v.is_empty() {
             let _ = write!(core, "<{tag}>{}</{tag}>", esc(v));
+        }
+    }
+    // WHIQ: when it was created (kept) and last saved (the save sets it).
+    for (tag, v) in [("dcterms:created", &p.created), ("dcterms:modified", &p.modified)] {
+        if !v.is_empty() {
+            let _ = write!(core, "<{tag} xsi:type=\"dcterms:W3CDTF\">{}</{tag}>", esc(v));
         }
     }
     core.push_str("</cp:coreProperties>");

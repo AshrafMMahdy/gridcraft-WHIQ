@@ -20,6 +20,8 @@ mod csv;
 mod drawing;
 mod feature_bags;
 mod fmla;
+// WHIQ: what an edit did not touch is written back as the file had it.
+mod kept;
 mod lazy;
 mod ods;
 mod package;

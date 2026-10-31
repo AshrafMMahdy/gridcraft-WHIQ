@@ -86,6 +86,12 @@ pub struct DocProps {
     /// WHIQ: who saved the workbook last (`cp:lastModifiedBy`): the MCP caller or `--author`.
     #[serde(default)]
     pub last_modified_by: String,
+    /// WHIQ: when the workbook was created and last saved (`dcterms:created`, `dcterms:modified`,
+    /// W3CDTF text as the file has it). A save keeps `created` and sets `modified` to now.
+    #[serde(default)]
+    pub created: String,
+    #[serde(default)]
+    pub modified: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

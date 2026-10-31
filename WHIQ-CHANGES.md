@@ -672,6 +672,68 @@ upstream's `crates/model/src/spill.rs` `SystemTime::now` with the newer clippy 1
 here.) The preview was also looked at in headless Chromium (a 60-row sheet with a frozen header,
 data bars, a column and a pie chart on the grid; a merged title and Arabic text).
 
+## A customer's file keeps what an edit did not touch (2026-10-31, `whiq-v0.7.5`)
+
+The platform's edit-in-place check on an openpyxl-made workbook (`selfchecks/shared/craftEditInPlace.selfcheck.ts`)
+found what the engine's own `roundtrip_check` reported changing on save. Owner rule: editing a customer's file must
+not lose anything it holds. Every one of these is now written back as the file had it while the edit leaves it
+alone, and from the model (as before) once the edit changes it:
+
+- **The theme part verbatim** (`crates/xlsx/src/read.rs`, `kept.rs`, `write.rs`): the part's bytes are kept at read
+  (workbook-level kept element, slot `theme`) and written back while the model's theme still reads the same from
+  them (`read_theme(kept) == wb.theme`): effect styles, gradient fills, the per-script font table (`<a:font
+  script="Arab" …>`, which Arabic workbooks rely on), the theme name and everything else. A theme changed in
+  GridCraft is written from the model.
+- **Charts the edit did not touch, from their own part** (`passthrough.rs` `KeptReader::charts`, `kept.rs`,
+  `drawing.rs`, `sheet_write.rs`; model `PreservedChart` in `Preserved::charts`): each chart part is kept with the
+  parts behind its relationships (chart style, colours, user shapes, embedded data: `CHART_SHEET_GRAPH`) and a
+  fingerprint of the chart as read. While the model's chart is unchanged (cell edits elsewhere included) the save
+  writes that part back byte for byte, its `numCache` / `strCache` refilled from the cells (any prefix; a formula
+  naming no cell here keeps its cache) — series line styles (`spPr` / `a:ln` / `a:prstDash`), colours, layout,
+  namespaces, the category reference kind all stay. An edited chart (type, title, series, references moved by an
+  inserted row…) is written from the model.
+- **The chart's anchor as it was** (`top_level_fragments`, `Obj::Kept`): the drawing's anchor element holding the
+  chart is kept (namespace declarations, the default one too, added) and written back while the chart has not
+  moved or been resized — a `oneCellAnchor` with its extent stays one — with the chart's new relationship id and a
+  drawing-object id unique in the drawing. A moved chart gets GridCraft's `twoCellAnchor` from the model.
+- **The indexed colour palette** (`<colors>`: `indexedColors`, `mruColors`) is written back in `styles.xml` after
+  `tableStyles`, as read.
+- **`workbookProtection` as it was** (an empty `<workbookProtection/>` too), while the structure protection and its
+  password hash are the ones read from it; changed in GridCraft, it is written from the model.
+- **`docProps/core.xml` dates**: `dcterms:created` kept (`DocProps::created`), `dcterms:modified` set to the save
+  time by every `.xlsx` save of the engine (`io::save_to_path`, `w3cdtf_now`; a workbook with no creation date gets
+  the save time for both). The writer itself stays deterministic (it writes what the model holds), so two writes
+  of one model are the same bytes.
+
+`roundtrip_check` on the platform's `cost-report.xlsx` (openpyxl) before → after: theme (24 element kinds), chart
+(`spPr`, `a:ln`, `a:prstDash`, the category `numRef`), drawing (`oneCellAnchor`, `ext`), `colors` (64
+`rgbColor`), `workbookProtection` and core `created` / `modified` were lost → none. Still reported, by design: the
+worksheet parts are rewritten from the model (inline strings become shared strings, identical adjacent column
+ranges are written as one, openpyxl's default `sheetPr` is not written, column widths round-trip through pixels:
+22 → 22.00390625) and `docProps/app.xml` names GridCraft as the saving application (openpyxl's `AppVersion` goes).
+
+Test: contract `authoring::a_customer_file_edited_in_place_keeps_what_the_edit_did_not_touch` — a workbook laid out
+as openpyxl writes one (default namespaces, inline strings, a one-cell chart anchor, series line styles, a stale
+value cache, the palette, an empty `workbookProtection`, created/modified dates) is checked with `roundtrip_check`
+(none of those parts reported), opened, one cell edited and saved: the theme is byte for byte the original, the
+chart part is the original with its cache's edited value refilled and nothing else changed, the anchor is the
+one-cell anchor with its extent, 64 palette colours, `<workbookProtection/>`, `created` kept and `modified` the save
+time; then a row inserted above the chart's data moves the chart and its anchor, both written from the model with
+the new references and row, the theme still verbatim. The fixture's theme is original content (the theme openpyxl
+bundles is derived from Office's and is not committed here). Unit: `kept::tests` (caches refilled with a `c:`
+prefix and an `&` in the sheet name, a cache of another workbook kept, damaged XML refused; anchor fragments with
+the default namespace, relationship id rewritten, object renumbered).
+
+Also: `crates/model/src/spill.rs` read the std clock for a folder-name salt, a method `clippy.toml` disallows
+(it traps on wasm; clippy 1.97 stopped `cargo clippy` there): it reads `gridcraft_core::date::unix_now_ms` now, and
+the native test `spill_claim` allows the lint where it sets a file's age.
+
+Status (Linux x86_64, 2026-10-31, debug, without craft-fonts): contract suite 35 passed (the new test included),
+`gridcraft-xlsx` 184 + `lazy_sheets` 1, `gridcraft-engine` lib 321 and its 15 integration tests (the command
+sequence fuzzer's XLSX round trips included), `gridcraft-mcp` 39, `gridcraft-model` 19; `cargo fmt --check`,
+`cargo clippy --no-deps -D warnings` on model / xlsx / engine / mcp / cli, `cargo check --target
+wasm32-unknown-unknown` on model / xlsx / engine.
+
 ## Tests
 
 - `cargo test` runs everything; the WHIQ-specific suites:

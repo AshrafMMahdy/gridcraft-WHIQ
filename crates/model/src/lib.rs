@@ -19,7 +19,7 @@ pub mod workbook;
 pub use cell::{Cell, CellPicture, Formula};
 pub use features::*;
 pub use password::PasswordHash;
-pub use preserved::{Preserved, PreservedPart, PreservedRel, PreservedSheet, PreservedXml};
+pub use preserved::{Preserved, PreservedChart, PreservedPart, PreservedRel, PreservedSheet, PreservedXml};
 pub use sheet::{DEFAULT_COL_WIDTH, DEFAULT_ROW_HEIGHT, LineIndex, Sheet, SheetViewMode, Visibility, points_to_chars};
 pub use store::{Band, CELL_BYTES, CellStore, ColdCells};
 pub use style::{

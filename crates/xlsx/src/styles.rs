@@ -723,7 +723,10 @@ pub fn write_styles(wb: &Workbook, dxfs: &[Style], extra_fmts: &[String]) -> (St
     let _ = write!(s, "<cellXfs count=\"{count}\">{xfs}</cellXfs>");
     let _ = write!(s, "<cellStyles count=\"{named}\">{cell_styles}</cellStyles>");
     let _ = write!(s, "<dxfs count=\"{}\">{dx}</dxfs>", dxfs.len());
-    s.push_str("<tableStyles count=\"0\" defaultTableStyle=\"TableStyleMedium2\" defaultPivotStyle=\"PivotStyleLight16\"/></styleSheet>");
+    s.push_str("<tableStyles count=\"0\" defaultTableStyle=\"TableStyleMedium2\" defaultPivotStyle=\"PivotStyleLight16\"/>");
+    // WHIQ: the palette as the file had it (CT_Stylesheet: after tableStyles).
+    s.push_str(&crate::kept::kept_colors(wb));
+    s.push_str("</styleSheet>");
     (s, nf.map)
 }
 

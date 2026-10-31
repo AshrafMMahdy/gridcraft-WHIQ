@@ -55,6 +55,7 @@ fn claim_empties_our_folder_and_the_sweep_takes_only_dead_folders() {
         let legacy = base.join("pid-4000004");
         std::fs::create_dir_all(&legacy).unwrap();
         std::fs::write(legacy.join("0.part"), b"legacy").unwrap();
+        #[allow(clippy::disallowed_methods)] // a native test: the std clock is there
         let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
         std::fs::File::open(&legacy).unwrap().set_modified(hour_ago).unwrap();
         legacy
