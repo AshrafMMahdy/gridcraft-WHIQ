@@ -325,7 +325,9 @@ pub fn tokenize_locale(src: &str, locale: crate::FormulaLocale) -> Result<Vec<To
                 push(&mut out, Tok::Op(op), i + len);
                 i += len;
             }
-            c if is_word_char(c) => {
+            // WHIQ: a name or reference starts with a letter, `_`, `\\` or `$` (`$A$1`); a word
+            // starting with `.` or `?` (`=.F35`) is not one Excel accepts.
+            c if is_word_char(c) && !matches!(c, '.' | '?') => {
                 let mut j = i;
                 while ch(j).is_some_and(|c| is_word_char(c) && !(array_depth > 0 && c == locale.array_column_separator())) {
                     j += 1;

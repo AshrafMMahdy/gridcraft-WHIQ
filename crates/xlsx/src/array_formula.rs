@@ -20,6 +20,20 @@ impl Shape {
     }
 }
 
+/// WHIQ: which function names are built in (the engine sets it from its function registry; the
+/// file-format crate does not depend on it). Unset: every name counts as known.
+static KNOWN_FUNCTIONS: std::sync::OnceLock<fn(&str) -> bool> = std::sync::OnceLock::new();
+
+/// Sets the test the writer uses to tell a built-in function from one it does not know. The
+/// first call wins.
+pub fn set_function_oracle(known: fn(&str) -> bool) {
+    let _ = KNOWN_FUNCTIONS.set(known);
+}
+
+fn is_known(name: &str) -> bool {
+    KNOWN_FUNCTIONS.get().is_none_or(|known| known(name))
+}
+
 pub(crate) fn needs_array(wb: &Workbook, sheet: usize, at: CellRef, formula: &Formula) -> bool {
     let Some(expr) = formula.expr_arc() else { return false };
     let mut scan = Scan { wb, at, remaining: 4096, locals: Vec::new() };
@@ -119,6 +133,17 @@ impl Scan<'_> {
             result.affected |= affected;
             self.locals.truncate(saved);
             return result;
+        }
+        // WHIQ: a function GridCraft does not know (a typo, a user-defined function) is one Excel
+        // hands its arguments to as they are (a UDF's argument may be a Range) and whose result is
+        // the one value it shows (#NAME? here): nothing in the call is intersected, so the call
+        // itself needs no array formula. Its arguments are still looked at.
+        if !is_known(name) && self.wb.name(name, sheet).is_none() {
+            let mut affected = false;
+            for arg in args.iter().take(255) {
+                affected |= self.expr(arg, sheet, array_context, depth).affected;
+            }
+            return Shape { array: false, affected };
         }
         let legacy_array =
             matches!(name, "SUMPRODUCT" | "MMULT" | "MINVERSE" | "MDETERM" | "TRANSPOSE" | "FREQUENCY" | "LINEST" | "LOGEST" | "TREND" | "GROWTH");

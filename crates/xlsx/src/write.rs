@@ -372,7 +372,16 @@ pub fn write_xlsx_into<W: std::io::Write + std::io::Seek>(wb: &Workbook, kind: X
     names.push_str(&slicer_names);
     let mut w = format!("{XML_DECL}<workbook xmlns=\"{NS_MAIN}\" xmlns:r=\"{NS_REL}\">");
     w.push_str(&crate::passthrough::workbook_elements(wb, "fileVersion"));
-    w.push_str(if wb.date_system == gridcraft_core::DateSystem::D1904 { "<workbookPr date1904=\"1\"/>" } else { "<workbookPr/>" });
+    // WHIQ: the VBA code name and the properties kept from the file.
+    w.push_str("<workbookPr");
+    if wb.date_system == gridcraft_core::DateSystem::D1904 {
+        w.push_str(" date1904=\"1\"");
+    }
+    if let Some(cn) = wb.code_name.as_deref().filter(|c| !c.is_empty()) {
+        let _ = write!(w, " codeName=\"{}\"", crate::xml::esc_attr(cn));
+    }
+    w.push_str(crate::kept::kept_slot(wb.preserved.as_deref(), "workbookPr"));
+    w.push_str("/>");
     if let Some(x) = crate::kept::kept_protection(wb) {
         // WHIQ: as the file had it (an empty element too) while the protection is unchanged.
         w.push_str(&x);

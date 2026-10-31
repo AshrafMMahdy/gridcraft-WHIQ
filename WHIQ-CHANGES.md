@@ -734,6 +734,185 @@ sequence fuzzer's XLSX round trips included), `gridcraft-mcp` 39, `gridcraft-mod
 `cargo clippy --no-deps -D warnings` on model / xlsx / engine / mcp / cli, `cargo check --target
 wasm32-unknown-unknown` on model / xlsx / engine.
 
+## VBA, protection, formulas and charts: the v0.7.5 test investigation (2026-10-31, `whiq-v0.7.6`)
+
+A test investigation of v0.7.5 found twelve defects, and the platform's corpus run two more (G1, G2). Each fix has a test that failed on v0.7.5
+(`crates/mcp/src/tests_v076.rs`: 15 tests through the MCP tools, plus the unit and contract tests named below).
+The test files are built with XlsxWriter by `tests/mcp-contract/fixtures/make_vba_protection.py`
+(`vba-button.xlsm`, `protected-perms.xlsx`; XlsxWriter's Office-derived theme part is taken out, the
+VBA project is a placeholder blob). No customer file is used.
+
+### VBA and protection
+
+1. **VBA code names are kept** (HIGH). `<workbookPr codeName>` and `<sheetPr codeName>` are read into
+   `Workbook::code_name` / `Sheet::code_name` (model, JSON `code_name`; `read.rs`, `sheet_read.rs`) and
+   written back (`write.rs`, `kept::sheet_pr_xml`). A rename keeps the code name (VBA modules bind by
+   it); a copied sheet, and a sheet inserted in a workbook whose sheets have code names, gets a fresh
+   `SheetN` (`sheet.rs` `fresh_code_name`), so no two sheets share one. The workbookPr / sheetPr
+   attributes the model does not hold are kept as read (CT_WorkbookPr: `defaultThemeVersion`,
+   `filterPrivacy`, `backupFile`, `updateLinks`…; CT_SheetPr: `published`, `syncHorizontal`,
+   `transitionEvaluation`…, `filterMode` only while the sheet has a filter), with `<outlinePr>` and
+   `pageSetUpPr autoPageBreaks` (pass-through slots `workbookPr`, `sheetPr`, `outlinePr`,
+   `pageSetUpPr`; only schema attributes, escaped). `inspect_workbook` shows `codeName` and `macros`.
+   Tests: `vba_code_names_and_the_other_workbook_and_sheet_properties_survive_a_save` (open the .xlsm,
+   edit, save, save again: `codeName="ThisWorkbook"` with `defaultThemeVersion`, `Sheet1` with
+   `outlinePr summaryBelow="0"`, fit to page and tab colour, `InputSheet`, the VBA project),
+   `a_copied_sheet_gets_a_code_name_of_its_own`.
+2. **The workbook structure lock holds** (MEDIUM). `sheet.rename`, `sheet.move` (and copy),
+   `sheet.hide`, `sheet.unhide` and `sheet.tabColor` refuse under `lockStructure` like insert and
+   delete did, and every commit is checked as well (`cmd/mod.rs` `check_structure`): an edit that
+   adds, removes, renames, reorders, hides, shows or recolours sheets while the structure stays
+   protected is refused, whichever command made it (the Scenario Summary report's new sheet
+   included). One message for all of them (`STRUCTURE_LOCKED`). Test:
+   `a_structure_lock_refuses_every_sheet_change_excel_refuses` (eight calls, code `protected`, the
+   sheets unchanged; after unprotecting the same calls go through).
+3. **Old-style VML form controls are kept** (MEDIUM). A sheet whose only drawing is a VML part
+   (an XlsxWriter / Excel 95-style button with `FmlaMacro`, check boxes…, no `<controls>`) now keeps
+   that drawing when it holds any shape other than a note (`passthrough.rs` `sheet()` /
+   `sheet_elements`, `vml_object_types`); it is written back alone or merged with GridCraft's notes,
+   and the open warns `form controls (Button) are not shown; they are kept for saving, with the macros
+   they run`. Test: `an_old_style_form_button_with_no_controls_part_is_kept_and_named` (the button and
+   its macro after a save; with a note added, both in one drawing).
+4. **Sheet-protection permissions are kept** (LOW). `SheetProtection` gains `edit_objects`,
+   `edit_scenarios`, `insert_hyperlinks`, `pivot_tables` (read in `sheet_read.rs`, written in
+   `sheet_write.rs` instead of the hard-coded `objects="1" scenarios="1"`; `review.protectSheet`
+   takes `editObjects`, `editScenarios`, `insertHyperlinks`, `pivotTables`). A text box on a protected
+   sheet can be edited when objects are. Test: `sheet_protection_permissions_round_trip`.
+5. **Protection refusals say so** (LOW). The engine's refusals name the sheet and cell
+   (`… is on a protected sheet. (cell A2 on sheet "Locked")`); the MCP server answers them with code
+   **`protected`** (`whiq.rs` `protected_error`) and a next step naming the sheet, its unlocked cells
+   and its Allow Edit Ranges (`sheet "Locked" is protected: you can still write its unlocked cells
+   B2:B4 and its Allow Edit Ranges "Items" (A2:A4). For anything else ask the owner to unprotect the
+   sheet`), plus `sheet`, `unlocked_cells`, `edit_ranges`; a structure lock says what it forbids and
+   to ask the owner to unprotect the workbook. `inspect_workbook` has `structureProtected` and per
+   sheet `protection {password, unlockedCells, unlockedMore, editRanges, allowed}`;
+   `export_markdown` opens with a line when the structure is protected and puts one under each
+   protected sheet's heading; `render_preview` has `structure_protected`, `sheets[].protected` /
+   `protection`, a `.cap.protected` line on a protected sheet and a note in the page head. Test:
+   `protection_refusals_say_protected_and_what_can_still_be_edited`.
+6. **Saving an .xlsm as .xlsx warns** (LOW/MEDIUM). `file.save` / `save_workbook` to a format
+   without macros returns `warnings: ["the workbook's macros (VBA project) were not saved … Save it as
+   .xlsm …"]` (the open workbook still holds them). Test:
+   `saving_a_macro_workbook_as_xlsx_warns_that_the_macros_are_dropped`.
+
+### Formulas
+
+7. **A name starts with a letter, `_` or `\`** (`lexer.rs`): a word starting with `.` or `?`
+   (`=.F35`) is a syntax error at that character; `.5` is still a number. Tests: formula
+   `a_word_cannot_start_with_a_dot_or_a_question_mark`, MCP `a_name_cannot_start_with_a_dot`.
+8. **The parenthesis auto-close only closes** (`edit.rs` `parse_entry`): only when the formula stops
+   early (the error is at its end) are the `)` still open appended, exactly that many; any other error
+   is reported with its position, counted in the text as typed (`expected `,` or `)`, found the text
+   "no" at character 16`). Parse errors now point at the offending token, not past it (`parser.rs`
+   `err_prev`), and name it as typed. Test: `only_missing_parentheses_are_added_and_only_at_the_end`.
+9. **Tools say what happened to a formula.** `set_cell` returns `corrected_to` when parentheses were
+   added; `write_range` returns `corrected [{cell, corrected_to}]`; a function that is neither built
+   in nor a LAMBDA name gives a warning with the closest name (`Sheet1!C1: VLOKUP is not a function
+   Excel knows, so the cell shows #NAME?; did you mean VLOOKUP?`, bounded edit distance over the
+   registry); a refused write names its cell (`There's a problem with this formula in Sheet1!B8
+   (=1+*2): …`) and `build_workbook` its row of the spec and cell (`sheet S, row 2 (cell B3): …`),
+   with the warnings of every sheet in its answer. Every syntax and argument-count refusal is
+   `invalid_argument`. `evaluate_formula` reads the formula as `set_cell` does (same refusals, same
+   correction, `corrected_to`, warnings; `formulas.evaluate {report: true}`). **Dynamic arrays and
+   unknown functions:** a function GridCraft does not know is what Excel treats as a user-defined
+   function: it is handed its arguments as they are (a UDF's argument may be a Range) and its result
+   is the one value shown (`#NAME?`), so nothing in the call is intersected and the call alone does
+   not make the formula a dynamic-array one; `=VLOKUP(A1,A1:B2,2,FALSE)` is now saved as a plain
+   `<f>` (it was `cm="1" t="array"` because its range argument was taken for a scalar parameter),
+   while `=SQRT(A1:A2)` stays `cm="1"` as Excel saves it. The writer learns which names are built in
+   from the engine (`gridcraft_xlsx::set_function_oracle`, set by `Session::new`; the file-format
+   crate may not depend on the registry). Tests: `formula_writes_say_what_happened`,
+   `an_unknown_function_is_saved_as_a_plain_formula`.
+
+### Charts
+
+10. **`inspect_workbook` and `export_markdown` describe charts.** Each chart: `id`, `type` /
+    `subtype` (insert_chart's names), `title`, `anchor {cell, dx, dy, width, height, mode}`, `x_title`,
+    `y_title`, `y2_title`, and `series [{index, name, kind, values, categories, axis:
+    primary|secondary}]` (`series_count` for the old count; `kind` / `at` / `trendlines` stay).
+    Markdown lists `Charts on <sheet>:` after the sheet's rows, one line per chart and per series.
+    Test: `inspect_and_markdown_describe_each_chart`.
+11. **Dual-axis combos on an existing workbook.** `insert_chart` takes `series [{type, secondary,
+    name, color}]` (a series of another type or on the secondary axis makes a combo) and `x_title`,
+    `y_title`, `y2_title`; the new command **`chart.setSeries {chart, sheet?, series: n, type?,
+    secondary?, name?, values?, categories?, color?}`** changes one series of an existing chart
+    (`execute_command` or `batch`). `chart.set` takes `sheet` and `y2Title`. Test:
+    `insert_chart_makes_a_dual_axis_combo_and_a_series_can_be_moved_to_the_secondary_axis` (both
+    ways, saved, both value axes in the parts, reopened: the axis titles and the secondary series).
+12. **The secondary axis has a title**: `Chart::y2_title` (model), written on the secondary `valAx`
+    and read back from it (`chart.rs`; the primary value axis is now the one the first group plots
+    on), `build_workbook` charts `y2_title`, drawn on the right in PNG / PDF / preview when a series
+    is on that axis (`render.rs`). Test: the two chart tests above, chart
+    `the_secondary_axis_title_is_drawn_when_a_series_is_on_it`.
+
+### From the platform's corpus run (2026-10-31, `docs/engines-corpus/README.md` G1, G2)
+
+G1. **`render_sheet` of a large sheet took minutes and said nothing meanwhile.** The corpus file
+    `poi-57181.xlsm` (Apache POI test data; sheet "General", 252 × 264 cells) took 169 s on Windows
+    and 24.5 min on a loaded Linux box. Cause: every cell is drawn under its own clip, and the raster
+    canvas made each clip a canvas-sized mask, built anew for every clip and copied for every draw
+    call (`Mask` cloned in `fill_rect`, `stroke`, `glyphs`…): a 4000 × 1260 picture moved ~5 MB per
+    draw, three or four draws per cell. Now (`crates/raster/src/lib.rs`) one mask is kept and moved
+    from clip to clip by clearing the old rectangle and setting the new one, it is not copied (the
+    pixmap and the mask are borrowed apart), and a draw wholly inside the clip (nearly every cell)
+    uses no mask at all; a rectangle fill straddling the clip still is. The same render takes 2.4 s
+    on this box (debug build, loaded). And a sheet picture reports progress while it draws
+    (`draw_block`: stage `drawing cells`, done of total per pass over the cells, with a `cancel`
+    safe point every 512 cells), so `job_status` and progress notifications move during a long
+    render (the liveness rule; a PDF keeps reporting its pages). Tests: raster
+    `clipped_draws_do_not_cost_the_whole_canvas` (2,000 clipped cells on an 8000 × 3000 canvas: 24 s
+    before, under 0.4 s now; the clip still holds), engine
+    `a_large_sheet_picture_reports_progress_and_is_quick` (260 × 250 cells), contract
+    `a_large_render_reports_its_progress` (progress notifications naming `drawing cells`).
+G2. **Excel 2010 form controls keep their DrawingML twin; shared pivot caches stay shared.**
+    Excel 2010 writes each form control twice: the legacy VML shape and, in the sheet's drawing part,
+    a hidden `xdr:sp` inside `mc:AlternateContent Requires="a14"` whose `a14:compatExt spid` names
+    that VML shape. The control (`<controls>`, `ctrlProp`, VML) was kept and the twin dropped (the
+    drawing part was not even written when the sheet had no picture or chart). The twins are now
+    kept at read (`drawing.rs`, sheet pass-through slot `controlTwin`, without relationship ids) and
+    written back exactly, ids included, in the sheet's drawing next to GridCraft's objects while the
+    sheet's controls are kept (`sheet_write.rs`, `Obj::Raw`). Pivot caches: every PivotTable got a
+    cache of its own on save, so tables sharing one cache in the file (Excel's default for tables on
+    one source) came back with copies (`poi-WithChartSheet.xlsx`: 3 caches for 5 tables became 5).
+    Tables that read one cache part now carry one `PivotTable::cache_group` (model) and are written
+    with one cache again while their source is still the same (`pivot.rs` `add_sheet`, with the
+    slicer groups as before); a table whose source was changed gets its own. On the corpus files:
+    `poi-mv-calculator-final-2-20-2013.xlsm` 163 twins → 163 (v0.7.5: 0),
+    `maa-construction-cost-estimating-template.xlsx` 9 → 9 (v0.7.5: 0, and `drawing1.xml` missing in
+    `roundtrip_check`), `poi-WithChartSheet.xlsx` 3 caches → 3 (v0.7.5: 5). Fixtures written by
+    `tests/mcp-contract/fixtures/make_controls_pivots.py` (`form-controls-2010.xlsx`: two check boxes
+    laid out as Excel 2010 saves them; `pivot-shared-cache.xlsx`: two tables on one cache), both
+    failing on the v0.7.5 release binary (0 twins kept; 2 caches). Tests:
+    `excel_2010_form_controls_keep_their_drawing_twin`,
+    `pivot_tables_that_share_a_cache_keep_sharing_it`.
+
+Also: the command-sequence fuzzer (its picks moved with the new `chart.setSeries` command) found that
+Delete Cells / Insert Cells could cut a merged cell and leave two merges overlapping (`C10:G16` and
+`D10:E10` after deleting `B10:F15` shifting left). As in Excel ("We can't do that to a merged cell"),
+a cell shift whose moving cells hold only part of a merge, or that would cut one at its edge or in
+the deleted block, is refused (`check_table_shift`). Test: engine `cell_shifts_never_cut_a_merged_cell`.
+
+| Capability | Tools | Test |
+|---|---|---|
+| Read a workbook's code names, protection, charts with their series and axes | `inspect_workbook`, `export_markdown`, `render_preview` | `inspect_and_markdown_describe_each_chart`, `protection_refusals_say_…` |
+| Create a dual-axis combo; a formula with its correction and warnings | `insert_chart` (`series`, `y2_title`), `build_workbook` (`y2_title`), `set_cell`, `write_range` | `insert_chart_makes_a_dual_axis_combo_…`, `formula_writes_say_what_happened` |
+| Edit a chart's series; edit a macro workbook and a protected one in place | `execute_command chart.setSeries`, `set_cell` + `save_workbook` | `insert_chart_makes_…`, `vba_code_names_…`, `an_old_style_form_button_…`, `sheet_protection_permissions_round_trip` |
+| Delete / move / hide sheets under a structure lock (refused) | `delete_sheet`, `rename_sheet`, `add_sheet`, `sheet.move` / `hide` / `unhide` / `tabColor` | `a_structure_lock_refuses_every_sheet_change_excel_refuses` |
+| Search: check a formula without writing it | `evaluate_formula` | `formula_writes_say_what_happened` |
+| Read a large sheet as a picture, with progress | `render_sheet` (`job_status`, progress notifications) | `a_large_render_reports_its_progress` |
+| Edit a workbook with Excel 2010 form controls or shared pivot caches in place | `set_cell` + `save_workbook` | `excel_2010_form_controls_keep_…`, `pivot_tables_that_share_a_cache_…` |
+
+Not in scope: untouched sheets byte for byte (the owner's decision).
+
+Status (Linux x86_64, 2026-10-31, debug, without craft-fonts; each test target run alone, the shared disk
+being short): contract suite 36 passed (`a_large_render_reports_its_progress` new), `gridcraft-mcp` lib 54
+(the 15 `tests_v076` included), `gridcraft-engine` lib 323 and its 15 integration tests (the command
+sequence fuzzer included), `gridcraft-xlsx` 185 + `lazy_sheets` 1, `gridcraft-cli` bins 21, `cli` 7,
+`text_to_columns_quotes` 1, core 23, numfmt 35, formula 31, functions 123, model 19, calc 60 (1 ignored),
+text 6, raster 3, pdf 18, chart 36; `cargo fmt --check` and `cargo clippy --no-deps --all-targets -D
+warnings` on model / formula / xlsx / chart / raster / engine / mcp / cli. Not run this round: `ui-egui`
+and the desktop app (no space for their builds on the shared disk), `cargo xtask wasm`.
+
 ## Tests
 
 - `cargo test` runs everything; the WHIQ-specific suites:

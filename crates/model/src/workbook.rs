@@ -122,6 +122,10 @@ pub struct Workbook {
     /// separator back (a `;` file stays a `;` file). `None` = not read from CSV: CSV saves use `,`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub csv_delimiter: Option<u8>,
+    /// WHIQ: the workbook's VBA code name (`<workbookPr codeName="ThisWorkbook">`): the name its
+    /// VBA document module binds by. `None`: the file had none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_name: Option<String>,
     /// Unmodelled file content kept for saving (package root and workbook level). Not in JSON.
     #[serde(skip)]
     pub preserved: Option<Arc<crate::preserved::Preserved>>,
@@ -155,6 +159,7 @@ impl Workbook {
             cell_styles: vec![],
             vba_project: None,
             csv_delimiter: None,
+            code_name: None,
             preserved: None,
             source_dir: None,
         }

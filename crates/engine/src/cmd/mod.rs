@@ -343,6 +343,7 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
     if !protection_checked {
         check_protection(&d.wb, &wb, &d.unlocked_ranges)?;
     }
+    check_structure(&d.wb, &wb)?;
     if !structural {
         check_arrays(&d.wb, &wb)?;
     }
@@ -375,6 +376,38 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
 
 /// Excel's message for an edit of a locked cell on a protected sheet.
 pub(crate) const PROTECTED: &str = "The cell or chart you're trying to change is on a protected sheet.";
+
+/// WHIQ: Excel's refusal under a workbook structure lock (the MCP server answers it `protected`).
+pub(crate) const STRUCTURE_LOCKED: &str = "The workbook is protected and cannot be changed: its structure is locked (sheets can't be inserted, deleted, renamed, moved, copied, hidden, unhidden or given a tab colour).";
+
+/// WHIQ: [`PROTECTED`] naming the sheet (and the cell), for the caller to say what can still be
+/// edited there.
+pub(crate) fn protected_msg(sheet: &str, cell: Option<CellRef>) -> String {
+    match cell {
+        Some(c) => format!("{PROTECTED} (cell {} on sheet \"{sheet}\")", c.a1()),
+        None => format!("{PROTECTED} (sheet \"{sheet}\")"),
+    }
+}
+
+/// WHIQ: refuses a sheet-structure command while the workbook's structure is protected.
+pub(crate) fn structure_unlocked(s: &Session) -> Result<()> {
+    if s.doc()?.wb.protected_structure { Err(EngineError::Other(STRUCTURE_LOCKED.into())) } else { Ok(()) }
+}
+
+/// WHIQ: whatever command made it, an edit that adds, removes, renames, reorders, hides, shows or
+/// recolours sheets while the structure stays protected is refused (Excel greys all of them out).
+fn check_structure(old: &Workbook, new: &Workbook) -> Result<()> {
+    if !(old.protected_structure && new.protected_structure) {
+        return Ok(());
+    }
+    let shape = |wb: &Workbook| -> Vec<(String, gridcraft_model::Visibility, Option<gridcraft_model::Color>)> {
+        wb.sheets.iter().map(|s| (s.name.clone(), s.visibility, s.tab_color)).collect()
+    };
+    if old.sheets.len() != new.sheets.len() || shape(old) != shape(new) {
+        return Err(EngineError::Other(STRUCTURE_LOCKED.into()));
+    }
+    Ok(())
+}
 
 /// Refuses an edit that changed what a locked cell on a protected sheet holds (its value or
 /// formula), whichever command made it. Sheets are matched by name, so moving, renaming or
@@ -412,7 +445,7 @@ pub(crate) fn locked_cell_error(sh: &gridcraft_model::Sheet, c: CellRef, unlocke
     }
     Some(match needs_password {
         Some(t) => format!("The range \"{t}\" needs its password before it can be changed (Review › Allow Edit Ranges)."),
-        None => PROTECTED.into(),
+        None => protected_msg(&sh.name, Some(c)),
     })
 }
 

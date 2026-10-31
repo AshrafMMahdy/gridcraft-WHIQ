@@ -643,9 +643,7 @@ fn insert_copied_steps(s: &mut Session, clip: &crate::Clipboard, sheet: usize, a
 }
 
 fn insert_sheet(s: &mut Session, p: &Json) -> Result<Json> {
-    if s.doc()?.wb.protected_structure {
-        return Err(EngineError::Other("The workbook is protected and cannot be changed.".into()));
-    }
+    super::structure_unlocked(s)?;
     let name = match str_param(p, "name") {
         Some(n) => n.to_string(),
         None => s.doc()?.wb.next_sheet_name(),
@@ -656,7 +654,12 @@ fn insert_sheet(s: &mut Session, p: &Json) -> Result<Json> {
     let idx = edit_doc(d, |cx| {
         // Excel inserts before the active sheet; the "+" button appends after it.
         let at = before.unwrap_or(cx.wb.active_sheet + 1).min(cx.wb.sheets.len());
-        cx.wb.sheets.insert(at, Arc::new(Sheet::new(name.clone())));
+        let mut sheet = Sheet::new(name.clone());
+        // WHIQ: in a workbook whose sheets have VBA code names, the new sheet gets one too.
+        if cx.wb.sheets.iter().any(|s| s.code_name.is_some()) {
+            sheet.code_name = Some(fresh_code_name(&cx.wb));
+        }
+        cx.wb.sheets.insert(at, Arc::new(sheet));
         // Names scoped to later sheets shift.
         for n in cx.wb.names.iter_mut() {
             if let Some(sc) = n.scope.as_mut()
@@ -672,6 +675,15 @@ fn insert_sheet(s: &mut Session, p: &Json) -> Result<Json> {
     })?;
     d.sheet_selections.insert(idx.min(d.sheet_selections.len()), crate::Selection::default());
     Ok(json!({"index": idx, "name": name}))
+}
+
+/// WHIQ: `SheetN`, the first such VBA code name no sheet (or the workbook) has.
+fn fresh_code_name(wb: &gridcraft_model::Workbook) -> String {
+    let taken = |n: &str| {
+        wb.code_name.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(n))
+            || wb.sheets.iter().any(|s| s.code_name.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(n)))
+    };
+    (1..10_000).map(|k| format!("Sheet{k}")).find(|n| !taken(n)).unwrap_or_else(|| "Sheet".into())
 }
 
 fn edit_doc<R>(d: &mut crate::DocState, f: impl FnOnce(&mut Ctx) -> Result<R>) -> Result<R> {
@@ -692,7 +704,7 @@ fn check_lines_protection(s: &Session, p: &Json, axis: Axis, at: u32, count: u32
         (Axis::Cols, false) => pr.delete_columns,
     };
     let locked = |st: gridcraft_model::StyleId| wb.styles.get(st).protection.locked;
-    let refuse = || EngineError::Other(PROTECTED.into());
+    let refuse = || EngineError::Other(super::protected_msg(&sh.name, None));
     if !allowed {
         return Err(refuse());
     }
@@ -715,7 +727,7 @@ fn delete_sheet(s: &mut Session, p: &Json) -> Result<Json> {
     let i = target_sheet(s, p)?;
     let d = s.doc()?;
     if d.wb.protected_structure {
-        return Err(EngineError::Other("The workbook is protected and cannot be changed.".into()));
+        return Err(EngineError::Other(super::STRUCTURE_LOCKED.into()));
     }
     if d.wb.sheets.iter().filter(|s| s.visibility == Visibility::Visible).count() <= 1 {
         return Err(EngineError::Other("A workbook must contain at least one visible worksheet.".into()));
@@ -767,6 +779,7 @@ fn delete_sheet(s: &mut Session, p: &Json) -> Result<Json> {
 }
 
 fn rename_sheet(s: &mut Session, p: &Json) -> Result<Json> {
+    super::structure_unlocked(s)?;
     let i = target_sheet(s, p)?;
     let Some(name) = str_param(p, "name").map(|n| n.trim().to_string()) else { return Err(bad("sheet.rename", "missing `name`")) };
     s.doc()?.wb.check_sheet_name(&name, Some(i)).map_err(EngineError::Other)?;
@@ -838,6 +851,7 @@ fn rename_sheet(s: &mut Session, p: &Json) -> Result<Json> {
 }
 
 fn move_sheet(s: &mut Session, p: &Json) -> Result<Json> {
+    super::structure_unlocked(s)?;
     let i = target_sheet(s, p)?;
     let copy = bool_param(p, "copy").unwrap_or(false);
     let to = p.get("to").and_then(Json::as_u64).map(|v| v as usize).ok_or_else(|| bad("sheet.move", "missing `to`"))?;
@@ -859,6 +873,10 @@ fn move_sheet(s: &mut Session, p: &Json) -> Result<Json> {
             sh.name = name;
             sh.tables.clear(); // table names must be unique
             sh.preserved = None; // kept file content (form controls, OLE objects…) stays with the original
+            // WHIQ: a VBA code name is unique in the workbook: the copy gets one of its own.
+            if sh.code_name.is_some() {
+                sh.code_name = Some(fresh_code_name(&cx.wb));
+            }
             let at = to.min(n);
             // The copy gets its own copies of the sheet's names, referring to the copy.
             let copies: Vec<gridcraft_model::DefinedName> = cx
@@ -906,6 +924,7 @@ fn move_sheet(s: &mut Session, p: &Json) -> Result<Json> {
 }
 
 fn tab_color(s: &mut Session, p: &Json) -> Result<Json> {
+    super::structure_unlocked(s)?;
     let i = target_sheet(s, p)?;
     let c = super::format::color_param(p.get("color"));
     edit(s, |cx| {
@@ -915,6 +934,7 @@ fn tab_color(s: &mut Session, p: &Json) -> Result<Json> {
 }
 
 fn hide_sheet(s: &mut Session, p: &Json) -> Result<Json> {
+    super::structure_unlocked(s)?;
     let i = target_sheet(s, p)?;
     if s.doc()?.wb.sheets.iter().filter(|s| s.visibility == Visibility::Visible).count() <= 1 {
         return Err(EngineError::Other("A workbook must contain at least one visible worksheet.".into()));
@@ -929,6 +949,7 @@ fn hide_sheet(s: &mut Session, p: &Json) -> Result<Json> {
 }
 
 fn unhide_sheet(s: &mut Session, p: &Json) -> Result<Json> {
+    super::structure_unlocked(s)?;
     if p.get("sheet").is_none() {
         let hidden: Vec<String> = s.doc()?.wb.sheets.iter().filter(|s| s.visibility != Visibility::Visible).map(|s| s.name.clone()).collect();
         if hidden.is_empty() {
@@ -1092,6 +1113,31 @@ pub(crate) fn check_table_shift(sh: &Sheet, e: &Edit) -> Result<()> {
         };
         if !ok {
             return Err(EngineError::Other("This operation isn't allowed: it would shift cells in a table on your worksheet.".into()));
+        }
+    }
+    // WHIQ: a merged cell is never cut, as in Excel: the cells that shift hold whole merges, no
+    // merge straddles the edge they move from, and a deleted block holds no part of one (else two
+    // merges could end up overlapping).
+    for m in sh.merges.iter().filter(|m| !m.is_single()) {
+        let (lines, across) = match axis {
+            // Cells move left/right in rows r: the band is those rows from r's first column on.
+            Axis::Cols => ((m.start.row, m.end.row, r.start.row, r.end.row), (m.start.col, m.end.col, r.start.col)),
+            Axis::Rows => ((m.start.col, m.end.col, r.start.col, r.end.col), (m.start.row, m.end.row, r.start.row)),
+        };
+        let (m0, m1, b0, b1) = lines;
+        let (a0, a1, edge) = across;
+        let in_band = m0 <= b1 && m1 >= b0 && a1 >= edge;
+        if !in_band {
+            continue;
+        }
+        let whole_lines = m0 >= b0 && m1 <= b1;
+        let straddles = a0 < edge;
+        let part_deleted = delete && m.intersects(&r) && !(r.contains(m.start) && r.contains(m.end));
+        if !whole_lines || straddles || part_deleted {
+            return Err(EngineError::Other(format!(
+                "We can't do that to a merged cell: {} would be cut. Unmerge it first (Home › Merge & Center).",
+                m.a1()
+            )));
         }
     }
     Ok(())

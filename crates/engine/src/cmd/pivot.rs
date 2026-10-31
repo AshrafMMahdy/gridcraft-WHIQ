@@ -613,7 +613,7 @@ fn field_list(v: Option<&Json>) -> Vec<Json> {
 
 fn insert_pivot(s: &mut Session, p: &Json) -> Result<Json> {
     if s.doc()?.wb.protected_structure && matches!(str_param(p, "destination"), None | Some("new")) {
-        return Err(other("The workbook is protected and cannot be changed."));
+        return Err(other(super::STRUCTURE_LOCKED));
     }
     let source = source_param(s, p)?;
     let active = s.doc()?.wb.active_sheet;
@@ -1455,6 +1455,7 @@ fn insert_pivot_chart(s: &mut Session, p: &Json) -> Result<Json> {
         style: 1,
         x_title: None,
         y_title: None,
+        y2_title: None,
         source: None,
         by_rows: false,
         pivot: Some(link),

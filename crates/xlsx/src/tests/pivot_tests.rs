@@ -116,6 +116,7 @@ fn workbook() -> Workbook {
         calculated_fields: vec![],
         values_on_rows: false,
         values_position: None,
+        cache_group: None,
     };
     // Pivot 2: table source, date grouping on two levels, show-values-as, multi-select page
     // filter and a hidden-items filter on a column field.
@@ -175,6 +176,7 @@ fn workbook() -> Workbook {
         calculated_fields: vec![],
         values_on_rows: false,
         values_position: None,
+        cache_group: None,
     };
     // Pivot 3: defaults, defined-name source, compact.
     let p3 = PivotTable {
@@ -220,7 +222,7 @@ fn pivots_round_trip() {
     let read = &back.sheet(1).unwrap().pivots;
     assert_eq!(read.len(), 3);
     for (a, b) in orig.iter().zip(read.iter()) {
-        assert_eq!(a, b, "pivot {} differs", a.name);
+        assert_eq!(a, &plain(b), "pivot {} differs", a.name);
     }
     // Report cells stay as written.
     let s = back.sheet(1).unwrap();
@@ -514,7 +516,7 @@ fn calculated_fields_round_trip() {
     let orig = &wb.sheet(1).unwrap().pivots;
     let read = &back.sheet(1).unwrap().pivots;
     for (a, b) in orig.iter().zip(read.iter()) {
-        assert_eq!(a, b, "pivot {} differs", a.name);
+        assert_eq!(a, &plain(b), "pivot {} differs", a.name);
     }
 }
 
@@ -545,7 +547,7 @@ fn values_on_rows_round_trip() {
     assert!(t2.contains("firstDataRow=\"2\" firstDataCol=\"3\""), "{t2}");
     let (back, report) = read_xlsx(&bytes).unwrap();
     assert!(report.warnings.iter().all(|w| !w.to_lowercase().contains("pivot")), "{:?}", report.warnings);
-    assert_eq!(back.sheet(1).unwrap().pivots, wb.sheet(1).unwrap().pivots);
+    assert_eq!(back.sheet(1).unwrap().pivots.iter().map(plain).collect::<Vec<_>>(), wb.sheet(1).unwrap().pivots);
 
     // After the last row field.
     wb.sheet_mut(1).unwrap().pivots[1].values_position = None;
@@ -553,7 +555,7 @@ fn values_on_rows_round_trip() {
     let t2 = String::from_utf8(unzip(&bytes).get("xl/pivotTables/pivotTable2.xml").unwrap().clone()).unwrap();
     assert_eq!(axis_xs(&t2, "rowFields").last(), Some(&-2), "{t2}");
     let (back, _) = read_xlsx(&bytes).unwrap();
-    assert_eq!(back.sheet(1).unwrap().pivots, wb.sheet(1).unwrap().pivots);
+    assert_eq!(back.sheet(1).unwrap().pivots.iter().map(plain).collect::<Vec<_>>(), wb.sheet(1).unwrap().pivots);
 
     // Σ Values in Columns is written after the last column field, its only place in the layout.
     {
@@ -589,4 +591,41 @@ fn data_on_rows_with_one_value_field_reads_without_warning() {
     assert_eq!(pt.values_position, None);
     let (back, _) = read_xlsx(&write_xlsx(&wb).unwrap()).unwrap();
     assert!(back.sheet(0).unwrap().pivots[0].values_on_rows);
+}
+
+/// WHIQ: a PivotTable read back without the cache it was read from (`cache_group`, file
+/// metadata the model it was written from did not have).
+fn plain(p: &PivotTable) -> PivotTable {
+    PivotTable { cache_group: None, ..p.clone() }
+}
+
+/// WHIQ 0.7.6 (G2): each PivotTable written with its own cache reads back in a group of its own,
+/// and two that share a cache group are written with one cache.
+#[test]
+fn pivots_in_one_cache_group_share_one_cache() {
+    let wb = workbook();
+    let back = read_xlsx(&write_xlsx(&wb).unwrap()).unwrap().0;
+    let groups: Vec<Option<u32>> = back.sheet(1).unwrap().pivots.iter().map(|p| p.cache_group).collect();
+    assert!(groups.iter().all(Option::is_some), "{groups:?}");
+    let mut uniq = groups.clone();
+    uniq.dedup();
+    assert_eq!(uniq.len(), groups.len(), "own caches: own groups {groups:?}");
+    let mut shared = wb.clone();
+    for p in shared.sheet_mut(1).unwrap().pivots.iter_mut() {
+        p.cache_group = Some(7);
+    }
+    let caches = |wb: &Workbook| unzip(&write_xlsx(wb).unwrap()).keys().filter(|k| k.starts_with("xl/pivotCache/pivotCacheDefinition")).count();
+    // A range, a table and a defined name over the same cells are three sources: three caches.
+    assert_eq!(caches(&shared), 3);
+    // On one source, one cache.
+    let first = shared.sheet(1).unwrap().pivots[0].source.clone();
+    for p in shared.sheet_mut(1).unwrap().pivots.iter_mut() {
+        p.source = first.clone();
+    }
+    assert_eq!(caches(&shared), 1, "tables on one source share one cache");
+    // Without a group each keeps its own (as GridCraft always wrote them).
+    for p in shared.sheet_mut(1).unwrap().pivots.iter_mut() {
+        p.cache_group = None;
+    }
+    assert_eq!(caches(&shared), 3);
 }

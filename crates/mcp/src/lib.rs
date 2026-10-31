@@ -38,3 +38,5 @@ pub fn control_addr(s: &str) -> String {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_v076;

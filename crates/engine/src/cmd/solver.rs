@@ -1871,7 +1871,7 @@ fn write_reports(s: &mut Session, kinds: &[ReportKind], inp: &ReportInput) -> Re
     }
     let d = s.doc()?;
     if d.wb.protected_structure {
-        return Err(EngineError::Other("The workbook is protected and cannot be changed.".into()));
+        return Err(EngineError::Other(super::STRUCTURE_LOCKED.into()));
     }
     let sh = d.wb.sheet(inp.model.sheet).ok_or(EngineError::NoDocument)?;
     let mut built = Vec::new();

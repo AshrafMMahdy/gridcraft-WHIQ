@@ -506,6 +506,9 @@ pub struct Chart {
     pub style: u32,
     pub x_title: Option<String>,
     pub y_title: Option<String>,
+    /// WHIQ: the title of the secondary value axis (combo charts with a series on it).
+    #[serde(default)]
+    pub y2_title: Option<String>,
     /// Source range when created from a selection (for Switch Row/Column).
     pub source: Option<String>,
     pub by_rows: bool,
@@ -847,6 +850,19 @@ pub struct SheetProtection {
     pub delete_rows: bool,
     pub sort: bool,
     pub autofilter: bool,
+    /// WHIQ: Edit objects (charts, shapes, pictures) is allowed (`objects="0"`). Excel's default,
+    /// and `false` here: objects are protected (`objects="1"`).
+    #[serde(default)]
+    pub edit_objects: bool,
+    /// WHIQ: Edit scenarios is allowed (`scenarios="0"`); default protected (`scenarios="1"`).
+    #[serde(default)]
+    pub edit_scenarios: bool,
+    /// WHIQ: Insert hyperlinks is allowed (`insertHyperlinks="0"`).
+    #[serde(default)]
+    pub insert_hyperlinks: bool,
+    /// WHIQ: Use PivotTable & PivotChart is allowed (`pivotTables="0"`).
+    #[serde(default)]
+    pub pivot_tables: bool,
 }
 
 /// Review › Allow Edit Ranges: cells that stay editable on a protected sheet, with or without a
@@ -1025,6 +1041,11 @@ pub struct PivotTable {
     /// Position of Σ Values among the row fields (`None` = after the last). Only used with
     /// `values_on_rows`: in Columns Σ Values always comes after the last column field.
     pub values_position: Option<usize>,
+    /// WHIQ: the PivotTables that shared one pivot cache in the file they were read from carry
+    /// the same number; they share one cache again on save while their source is the same (one
+    /// cache per PivotTable duplicated the cache Excel wrote once). `None`: its own cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_group: Option<u32>,
 }
 
 /// A calculated field: a formula over other fields (`=Sales*0.1`, `='Unit Price'*Units`). As in
@@ -1059,6 +1080,7 @@ impl Default for PivotTable {
             calculated_fields: vec![],
             values_on_rows: false,
             values_position: None,
+            cache_group: None,
         }
     }
 }

@@ -755,3 +755,23 @@ fn a_call_with_a_progress_token_gets_progress_notifications() {
     assert!(values.windows(2).all(|w| w[1] > w[0]), "progress only grows: {values:?}");
     assert!(notes.last().unwrap()["params"]["message"].as_str().unwrap().contains("sleeping"), "{:?}", notes);
 }
+
+// WHIQ 0.7.6 (G1): a large sheet picture sends progress notifications while it draws, so a
+// caller can tell a long render from a hung one.
+#[test]
+fn a_large_render_reports_its_progress() {
+    let dir = folder("render-progress");
+    let mut m = start(&dir, &[]);
+    let rows: Vec<Value> = (0..260).map(|r| json!((0..250).map(|c| json!(r * 1000 + c)).collect::<Vec<_>>())).collect();
+    let id = m.begin("tools/call", json!({"name": "build_workbook", "arguments": {"sheets": [{"name": "Big", "rows": rows}]}}));
+    assert_eq!(m.wait(&id)["result"]["isError"], false);
+    let png = dir.join("big.png");
+    let id = m.begin(
+        "tools/call",
+        json!({"name": "render_sheet", "arguments": {"sheet": "Big", "path": png.to_str().unwrap(), "scale": 1}, "_meta": {"progressToken": "r-1"}}),
+    );
+    let r = m.wait_for(&id, 600);
+    assert_eq!(r["result"]["isError"], false, "{r}");
+    let notes: Vec<&Value> = m.notifications.iter().filter(|n| n["params"]["progressToken"] == "r-1").collect();
+    assert!(notes.iter().any(|n| n["params"]["message"].as_str().unwrap_or("").contains("drawing cells")), "{:?}", notes);
+}

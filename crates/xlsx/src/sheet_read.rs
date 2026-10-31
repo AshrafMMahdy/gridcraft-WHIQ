@@ -185,6 +185,24 @@ fn read_sheet_with(cx: &mut Ctx<'_>, part: &str, name: &str, lazy: Option<&crate
                     sheet.tab_color = Some(read_color(t, &cx.palette));
                 }
                 fit_to_page = e.child("pageSetUpPr").is_some_and(|p| p.flag("fitToPage", false));
+                // WHIQ: the VBA code name, and what the model does not hold kept for the save.
+                sheet.code_name = e.attr("codeName").map(str::trim).filter(|c| !c.is_empty()).map(str::to_string);
+                let mut kept = vec![];
+                let mut keep = |slot: &str, x: String| {
+                    if !x.is_empty() {
+                        kept.push(gridcraft_model::PreservedXml { slot: slot.into(), xml: x });
+                    }
+                };
+                keep("sheetPr", crate::kept::schema_attrs(e, crate::kept::SHEET_PR_ATTRS));
+                if let Some(o) = e.child("outlinePr") {
+                    keep("outlinePr", crate::kept::schema_attrs(o, crate::kept::OUTLINE_PR_ATTRS));
+                }
+                if let Some(o) = e.child("pageSetUpPr") {
+                    keep("pageSetUpPr", crate::kept::schema_attrs(o, crate::kept::PAGE_SETUP_PR_ATTRS));
+                }
+                if !kept.is_empty() {
+                    sheet.preserved = Some(std::sync::Arc::new(gridcraft_model::Preserved { elements: kept, ..Default::default() }));
+                }
             }
             "sheetViews" => read_views(e, &mut sheet),
             "sheetFormatPr" => {
@@ -289,6 +307,11 @@ fn read_sheet_with(cx: &mut Ctx<'_>, part: &str, name: &str, lazy: Option<&crate
                     delete_rows: !e.flag("deleteRows", true),
                     sort: !e.flag("sort", true),
                     autofilter: !e.flag("autoFilter", true),
+                    // WHIQ: objects / scenarios default to unprotected (0) in the schema.
+                    edit_objects: !e.flag("objects", false),
+                    edit_scenarios: !e.flag("scenarios", false),
+                    insert_hyperlinks: !e.flag("insertHyperlinks", true),
+                    pivot_tables: !e.flag("pivotTables", true),
                 });
             }
             "drawing" => {

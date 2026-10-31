@@ -401,3 +401,17 @@ fn formulas_longer_than_excel_allows_are_refused() {
     assert!(text.len() > crate::MAX_FORMULA_LEN);
     assert!(parse(&text).is_ok());
 }
+
+/// WHIQ 0.7.6: a name starts with a letter, `_` or `\` (a reference with `$`); `.F35` and `?x`
+/// are syntax errors at their first character, while `.5` is still a number.
+#[test]
+fn a_word_cannot_start_with_a_dot_or_a_question_mark() {
+    for bad in [".F35", "SUM(.A1)", "?x", "1+.B2"] {
+        assert!(parse(bad).is_err(), "{bad} parsed");
+    }
+    assert_eq!(parse(".F35").unwrap_err().pos, 0);
+    assert_eq!(parse("1+.B2").unwrap_err().pos, 2);
+    for good in [".5+1", "_x1", "\\name", "$A$1", "a.b", "x?", "Sheet1!A1.:B9"] {
+        assert!(parse(good).is_ok(), "{good}: {:?}", parse(good));
+    }
+}

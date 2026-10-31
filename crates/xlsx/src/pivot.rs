@@ -292,7 +292,24 @@ impl PivotWriter {
             let (n, cache) = match self.shared.get(&(si, idx)) {
                 Some((n, c)) => (*n, c.clone()),
                 None => {
-                    let group: Vec<(usize, usize)> = out.slicer_plan.pivot_group(si, idx);
+                    let mut group: Vec<(usize, usize)> = out.slicer_plan.pivot_group(si, idx);
+                    // WHIQ: and the PivotTables that shared this one's cache in the file, while
+                    // their source is still the same.
+                    if let Some(g) = pt.cache_group {
+                        let key = source_key(wb, pt, si);
+                        for (s2, sh2) in wb.sheets.iter().enumerate() {
+                            for (i2, p2) in sh2.pivots.iter().enumerate() {
+                                if p2.cache_group == Some(g)
+                                    && !group.contains(&(s2, i2))
+                                    && key.is_some()
+                                    && p2.source.trim().eq_ignore_ascii_case(pt.source.trim())
+                                    && source_key(wb, p2, s2) == key
+                                {
+                                    group.push((s2, i2));
+                                }
+                            }
+                        }
+                    }
                     let pts: Vec<&PivotTable> = group.iter().filter_map(|(s, i)| wb.sheet(*s).and_then(|sh| sh.pivots.get(*i))).collect();
                     let fields = out.slicer_plan.slicer_fields(&group);
                     let Some(mut cache) = build_cache(wb, &pts, si, &fields) else { continue };
@@ -1164,6 +1181,8 @@ pub struct CachesIn {
     by_id: HashMap<u32, String>,
     parsed: HashMap<String, Option<CacheIn>>,
     next_id: u32,
+    /// WHIQ: cache part → the number its PivotTables share ([`PivotTable::cache_group`]).
+    groups: HashMap<String, u32>,
 }
 
 impl CachesIn {
@@ -1178,7 +1197,7 @@ impl CachesIn {
                 }
             }
         }
-        CachesIn { by_id, parsed: HashMap::new(), next_id: 1 }
+        CachesIn { by_id, parsed: HashMap::new(), next_id: 1, groups: HashMap::new() }
     }
 }
 
@@ -1288,8 +1307,12 @@ pub fn read_pivots(cx: &mut Ctx<'_>, caches: &mut CachesIn, sheet_part: &str, sh
             }
         };
         let Some(cache) = cache else { continue };
-        if let Some(pt) = read_table(cx, &x, &cache, caches.next_id) {
+        // WHIQ: PivotTables reading one cache part share it again on save.
+        let n = caches.groups.len() as u32 + 1;
+        let group = *caches.groups.entry(cache_part.clone()).or_insert(n);
+        if let Some(mut pt) = read_table(cx, &x, &cache, caches.next_id) {
             caches.next_id = caches.next_id.saturating_add(1);
+            pt.cache_group = Some(group);
             out.push(pt);
         }
     }

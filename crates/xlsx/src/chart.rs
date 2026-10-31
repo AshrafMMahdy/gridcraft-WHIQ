@@ -244,8 +244,15 @@ pub fn read_chart(root: &El) -> Option<Chart> {
         let y = val_axes.iter().find(|a| matches!(a.child_val("axPos"), Some("l") | Some("r"))).copied();
         (x, y)
     } else {
-        (cat_ax, val_axes.first().copied())
+        // WHIQ: the primary value axis is the one the first group plots on; a value axis of a
+        // group on other axes is the secondary one.
+        let primary = val_axes.iter().find(|a| a.child_val("axId").is_some_and(|id| first_axes.iter().any(|f| f == id))).copied();
+        (cat_ax, primary.or_else(|| val_axes.first().copied()))
     };
+    let secondary_ids: Vec<String> =
+        groups.iter().map(|(g, _)| axis_ids(g)).filter(|ids| *ids != first_axes).flatten().filter(|id| !first_axes.contains(id)).collect();
+    let y2_ax =
+        if scatter { None } else { val_axes.iter().find(|a| a.child_val("axId").is_some_and(|id| secondary_ids.iter().any(|s| s == id))).copied() };
     let legend = match chart.child("legend") {
         None => LegendPos::None,
         Some(l) => match l.child_val("legendPos").unwrap_or("r") {
@@ -267,6 +274,7 @@ pub fn read_chart(root: &El) -> Option<Chart> {
         style: root.child_val("style").and_then(|v| v.parse().ok()).unwrap_or(2),
         x_title: x_ax.and_then(|a| a.child("title")).and_then(rich_title),
         y_title: y_ax.and_then(|a| a.child("title")).and_then(rich_title),
+        y2_title: y2_ax.and_then(|a| a.child("title")).and_then(rich_title),
         source: None,
         by_rows: false,
         pivot: root.path(&["pivotSource", "name"]).map(|n| n.text.trim().to_string()).filter(|n| !n.is_empty()),
@@ -817,7 +825,16 @@ pub fn write_chart(wb: &Workbook, si: usize, ch: &Chart) -> String {
     }
     if secondary.is_some() {
         s.push_str(&axis_xml(&Ax { cat: true, id: 3, cross: 4, pos: "b", delete: true, grid: false, title: None, crosses_max: false }));
-        s.push_str(&axis_xml(&Ax { cat: false, id: 4, cross: 3, pos: "r", delete: false, grid: false, title: None, crosses_max: true }));
+        s.push_str(&axis_xml(&Ax {
+            cat: false,
+            id: 4,
+            cross: 3,
+            pos: "r",
+            delete: false,
+            grid: false,
+            title: ch.y2_title.as_deref(),
+            crosses_max: true,
+        }));
     }
     s.push_str("</c:plotArea>");
     let pos = match ch.legend {

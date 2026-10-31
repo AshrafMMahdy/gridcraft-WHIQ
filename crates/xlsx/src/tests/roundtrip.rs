@@ -395,6 +395,7 @@ fn sample() -> Workbook {
         style: 2,
         x_title: Some("Region".into()),
         y_title: Some("Amount".into()),
+        y2_title: None,
         source: None,
         by_rows: false,
         pivot: None,

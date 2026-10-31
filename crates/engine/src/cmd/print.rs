@@ -1078,6 +1078,8 @@ struct Block<'a> {
     ys: Vec<f32>,
     k: f32,
     scale: f32,
+    /// WHIQ: report progress cell by cell (a sheet picture; a PDF reports its pages).
+    progress: bool,
 }
 
 impl Block<'_> {
@@ -1178,11 +1180,24 @@ fn draw_block(pg: &mut dyn Canvas, b: &Block, gridlines: bool, cf: &mut Option<c
             && sh.style_id(*c) == StyleId::DEFAULT
             && (sh.tables.is_empty() || sh.table_at(*c).is_none())
     };
+    // WHIQ: a large picture says how far it is (the liveness rule): looks, fills, borders, text.
+    let todo = cells.len() as u64 * 4;
+    let mut done = 0u64;
+    let tick = |n: &mut u64| {
+        *n += 1;
+        if b.progress && (*n).is_multiple_of(512) {
+            gridcraft_core::cancel::checkpoint();
+            gridcraft_core::progress::step_in("drawing cells", *n, todo);
+        }
+    };
     let looks: Vec<(CellRef, Look)> = cells
         .iter()
         .filter(|c| !skip(c))
         .chain(merges.iter().map(|m| &m.start))
-        .map(|c| (*c, cell_look(b.wb, b.si, sh, *c, cf)))
+        .map(|c| {
+            tick(&mut done);
+            (*c, cell_look(b.wb, b.si, sh, *c, cf))
+        })
         .filter(|(c, l)| {
             l.fill.is_some()
                 || l.cf.is_some()
@@ -1204,7 +1219,9 @@ fn draw_block(pg: &mut dyn Canvas, b: &Block, gridlines: bool, cf: &mut Option<c
         }
     };
     // Fills (merged blocks hide the gridlines inside them).
+    done = done.max(cells.len() as u64);
     for (c, l) in &looks {
+        tick(&mut done);
         let (x, y, w, h, merged) = rect_of(*c);
         if w <= 0.0 || h <= 0.0 {
             continue;
@@ -1224,7 +1241,9 @@ fn draw_block(pg: &mut dyn Canvas, b: &Block, gridlines: bool, cf: &mut Option<c
         }
     }
     // Borders.
+    done = done.max(cells.len() as u64 * 2);
     for (c, l) in &looks {
+        tick(&mut done);
         let (x, y, w, h, merged) = rect_of(*c);
         if w <= 0.0 || h <= 0.0 {
             continue;
@@ -1245,7 +1264,9 @@ fn draw_block(pg: &mut dyn Canvas, b: &Block, gridlines: bool, cf: &mut Option<c
         draw_border(pg, &bd.diag_up, b.wb, x, y + h, x + w, y, b.k);
     }
     // Text.
+    done = done.max(cells.len() as u64 * 3);
     for (c, l) in &looks {
+        tick(&mut done);
         let (x, y, w, h, merged) = rect_of(*c);
         if w <= 0.0 || h <= 0.0 {
             continue;
@@ -1738,7 +1759,7 @@ fn make_block<'a>(wb: &'a Workbook, si: usize, sh: &'a Sheet, rows: (u32, u32), 
         acc += sh.row_height(r) * k;
         ys.push(acc);
     }
-    Block { wb, si, sh, rows, cols, xs, ys, k, scale: lay.scale }
+    Block { wb, si, sh, rows, cols, xs, ys, k, scale: lay.scale, progress: false }
 }
 
 /// Segments of a page along one axis: repeated titles (before the band) then the band.
@@ -1975,7 +1996,18 @@ pub fn render_png(wb: &Workbook, si: usize, range: Option<RangeRef>, o: &PngOpti
         acc += sh.row_height(r) * k;
         ys.push(acc);
     }
-    let b = Block { wb, si, sh, rows: (range.start.row, range.end.row), cols: (range.start.col, range.end.col), xs, ys, k, scale: k * 96.0 / 72.0 };
+    let b = Block {
+        wb,
+        si,
+        sh,
+        rows: (range.start.row, range.end.row),
+        cols: (range.start.col, range.end.col),
+        xs,
+        ys,
+        k,
+        scale: k * 96.0 / 72.0,
+        progress: true,
+    };
     let mut cf = if sh.cond_formats.is_empty() { None } else { Some(crate::cf::CfCache::new()) };
     let axis = w as f32;
     {

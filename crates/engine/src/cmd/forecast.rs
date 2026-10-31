@@ -195,7 +195,7 @@ fn forecast_sheet(s: &mut Session, p: &Json) -> Result<Json> {
     }
     let d = s.doc()?;
     if d.wb.protected_structure {
-        return Err(EngineError::Other("The workbook is protected and cannot be changed.".into()));
+        return Err(EngineError::Other(super::STRUCTURE_LOCKED.into()));
     }
     let sys = d.wb.date_system;
     let sh = d.wb.sheet(si).ok_or(EngineError::NoDocument)?;
@@ -430,6 +430,7 @@ fn forecast_sheet(s: &mut Session, p: &Json) -> Result<Json> {
             style: 1,
             x_title: None,
             y_title: None,
+            y2_title: None,
             source: None,
             by_rows: false,
             pivot: None,

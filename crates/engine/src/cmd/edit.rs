@@ -118,10 +118,154 @@ pub fn specs() -> Vec<CommandSpec> {
 
 // ---------------------------------------------------------------- entry
 
+/// WHIQ: what entering a formula did besides storing it: the text it was corrected to (missing
+/// closing parentheses added, as Excel does) and warnings (a function nobody knows).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct EntryNotes {
+    pub corrected_to: Option<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Whether typed input is a formula (`=…`, or `+`/`-` followed by a name or a parenthesis).
+fn is_formula_input(input: &str) -> bool {
+    input.starts_with('=')
+        || (input.len() > 1
+            && (input.starts_with('+') || input.starts_with('-'))
+            && gridcraft_core::parse::parse_number_text(input).is_none()
+            && input.chars().nth(1).is_some_and(|c| c.is_ascii_alphabetic() || c == '('))
+}
+
+/// WHIQ: parses a formula as typed. Excel closes the parentheses left open at the end of a
+/// formula: only those are added, and only when the formula stops early (an "unexpected end"
+/// error); any other error is reported where it is, with its position (1-based, counted in the
+/// text as typed, `=` included). `Ok` carries the corrected body when parentheses were added.
+pub(crate) fn parse_entry(input: &str) -> std::result::Result<(gridcraft_formula::Expr, Option<String>), String> {
+    let body = input.strip_prefix('=').unwrap_or(input);
+    let lead = input.len() - body.len();
+    let err = match gridcraft_formula::parse(body) {
+        Ok(e) => return Ok((e, None)),
+        Err(e) => e,
+    };
+    if err.pos >= body.len()
+        && let Ok(toks) = gridcraft_formula::lexer::tokenize(body)
+    {
+        use gridcraft_formula::lexer::Tok;
+        let open: i64 = toks
+            .iter()
+            .map(|t| match t.tok {
+                Tok::LParen | Tok::Func(_) => 1,
+                Tok::RParen => -1,
+                _ => 0,
+            })
+            .sum();
+        if (1..=64).contains(&open) {
+            let fixed = format!("{body}{}", ")".repeat(open as usize));
+            if let Ok(e) = gridcraft_formula::parse(&fixed) {
+                return Ok((e, Some(fixed)));
+            }
+        }
+    }
+    let at = lead + body.get(..err.pos.min(body.len())).map_or(0, |t| t.chars().count()) + 1;
+    Err(format!("{} at character {at}", err.msg))
+}
+
+/// WHIQ: the syntax or argument-count error of formula input (`None`: not a formula, or one that
+/// would be stored), as [`input_to_cell`] reports it but without the cell.
+pub(crate) fn entry_error(input: &str) -> Option<String> {
+    if !is_formula_input(input) {
+        return None;
+    }
+    match parse_entry(input) {
+        Err(m) => Some(m),
+        Ok((e, _)) => check_arg_counts(&e).err().map(|e| e.to_string()),
+    }
+}
+
+/// `There's a problem with this formula in Sheet1!B2 (=SUM(1,,): …`, the input shortened.
+fn formula_problem(wb: &gridcraft_model::Workbook, sheet: usize, at: CellRef, input: &str, msg: &str) -> EngineError {
+    let name = wb.sheet(sheet).map(|s| gridcraft_formula::quote_sheet(&s.name)).unwrap_or_default();
+    let shown: String = input.chars().take(200).collect();
+    let more = if input.chars().count() > 200 { "…" } else { "" };
+    EngineError::Other(format!("There's a problem with this formula in {name}!{} ({shown}{more}): {msg}", at.a1()))
+}
+
+/// Levenshtein distance, bounded (`None` past `max`).
+fn distance(a: &str, b: &str, max: usize) -> Option<usize> {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.len().abs_diff(b.len()) > max || a.len() > 64 || b.len() > 64 {
+        return None;
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1; b.len() + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let sub = prev.get(j).copied().unwrap_or(usize::MAX).saturating_add(usize::from(ca != cb));
+            let del = prev.get(j + 1).copied().unwrap_or(usize::MAX).saturating_add(1);
+            let ins = cur.get(j).copied().unwrap_or(usize::MAX).saturating_add(1);
+            if let Some(c) = cur.get_mut(j + 1) {
+                *c = sub.min(del).min(ins);
+            }
+        }
+        prev = cur;
+    }
+    prev.last().copied().filter(|d| *d <= max)
+}
+
+/// WHIQ: the built-in function whose name is closest to `name` (`VLOKUP` → `VLOOKUP`).
+pub(crate) fn closest_function(name: &str) -> Option<&'static str> {
+    let up = name.to_ascii_uppercase();
+    let max = (up.chars().count() / 3).clamp(1, 3);
+    let names = gridcraft_functions::all().iter().map(|f| f.name).chain(gridcraft_calc::SPECIAL_FUNCTIONS.iter().copied());
+    let mut best: Option<(usize, &'static str)> = None;
+    for n in names {
+        if let Some(d) = distance(&up, n, max)
+            && best.is_none_or(|(bd, bn)| d < bd || (d == bd && n < bn))
+        {
+            best = Some((d, n));
+        }
+    }
+    best.map(|(_, n)| n)
+}
+
+/// WHIQ: warnings for the functions in `expr` that are neither built in nor a LAMBDA name of the
+/// workbook (`_xludf.` calls are user-defined on purpose and not named).
+pub(crate) fn unknown_function_warnings(expr: &gridcraft_formula::Expr, wb: &gridcraft_model::Workbook, sheet: usize, at: &str) -> Vec<String> {
+    let mut seen: Vec<String> = vec![];
+    expr.walk(&mut |e| {
+        if let gridcraft_formula::Expr::Call(name, _) = e
+            && !name.starts_with("_xludf.")
+            && !gridcraft_calc::is_known_function(name)
+            && wb.name(name, sheet).is_none()
+            && !seen.iter().any(|x| x.eq_ignore_ascii_case(name))
+            && seen.len() < 8
+        {
+            seen.push(name.clone());
+        }
+    });
+    seen.iter()
+        .map(|n| match closest_function(n) {
+            Some(c) => format!("{at}: {n} is not a function Excel knows, so the cell shows #NAME?; did you mean {c}?"),
+            None => format!("{at}: {n} is not a function Excel knows, so the cell shows #NAME? (list_functions finds the right name)"),
+        })
+        .collect()
+}
+
 /// What typing `input` into a cell produces (constant or formula, plus an automatic number
 /// format). Inherits the destination's cell, row or column style, including its number
 /// format, before parsing. Errors when the formula can't be parsed.
 pub(crate) fn input_to_cell(input: &str, sheet: usize, at: CellRef, wb: &mut gridcraft_model::Workbook) -> Result<Option<Cell>> {
+    input_to_cell_noted(input, sheet, at, wb, &mut EntryNotes::default())
+}
+
+/// [`input_to_cell`] that also says what the entry did (`notes`).
+pub(crate) fn input_to_cell_noted(
+    input: &str,
+    sheet: usize,
+    at: CellRef,
+    wb: &mut gridcraft_model::Workbook,
+    notes: &mut EntryNotes,
+) -> Result<Option<Cell>> {
     let style = wb.sheet(sheet).map(|sh| sh.style_id(at)).unwrap_or_default();
     if input.is_empty() {
         let c = Cell { value: Value::Empty, formula: None, style };
@@ -131,26 +275,14 @@ pub(crate) fn input_to_cell(input: &str, sheet: usize, at: CellRef, wb: &mut gri
     if fmt_is_text {
         return Ok(Some(Cell { value: Value::text(input), formula: None, style }));
     }
-    let is_formula = input.starts_with('=')
-        || (input.len() > 1
-            && (input.starts_with('+') || input.starts_with('-'))
-            && gridcraft_core::parse::parse_number_text(input).is_none()
-            && input.chars().nth(1).is_some_and(|c| c.is_ascii_alphabetic() || c == '('));
-    if is_formula {
-        let body = input.strip_prefix('=').unwrap_or(input);
-        // Excel closes missing parentheses for you.
-        let mut text = body.to_string();
-        let mut parsed = gridcraft_formula::parse(&text);
-        for _ in 0..8 {
-            if parsed.is_ok() {
-                break;
-            }
-            text.push(')');
-            parsed = gridcraft_formula::parse(&text);
-        }
-        let expr = parsed.map_err(|e| EngineError::Other(format!("There's a problem with this formula: {e}")))?;
+    if is_formula_input(input) {
+        // Excel closes missing parentheses at the end for you; other errors are reported.
+        let (expr, fixed) = parse_entry(input).map_err(|m| formula_problem(wb, sheet, at, input, &m))?;
+        notes.corrected_to = fixed.map(|f| format!("={f}"));
+        let name = wb.sheet(sheet).map(|s| format!("{}!{}", gridcraft_formula::quote_sheet(&s.name), at.a1())).unwrap_or_else(|| at.a1());
+        notes.warnings.extend(unknown_function_warnings(&expr, wb, sheet, &name));
         let expr = wb.name_call_case(expr);
-        check_arg_counts(&expr)?;
+        check_arg_counts(&expr).map_err(|e| formula_problem(wb, sheet, at, input, &e.to_string()))?;
         let mut cell = Cell::formula(Formula::from_expr(expr));
         cell.style = style;
         // Formulas whose result is a date/time get a format from functions like TODAY().
@@ -231,6 +363,7 @@ fn cell_set(s: &mut Session, p: &Json) -> Result<Json> {
         return Err(EngineError::Other(m));
     }
     let active_sheet = s.doc()?.wb.active_sheet;
+    let mut notes = EntryNotes::default();
     edit(s, |cx| {
         if array {
             // Legacy Ctrl+Shift+Enter array formula over the selection, when the selection holds
@@ -241,7 +374,7 @@ fn cell_set(s: &mut Session, p: &Json) -> Result<Json> {
             if !range.is_single() && cx.wb.sheet(sheet).is_some_and(|sh| sh.tables.iter().any(|t| t.range.intersects(&range))) {
                 return Err(EngineError::Other("Multi-cell array formulas aren't allowed in tables.".into()));
             }
-            let mut cell = input_to_cell(&input, sheet, range.start, &mut cx.wb)?.unwrap_or_default();
+            let mut cell = input_to_cell_noted(&input, sheet, range.start, &mut cx.wb, &mut notes)?.unwrap_or_default();
             if let Some(f) = cell.formula.as_mut() {
                 std::sync::Arc::make_mut(f).array = Some(range);
             }
@@ -257,7 +390,7 @@ fn cell_set(s: &mut Session, p: &Json) -> Result<Json> {
             cx.touch(sheet, range.start);
             return Ok(Json::Null);
         }
-        let cell = input_to_cell(&input, sheet, at, &mut cx.wb)?;
+        let cell = input_to_cell_noted(&input, sheet, at, &mut cx.wb, &mut notes)?;
         let sh = cx.sheet_mut(sheet)?;
         match cell {
             Some(c) => sh.set_cell(at, c),
@@ -269,7 +402,15 @@ fn cell_set(s: &mut Session, p: &Json) -> Result<Json> {
         Ok(Json::Null)
     })?;
     let v = s.doc()?.wb.sheet(sheet).map(|sh| sh.value(at)).unwrap_or_default();
-    Ok(json!({"cell": at.a1(), "value": v.display()}))
+    let mut out = json!({"cell": at.a1(), "value": v.display()});
+    // WHIQ: what the entry did to the formula.
+    if let Some(c) = notes.corrected_to {
+        out["corrected_to"] = json!(c);
+    }
+    if !notes.warnings.is_empty() {
+        out["warnings"] = json!(notes.warnings);
+    }
+    Ok(out)
 }
 
 pub(crate) fn json_to_input(v: &Json) -> String {
@@ -296,6 +437,9 @@ fn range_set_values(s: &mut Session, p: &Json) -> Result<Json> {
         return Err(bad("range.setValues", "too many rows"));
     }
     let mut count = 0;
+    let mut corrected: Vec<Json> = vec![];
+    let mut warnings: Vec<String> = vec![];
+    let (mut more_corrected, mut more_warnings) = (0usize, 0usize);
     edit(s, |cx| {
         for (ri, row) in rows.iter().enumerate() {
             // WHIQ: a safe point for `cancel` (the runner restores the workbook).
@@ -317,7 +461,25 @@ fn range_set_values(s: &mut Session, p: &Json) -> Result<Json> {
                     Json::Bool(b) => {
                         Some(Cell { value: Value::Bool(*b), formula: None, style: cx.wb.sheet(sheet).map(|sh| sh.style_id(at)).unwrap_or_default() })
                     }
-                    _ => input_to_cell(&input, sheet, at, &mut cx.wb)?,
+                    _ => {
+                        let mut notes = EntryNotes::default();
+                        let cell = input_to_cell_noted(&input, sheet, at, &mut cx.wb, &mut notes)?;
+                        if let Some(c) = notes.corrected_to {
+                            if corrected.len() < 100 {
+                                corrected.push(json!({"cell": at.a1(), "corrected_to": c}));
+                            } else {
+                                more_corrected += 1;
+                            }
+                        }
+                        for w in notes.warnings {
+                            if warnings.len() < 50 {
+                                warnings.push(w);
+                            } else {
+                                more_warnings += 1;
+                            }
+                        }
+                        cell
+                    }
                 };
                 let sh = cx.sheet_mut(sheet)?;
                 match cell {
@@ -332,7 +494,21 @@ fn range_set_values(s: &mut Session, p: &Json) -> Result<Json> {
         }
         Ok(())
     })?;
-    Ok(json!({"cells": count}))
+    let mut out = json!({"cells": count});
+    // WHIQ: formulas the entry corrected, and functions nobody knows.
+    if !corrected.is_empty() {
+        out["corrected"] = json!(corrected);
+        if more_corrected > 0 {
+            out["corrected_more"] = json!(more_corrected);
+        }
+    }
+    if more_warnings > 0 {
+        warnings.push(format!("{more_warnings} more cells call functions Excel does not know"));
+    }
+    if !warnings.is_empty() {
+        out["warnings"] = json!(warnings);
+    }
+    Ok(out)
 }
 
 fn range_fill(s: &mut Session, p: &Json) -> Result<Json> {

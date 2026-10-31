@@ -14,7 +14,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Protect Sheet…",
             ["Review", "Protect"],
             None,
-            "{password?, formatCells?, formatColumns?, formatRows?, insertRows?, insertColumns?, deleteRows?, deleteColumns?, sort?, autofilter?}",
+            "{password?, formatCells?, formatColumns?, formatRows?, insertRows?, insertColumns?, deleteRows?, deleteColumns?, sort?, autofilter?, insertHyperlinks?, pivotTables?, editObjects?, editScenarios?}",
             has_doc,
             protect_sheet
         ),
@@ -153,6 +153,10 @@ fn protect_sheet(s: &mut Session, p: &Json) -> Result<Json> {
         delete_rows: b("deleteRows"),
         sort: b("sort"),
         autofilter: b("autofilter"),
+        edit_objects: b("editObjects"),
+        edit_scenarios: b("editScenarios"),
+        insert_hyperlinks: b("insertHyperlinks"),
+        pivot_tables: b("pivotTables"),
     };
     let d = s.doc()?;
     let what = d.wb.sheet(sheet).map(|sh| sh.name.clone()).unwrap_or_default();

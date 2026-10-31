@@ -161,7 +161,12 @@ fn fill(s: &mut Session, p: &Json, sheets: &[Json], names: &[String]) -> Result<
         d.undo.clear();
         d.redo.clear();
     }
+    // WHIQ: the sheets' formula warnings, together.
+    let warnings: Vec<Json> = out_sheets.iter().flat_map(|sh| sh["warnings"].as_array().cloned().unwrap_or_default()).collect();
     let mut out = json!({"sheets": out_sheets, "charts": charts, "recalculated": calc["cells"]});
+    if !warnings.is_empty() {
+        out["warnings"] = json!(warnings);
+    }
     if let Some(path) = str_param(p, "path").filter(|x| !x.is_empty()) {
         let r = run(s, "save", "file.save", json!({"path": path}))?;
         out["path"] = r["path"].clone();
@@ -222,8 +227,25 @@ fn fill_sheet(s: &mut Session, spec: &Json, top: &Json, name: &str, charts: &mut
     let first_data = start.row + u32::from(header.is_some());
     let last_row = start.row + (values.len() as u32).saturating_sub(1);
     let block = (width > 0 && !values.is_empty()).then(|| RangeRef::new(start, CellRef::new(last_row, start.col + width.saturating_sub(1))));
+    // WHIQ: a formula that would be refused names its row of the spec and its cell.
+    for (ri, row) in values.iter().enumerate() {
+        for (ci, v) in row.as_array().into_iter().flatten().enumerate() {
+            let Some(t) = v.as_str() else { continue };
+            if let Some(m) = super::edit::entry_error(t) {
+                let at = CellRef::new(start.row + ri as u32, start.col + ci as u32);
+                let which = match (header.is_some(), ri) {
+                    (true, 0) => "the header".to_string(),
+                    (true, r) => format!("row {r}"),
+                    (false, r) => format!("row {}", r + 1),
+                };
+                let shown: String = t.chars().take(200).collect();
+                return Err(bad(CMD, step(&format!("{which} (cell {}): There's a problem with this formula ({shown}): {m}", at.a1()))));
+            }
+        }
+    }
+    let mut written = Json::Null;
     if !values.is_empty() {
-        run(s, &step("values"), "range.setValues", json!({"range": format!("{q}{}", start.a1()), "values": values}))?;
+        written = run(s, &step("values"), "range.setValues", json!({"range": format!("{q}{}", start.a1()), "values": values}))?;
     }
     // Dates written as dates show as dates (before the column formats, which win).
     looks::apply(s, &date_looks, max_cells(), &step)?;
@@ -404,7 +426,13 @@ fn fill_sheet(s: &mut Session, spec: &Json, top: &Json, name: &str, charts: &mut
         *charts += 1;
     }
     run(s, &step("selection"), "selection.set", json!({"range": format!("{q}{}", start.a1())}))?;
-    Ok(json!({"name": name, "range": block.map(|b| b.a1()), "rows": rows.len(), "columns": width}))
+    let mut out = json!({"name": name, "range": block.map(|b| b.a1()), "rows": rows.len(), "columns": width});
+    for k in ["corrected", "warnings"] {
+        if let Some(x) = written.get(k) {
+            out[k] = x.clone();
+        }
+    }
+    Ok(out)
 }
 
 /// WHIQ: how a sheet's string cells are read.
@@ -802,6 +830,7 @@ fn add_chart(s: &mut Session, c: &Json, sheet: &str, block: Option<RangeRef>, ha
                 style: 1,
                 x_title: None,
                 y_title: None,
+                y2_title: None,
                 source: None,
                 by_rows: false,
                 pivot: None,
@@ -822,6 +851,7 @@ fn add_chart(s: &mut Session, c: &Json, sheet: &str, block: Option<RangeRef>, ha
     }
     chart.x_title = str_param(c, "x_title").or(str_param(c, "xTitle")).map(str::to_string);
     chart.y_title = str_param(c, "y_title").or(str_param(c, "yTitle")).map(str::to_string);
+    chart.y2_title = str_param(c, "y2_title").or(str_param(c, "y2Title")).map(str::to_string);
     if let Some(l) = str_param(c, "legend") {
         chart.legend = match l {
             "none" => LegendPos::None,

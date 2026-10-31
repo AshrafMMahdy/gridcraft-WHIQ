@@ -515,7 +515,8 @@ impl KeptReader {
                 cx.warn(format!("sheet \"{name}\": {} was dropped: {why}", kind(&r.rel_type)));
             }
         }
-        if rels.iter().any(|r| is_kind(r, SHEET_ELEMENT_KINDS)) {
+        // WHIQ: a VML drawing alone can hold old-style form controls (a button with a macro).
+        if rels.iter().any(|r| is_kind(r, SHEET_ELEMENT_KINDS) || is_kind(r, &["vmlDrawing"])) {
             self.sheet_elements(cx, part, name, &rels, &mut p, &mut seen);
         }
         (!p.is_empty()).then(|| Arc::new(p))
@@ -573,8 +574,29 @@ impl KeptReader {
         }
         if p.elements.iter().any(|e| e.slot == "oleObjects" || e.slot == "controls") {
             cx.warn(format!("sheet \"{name}\": embedded objects and form controls are not shown; they are kept for saving"));
-        } else {
-            p.vml = None;
+            return;
+        }
+        p.vml = None;
+        // WHIQ: old-style form controls live in the VML drawing alone (no <controls>): a button
+        // and its macro (`FmlaMacro`), check boxes, drop-downs. The drawing is kept when it holds
+        // any shape other than a note (GridCraft writes the notes).
+        if scan.legacy_drawing.is_some() {
+            match self.vml(cx, rels, scan.legacy_drawing.as_deref(), seen) {
+                Ok((vml, parts)) if !shape_spans(&String::from_utf8_lossy(&vml.data)).is_empty() => {
+                    let kinds = vml_object_types(&String::from_utf8_lossy(&vml.data));
+                    p.parts.extend(parts);
+                    p.vml = Some(vml);
+                    cx.warn(format!(
+                        "sheet \"{name}\": form controls ({}) are not shown; they are kept for saving, with the macros they run",
+                        kinds.join(", ")
+                    ));
+                }
+                // Notes only: GridCraft writes them; what reading the drawing cost is given back.
+                Ok((vml, _)) => self.budget = self.budget.saturating_add(vml.data.len()),
+                // A sheet with notes has a VML drawing for them: say nothing about controls then.
+                Err(_) if rels.iter().any(|r| is_kind(r, &["comments"])) => {}
+                Err(why) => cx.warn(format!("sheet \"{name}\": form controls in the VML drawing were dropped: {why}")),
+            }
         }
     }
 
@@ -747,6 +769,24 @@ fn shape_spans(vml: &str) -> Vec<(usize, usize)> {
         from = end;
     }
     spans
+}
+
+/// The `ObjectType`s of the shapes in VML text (`Button`, `Checkbox`…), each once.
+fn vml_object_types(vml: &str) -> Vec<String> {
+    let mut out: Vec<String> = vec![];
+    for (a, b) in shape_spans(vml) {
+        let shape = vml.get(a..b).unwrap_or("");
+        let t = shape
+            .find("ObjectType=\"")
+            .and_then(|i| shape.get(i + "ObjectType=\"".len()..))
+            .and_then(|r| r.split('"').next())
+            .unwrap_or("shape")
+            .to_string();
+        if !out.contains(&t) && out.len() < 8 {
+            out.push(t);
+        }
+    }
+    out
 }
 
 /// VML without its note shapes (`ObjectType="Note"`).

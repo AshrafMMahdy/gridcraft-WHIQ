@@ -132,6 +132,7 @@ pub fn read_chartex(root: &El) -> Option<Chart> {
         style: 2,
         x_title: axis_title("0"),
         y_title: axis_title("1"),
+        y2_title: None,
         source: None,
         by_rows: false,
         pivot: None,

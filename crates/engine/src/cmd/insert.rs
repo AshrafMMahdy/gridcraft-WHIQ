@@ -63,7 +63,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Insert Chart",
             ["Insert", "Charts"],
             None,
-            "{range?, type?: column|bar|line|pie|doughnut|area|scatter|bubble|radar|combo|histogram|waterfall|funnel|treemap|sunburst|boxWhisker|stock, subtype?: clustered|stacked|stacked100|markers|lines, title?, at?: \"H2\", width?, height?, scatter only: line?: bool, markers?: bool, lineWidth?: pt, color?: \"#RRGGBB\"}",
+            "{range?, type?: column|bar|line|pie|doughnut|area|scatter|bubble|radar|combo|histogram|waterfall|funnel|treemap|sunburst|boxWhisker|stock, subtype?: clustered|stacked|stacked100|markers|lines, title?, xTitle?, yTitle?, y2Title?, series?: [{type?, secondary?, name?, color?}] (by series order; a secondary series makes a dual-axis combo), at?: \"H2\", width?, height?, scatter only: line?: bool, markers?: bool, lineWidth?: pt, color?: \"#RRGGBB\"}",
             has_doc,
             insert_chart
         ),
@@ -90,9 +90,18 @@ pub fn specs() -> Vec<CommandSpec> {
             "Chart Properties",
             ["Chart Design"],
             None,
-            "{chart?: id, type?, title?, legend?: none|bottom|top|left|right, dataLabels?, gridlines?, style?, xTitle?, yTitle?, at?, width?, height?, dx?, dy?}",
+            "{chart?: id, sheet?, type?, title?, legend?: none|bottom|top|left|right, dataLabels?, gridlines?, style?, xTitle?, yTitle?, y2Title? (secondary axis), at?, width?, height?, dx?, dy?}",
             has_doc,
             chart_set
+        ),
+        cmd!(
+            "chart.setSeries",
+            "Format Data Series",
+            ["Chart Design", "Type"],
+            None,
+            "{chart?: id, sheet?, series: 1-based number, type?: column|bar|line|area|scatter, subtype?, secondary?: bool (plot on the secondary axis), name?, values?, categories?, color?: \"#RRGGBB\"} (a series of its own type or on the secondary axis makes the chart a combo)",
+            has_doc,
+            chart_set_series
         ),
         cmd!("chart.switchRowColumn", "Switch Row/Column", ["Chart Design", "Data"], None, "{chart?}", has_doc, chart_switch),
         cmd!("chart.delete", "Delete Chart", [], None, "{chart?}", has_doc, chart_delete),
@@ -764,6 +773,7 @@ pub fn build_chart(s: &Session, p: &Json) -> Result<(usize, Chart)> {
         style: 1,
         x_title: None,
         y_title: None,
+        y2_title: None,
         source: Some(format!("{}!{}", gridcraft_formula::quote_sheet(&sh.name), r.a1())),
         by_rows,
         pivot: None,
@@ -821,6 +831,40 @@ pub fn apply_scatter_lines(chart: &mut Chart, c: &Json, per_series: &[Json], lin
 fn insert_chart(s: &mut Session, p: &Json) -> Result<Json> {
     let (sheet, mut chart) = build_chart(s, p)?;
     let theme = s.doc()?.wb.theme.clone();
+    // WHIQ: titles, and each series' own type and axis (a dual-axis combo in one call).
+    for (k, slot) in [("xTitle", &mut chart.x_title), ("yTitle", &mut chart.y_title), ("y2Title", &mut chart.y2_title)] {
+        let snake = match k {
+            "xTitle" => "x_title",
+            "yTitle" => "y_title",
+            _ => "y2_title",
+        };
+        if let Some(t) = str_param(p, k).or_else(|| str_param(p, snake)) {
+            *slot = Some(t.to_string());
+        }
+    }
+    let specs: Vec<Json> = p.get("series").and_then(Json::as_array).cloned().unwrap_or_default();
+    for (i, sp) in specs.iter().enumerate() {
+        let Some(se) = chart.series.get_mut(i) else {
+            return Err(bad("insert.chart", format!("`series` has {} entries but the range makes {} series", specs.len(), chart.series.len())));
+        };
+        apply_series_spec(se, sp, "insert.chart")?;
+    }
+    if chart.series.iter().any(|x| x.secondary || x.kind.is_some()) && chart.kind != ChartKind::Combo {
+        // A series of its own type or on the secondary axis makes the chart a combo: the others
+        // keep the chart's type.
+        let base = chart.kind;
+        for se in chart.series.iter_mut().filter(|x| x.kind.is_none()) {
+            se.kind = Some(base);
+        }
+        chart.kind = ChartKind::Combo;
+    }
+    if chart.kind == ChartKind::Combo {
+        for (i, se) in chart.series.iter_mut().enumerate() {
+            if se.kind.is_none() {
+                se.kind = Some(if i == 0 { ChartKind::ColumnClustered } else { ChartKind::Line });
+            }
+        }
+    }
     apply_scatter_lines(&mut chart, p, &[], None, &theme)?;
     let id = chart.id;
     edit(s, |cx| {
@@ -829,9 +873,80 @@ fn insert_chart(s: &mut Session, p: &Json) -> Result<Json> {
     })
 }
 
+/// WHIQ: `{type?, subtype?, secondary?, name?, values?, categories?, color?}` applied to a series.
+fn apply_series_spec(se: &mut Series, sp: &Json, cmd: &str) -> Result<()> {
+    if !sp.is_object() {
+        return Err(bad(cmd, "each `series` entry is an object, e.g. {\"type\": \"line\", \"secondary\": true}"));
+    }
+    if let Some(t) = str_param(sp, "type") {
+        const TYPES: &[&str] = &["column", "bar", "line", "area", "scatter", "pie", "doughnut", "radar", "bubble"];
+        if !TYPES.contains(&t) {
+            return Err(bad(cmd, format!("a series `type` is one of {} (got `{t}`)", TYPES.join(", "))));
+        }
+        se.kind = Some(chart_kind(t, str_param(sp, "subtype").unwrap_or("")));
+    }
+    if let Some(v) = bool_param(sp, "secondary") {
+        se.secondary = v;
+    }
+    for (k, slot) in [("values", &mut se.values)] {
+        if let Some(v) = str_param(sp, k) {
+            *slot = v.to_string();
+        }
+    }
+    if let Some(v) = str_param(sp, "categories") {
+        se.categories = Some(v.to_string());
+    }
+    if let Some(v) = str_param(sp, "name") {
+        se.name = Some(v.to_string());
+    }
+    if let Some(h) = str_param(sp, "color") {
+        se.color = Some(Color::from_hex(h).ok_or_else(|| bad(cmd, format!("`color` is \"#RRGGBB\" (got `{h}`)")))?);
+    }
+    Ok(())
+}
+
+/// WHIQ `chart.setSeries`: one series of an existing chart: its type, axis, data or colour. A
+/// series on the secondary axis or of a type of its own makes the chart a combo.
+fn chart_set_series(s: &mut Session, p: &Json) -> Result<Json> {
+    const CMD: &str = "chart.setSeries";
+    let (si, ci) = find_chart(s, p)?;
+    let n = s.doc()?.wb.sheet(si).and_then(|sh| sh.charts.get(ci)).map_or(0, |c| c.series.len());
+    let k = u32_param(p, "series").map(|v| v as usize).ok_or_else(|| bad(CMD, format!("missing `series`: the series' number, 1 to {n}")))?;
+    if k == 0 || k > n {
+        return Err(bad(CMD, format!("`series` is a number from 1 to {n} (got {k})")));
+    }
+    edit(s, |cx| {
+        let sh = cx.sheet_mut(si)?;
+        let Some(c) = sh.charts.get_mut(ci) else { return Ok(Json::Null) };
+        if matches!(c.kind, ChartKind::Pie | ChartKind::Doughnut) && bool_param(p, "secondary") == Some(true) {
+            return Err(bad(CMD, "a pie or doughnut chart has no secondary axis"));
+        }
+        let base = c.kind;
+        let first = c.series.first().and_then(|x| x.kind);
+        if let Some(se) = c.series.get_mut(k - 1) {
+            apply_series_spec(se, p, CMD)?;
+        }
+        if c.kind != ChartKind::Combo && c.series.iter().any(|x| x.secondary || x.kind.is_some_and(|kk| kk != base)) {
+            for se in c.series.iter_mut().filter(|x| x.kind.is_none()) {
+                se.kind = Some(base);
+            }
+            c.kind = ChartKind::Combo;
+        } else if c.kind == ChartKind::Combo
+            && first.is_none()
+            && let Some(se) = c.series.first_mut()
+            && se.kind.is_none()
+        {
+            se.kind = Some(ChartKind::ColumnClustered);
+        }
+        let se = c.series.get(k - 1).cloned().unwrap_or_default();
+        Ok(json!({"chart": c.id, "series": k, "type": format!("{:?}", c.kind), "secondary": se.secondary}))
+    })
+}
+
 fn find_chart(s: &Session, p: &Json) -> Result<(usize, usize)> {
     let d = s.doc()?;
-    let sheet = d.wb.active_sheet;
+    // WHIQ: `sheet` names the chart's sheet (default the active one).
+    let sheet = if p.get("sheet").is_some() { target_sheet(s, p)? } else { d.wb.active_sheet };
     let sh = d.wb.sheet(sheet).ok_or(EngineError::NoDocument)?;
     let idx = match u32_param(p, "chart") {
         Some(id) => sh.charts.iter().position(|c| c.id == id),
@@ -875,6 +990,9 @@ fn chart_set(s: &mut Session, p: &Json) -> Result<Json> {
         }
         if let Some(t) = p.get("yTitle") {
             c.y_title = t.as_str().map(str::to_string);
+        }
+        if let Some(t) = p.get("y2Title").or_else(|| p.get("y2_title")) {
+            c.y2_title = t.as_str().map(str::to_string);
         }
         if let Some(at) = at {
             c.anchor.cell = at;
@@ -1001,7 +1119,7 @@ fn insert_picture(s: &mut Session, p: &Json) -> Result<Json> {
         let at = sh.merge_at(at).map(|r| r.start).unwrap_or(at);
         let style = sh.style_id(at);
         if sh.is_protected() && d.wb.styles.get(style).protection.locked && locked_cell_error(sh, at, &d.unlocked_ranges).is_some() {
-            return Err(EngineError::Other("The cell you're trying to change is on a protected sheet.".into()));
+            return Err(EngineError::Other(super::protected_msg(&sh.name, Some(at))));
         }
         let picture = CellPicture { data, mime: mime.into(), alt: str_param(p, "alt").unwrap_or("").into() };
         return edit(s, |cx| {
@@ -1130,9 +1248,9 @@ fn shape_set_text(s: &mut Session, p: &Json) -> Result<Json> {
     if shape.kind != ShapeKind::TextBox {
         return Err(bad("shape.setText", "the shape is not a text box"));
     }
-    // Sheet protection locks drawing objects (there is no "edit objects" allowance yet).
-    if sh.is_protected() {
-        return Err(EngineError::Other(PROTECTED.into()));
+    // Sheet protection locks drawing objects unless it allows editing them.
+    if sh.protection.as_ref().is_some_and(|pr| !pr.edit_objects) {
+        return Err(EngineError::Other(super::protected_msg(&sh.name, None)));
     }
     if shape.text == text {
         return ok();

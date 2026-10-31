@@ -544,8 +544,26 @@ fn evaluate(s: &mut Session, p: &Json) -> Result<Json> {
     let d = s.doc()?;
     let f = str_param(p, "formula").ok_or_else(|| bad("formulas.evaluate", "missing `formula`"))?;
     let at = cell_param(s, p, "cell")?.unwrap_or(d.selection.active);
-    let v = gridcraft_calc::evaluate(&d.wb, d.wb.active_sheet, at, f);
-    Ok(crate::cmd::inspect::value_json(&v))
+    // WHIQ: the formula is read as `cell.set` reads it: the same syntax errors, the same
+    // parentheses closed at the end, the same warnings for functions nobody knows.
+    let typed = if f.starts_with('=') { f.to_string() } else { format!("={f}") };
+    let (expr, fixed) =
+        super::edit::parse_entry(&typed).map_err(|m| EngineError::Other(format!("There's a problem with this formula ({typed}): {m}")))?;
+    let text = fixed.as_ref().map_or(typed.clone(), |b| format!("={b}"));
+    let v = gridcraft_calc::evaluate(&d.wb, d.wb.active_sheet, at, &text);
+    let value = crate::cmd::inspect::value_json(&v);
+    if !bool_param(p, "report").unwrap_or(false) {
+        return Ok(value);
+    }
+    let mut out = json!({"result": value});
+    if fixed.is_some() {
+        out["corrected_to"] = json!(text);
+    }
+    let warnings = super::edit::unknown_function_warnings(&expr, &d.wb, d.wb.active_sheet, &at.a1());
+    if !warnings.is_empty() {
+        out["warnings"] = json!(warnings);
+    }
+    Ok(out)
 }
 
 fn calc_now(s: &mut Session, _: &Json) -> Result<Json> {

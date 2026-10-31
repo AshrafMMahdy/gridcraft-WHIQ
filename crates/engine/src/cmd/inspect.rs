@@ -46,7 +46,7 @@ fn inspect(s: &mut Session, _: &Json) -> Result<Json> {
                 "freeze": sh.freeze,
                 "merges": sh.merges.iter().map(|m| m.a1()).collect::<Vec<_>>(),
                 "tables": sh.tables.iter().map(|t| json!({"name": t.name, "range": t.range.a1(), "style": t.style, "totals": t.totals_row, "columns": t.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>()})).collect::<Vec<_>>(),
-                "charts": sh.charts.iter().map(|c| json!({"id": c.id, "kind": format!("{:?}", c.kind), "title": c.title, "at": c.anchor.cell.a1(), "series": c.series.len(), "trendlines": c.series.iter().flat_map(|s| s.trendlines.iter().map(|t| format!("{:?}", t.kind))).collect::<Vec<_>>()})).collect::<Vec<_>>(),
+                "charts": sh.charts.iter().map(chart_json).collect::<Vec<_>>(),
                 "images": sh.images.len(),
                 "shapes": sh.shapes.len(),
                 "conditionalFormats": sh.cond_formats.len(),
@@ -54,6 +54,8 @@ fn inspect(s: &mut Session, _: &Json) -> Result<Json> {
                 "comments": sh.comments.len(),
                 "autofilter": sh.autofilter.as_ref().map(|a| a.range.a1()),
                 "protected": sh.protection.is_some(),
+                "protection": protection_json(wb, sh),
+                "codeName": sh.code_name,
                 "tabColor": sh.tab_color.and_then(|c| c.hex(&wb.theme)),
                 "zoom": sh.zoom,
             })
@@ -69,11 +71,195 @@ fn inspect(s: &mut Session, _: &Json) -> Result<Json> {
         "activeCell": d.selection.active.a1(),
         "names": wb.names.iter().map(|n| json!({"name": n.name, "refersTo": format!("={}", n.formula), "scope": n.scope})).collect::<Vec<_>>(),
         "calcMode": format!("{:?}", wb.calc.mode),
+        // WHIQ: a structure lock refuses sheet inserts, deletes, renames, moves, hides, colours.
+        "structureProtected": wb.protected_structure,
+        "codeName": wb.code_name,
+        "macros": wb.vba_project.is_some(),
         "undo": d.undo.iter().rev().take(20).map(|e| e.label.clone()).collect::<Vec<_>>(),
         "redo": d.redo.iter().rev().take(20).map(|e| e.label.clone()).collect::<Vec<_>>(),
         "theme": wb.theme.name,
         "mode": format!("{:?}", s.mode),
     }))
+}
+
+/// WHIQ: a chart's type as `insert.chart` names it (`column`, `line`, `combo`…) and its subtype.
+pub(crate) fn chart_type_name(k: gridcraft_model::ChartKind) -> (&'static str, Option<&'static str>) {
+    use gridcraft_model::ChartKind as K;
+    match k {
+        K::ColumnClustered => ("column", None),
+        K::ColumnStacked => ("column", Some("stacked")),
+        K::ColumnStacked100 => ("column", Some("stacked100")),
+        K::BarClustered => ("bar", None),
+        K::BarStacked => ("bar", Some("stacked")),
+        K::BarStacked100 => ("bar", Some("stacked100")),
+        K::Line => ("line", None),
+        K::LineMarkers => ("line", Some("markers")),
+        K::LineStacked => ("line", Some("stacked")),
+        K::Pie => ("pie", None),
+        K::Doughnut => ("doughnut", None),
+        K::Area => ("area", None),
+        K::AreaStacked => ("area", Some("stacked")),
+        K::Scatter => ("scatter", None),
+        K::ScatterLines => ("scatter", Some("lines")),
+        K::Bubble => ("bubble", None),
+        K::Radar => ("radar", None),
+        K::Histogram => ("histogram", None),
+        K::Waterfall => ("waterfall", None),
+        K::Funnel => ("funnel", None),
+        K::Treemap => ("treemap", None),
+        K::Sunburst => ("sunburst", None),
+        K::BoxWhisker => ("boxWhisker", None),
+        K::Stock => ("stock", None),
+        K::Combo => ("combo", None),
+    }
+}
+
+/// WHIQ: the kind a series is drawn as (a combo's series without one of their own: the first a
+/// column, the others lines, as the writer and the painter do).
+pub(crate) fn series_kind(ch: &gridcraft_model::Chart, i: usize) -> gridcraft_model::ChartKind {
+    use gridcraft_model::ChartKind as K;
+    let own = ch.series.get(i).and_then(|s| s.kind).filter(|k| *k != K::Combo);
+    match ch.kind {
+        K::Combo => own.unwrap_or(if i == 0 { K::ColumnClustered } else { K::Line }),
+        k => own.unwrap_or(k),
+    }
+}
+
+/// WHIQ: a chart as an agent reads it: title, anchor, type, axis titles and every series with its
+/// kind, references and axis.
+pub(crate) fn chart_json(c: &gridcraft_model::Chart) -> Json {
+    let (t, sub) = chart_type_name(c.kind);
+    let series: Vec<Json> = c
+        .series
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let (k, ks) = chart_type_name(series_kind(c, i));
+            json!({"index": i + 1, "name": s.name, "kind": k, "subtype": ks, "values": s.values, "categories": s.categories,
+                   "axis": if s.secondary { "secondary" } else { "primary" }})
+        })
+        .collect();
+    let a = &c.anchor;
+    json!({
+        "id": c.id,
+        "kind": format!("{:?}", c.kind),
+        "type": t,
+        "subtype": sub,
+        "title": c.title,
+        "at": a.cell.a1(),
+        "anchor": {"cell": a.cell.a1(), "dx": a.dx, "dy": a.dy, "width": a.width, "height": a.height, "mode": format!("{:?}", a.mode)},
+        "x_title": c.x_title,
+        "y_title": c.y_title,
+        "y2_title": c.y2_title,
+        "series_count": c.series.len(),
+        "series": series,
+        "pivot": c.pivot,
+        "trendlines": c.series.iter().flat_map(|s| s.trendlines.iter().map(|t| format!("{:?}", t.kind))).collect::<Vec<_>>(),
+    })
+}
+
+/// WHIQ: the cells a protected sheet still lets anyone edit: unlocked cells (and unlocked whole
+/// rows and columns) as ranges, at most `cap`, and how many more there are.
+pub(crate) fn unlocked_ranges(wb: &gridcraft_model::Workbook, sh: &gridcraft_model::Sheet, cap: usize) -> (Vec<String>, usize) {
+    let unlocked = |st: gridcraft_model::StyleId| !wb.styles.get(st).protection.locked;
+    let mut out: Vec<String> = vec![];
+    for (c, info) in &sh.cols {
+        if info.style.is_some_and(unlocked) {
+            let l = gridcraft_core::col_to_letters(*c);
+            out.push(format!("{l}:{l}"));
+        }
+    }
+    for (r, info) in &sh.rows {
+        if info.style.is_some_and(unlocked) {
+            out.push(format!("{0}:{0}", r + 1));
+        }
+    }
+    // Cells by column, rows in order; runs down a column, then side-by-side equal runs joined.
+    let mut cells: Vec<CellRef> =
+        if sh.cells.is_resident() { sh.cells.iter().filter(|(_, x)| unlocked(x.style)).map(|(c, _)| c).take(200_000).collect() } else { vec![] };
+    cells.sort_by_key(|c| (c.col, c.row));
+    let mut runs: Vec<RangeRef> = vec![];
+    for c in cells {
+        match runs.last_mut() {
+            Some(r) if r.end.col == c.col && r.start.col == c.col && r.end.row + 1 == c.row => r.end.row = c.row,
+            _ => runs.push(RangeRef::cell(c)),
+        }
+    }
+    let mut blocks: Vec<RangeRef> = vec![];
+    for r in runs {
+        if let Some(b) = blocks.iter_mut().find(|b| b.end.col + 1 == r.start.col && b.start.row == r.start.row && b.end.row == r.end.row) {
+            b.end.col = r.start.col;
+        } else {
+            blocks.push(r);
+        }
+    }
+    out.extend(blocks.iter().map(|b| b.a1()));
+    let more = out.len().saturating_sub(cap);
+    out.truncate(cap);
+    (out, more)
+}
+
+/// WHIQ: what a sheet's protection allows and what can still be edited (`null` unprotected).
+pub(crate) fn protection_json(wb: &gridcraft_model::Workbook, sh: &gridcraft_model::Sheet) -> Json {
+    let Some(p) = &sh.protection else { return Json::Null };
+    let (cells, more) = unlocked_ranges(wb, sh, 20);
+    let allowed: Vec<&str> = [
+        ("formatCells", p.format_cells),
+        ("formatColumns", p.format_columns),
+        ("formatRows", p.format_rows),
+        ("insertColumns", p.insert_columns),
+        ("insertRows", p.insert_rows),
+        ("insertHyperlinks", p.insert_hyperlinks),
+        ("deleteColumns", p.delete_columns),
+        ("deleteRows", p.delete_rows),
+        ("sort", p.sort),
+        ("autoFilter", p.autofilter),
+        ("pivotTables", p.pivot_tables),
+        ("editObjects", p.edit_objects),
+        ("editScenarios", p.edit_scenarios),
+    ]
+    .into_iter()
+    .filter(|(_, on)| *on)
+    .map(|(k, _)| k)
+    .collect();
+    json!({
+        "password": p.password.is_some() || p.legacy_password_hash.is_some(),
+        "unlockedCells": cells,
+        "unlockedMore": more,
+        "editRanges": sh.edit_ranges.iter().map(|r| json!({"title": r.title, "ranges": r.ranges.iter().map(|x| x.a1()).collect::<Vec<_>>(), "password": r.password.is_some()})).collect::<Vec<_>>(),
+        "allowed": allowed,
+    })
+}
+
+/// WHIQ: one line saying what a protected sheet still lets anyone edit, for agents.
+pub(crate) fn protection_summary(wb: &gridcraft_model::Workbook, sh: &gridcraft_model::Sheet) -> Option<String> {
+    sh.protection.as_ref()?;
+    let (cells, more) = unlocked_ranges(wb, sh, 20);
+    let mut parts = vec![];
+    if !cells.is_empty() {
+        parts.push(format!("its unlocked cells {}{}", cells.join(", "), if more > 0 { format!(" and {more} more") } else { String::new() }));
+    }
+    let ranges: Vec<String> = sh
+        .edit_ranges
+        .iter()
+        .take(10)
+        .map(|r| {
+            format!(
+                "\"{}\" ({}{})",
+                r.title,
+                r.ranges.iter().map(|x| x.a1()).collect::<Vec<_>>().join(","),
+                if r.password.is_some() { ", needs its password" } else { "" }
+            )
+        })
+        .collect();
+    if !ranges.is_empty() {
+        parts.push(format!("its Allow Edit Ranges {}", ranges.join(", ")));
+    }
+    Some(if parts.is_empty() {
+        format!("sheet \"{}\" is protected and has no unlocked cells", sh.name)
+    } else {
+        format!("sheet \"{}\" is protected: only {} can be edited", sh.name, parts.join(" and "))
+    })
 }
 
 fn read(s: &mut Session, p: &Json) -> Result<Json> {

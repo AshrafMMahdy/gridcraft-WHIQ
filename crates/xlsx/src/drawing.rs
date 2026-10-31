@@ -126,7 +126,19 @@ pub fn read_drawing(cx: &mut Ctx<'_>, part: &str, sheet: &mut Sheet) -> Result<(
     let rels = cx.pkg.rels(part)?;
     // WHIQ: the anchors as written, so an untouched chart keeps its anchor on save.
     let fragments = cx.pkg.read_limited(part, 16 << 20).ok().flatten().and_then(|b| crate::passthrough::top_level_fragments(&b)).unwrap_or_default();
+    let mut twins: Vec<gridcraft_model::PreservedXml> = vec![];
     for (ai, a) in x.children.iter().enumerate() {
+        // WHIQ: an Excel 2010 form control's DrawingML twin (`a14:compatExt` naming its VML
+        // shape) is kept as written: the control itself is kept with the sheet's `<controls>`.
+        if a.name == "AlternateContent" && has_descendant(a, "compatExt", 12) {
+            match fragments.get(ai) {
+                Some(f) if !f.contains("r:id=\"") && !f.contains("r:embed=\"") && f.len() <= 1 << 20 => {
+                    twins.push(gridcraft_model::PreservedXml { slot: "controlTwin".into(), xml: f.clone() });
+                }
+                _ => cx.warn("a form control's drawing copy could not be kept (the control is kept)"),
+            }
+            continue;
+        }
         let Some(anchor) = read_anchor(a, sheet) else { continue };
         // Objects in markup-compatibility blocks: the first choice (chartex frames), else the
         // fallback.
@@ -219,7 +231,17 @@ pub fn read_drawing(cx: &mut Ctx<'_>, part: &str, sheet: &mut Sheet) -> Result<(
             }
         }
     }
+    if !twins.is_empty() {
+        let mut p = sheet.preserved.take().map(|a| (*a).clone()).unwrap_or_default();
+        p.elements.extend(twins);
+        sheet.preserved = Some(std::sync::Arc::new(p));
+    }
     Ok(())
+}
+
+/// Whether `e` holds an element named `name` within `depth` levels.
+fn has_descendant(e: &El, name: &str, depth: usize) -> bool {
+    depth > 0 && e.children.iter().any(|c| c.name == name || has_descendant(c, name, depth - 1))
 }
 
 fn read_shape(obj: &El, anchor: Anchor) -> Option<Shape> {
@@ -343,6 +365,9 @@ pub enum Obj<'a> {
     /// WHIQ: an anchor element kept as the source file wrote it (its relationship id already
     /// rewritten); its drawing-object id is renumbered.
     Kept(String),
+    /// WHIQ: a top-level element written back exactly (a form control's drawing twin: its id
+    /// is the control's VML shape number).
+    Raw(&'a str),
 }
 
 /// The drawing part for a sheet's objects (relationship ids already assigned).
@@ -357,8 +382,12 @@ pub fn write_drawing(sheet: &Sheet, theme: &Theme, objs: &[Obj<'_>]) -> String {
             s.push_str(&crate::kept::renumber_object(x, id));
             continue;
         }
+        if let Obj::Raw(x) = o {
+            s.push_str(x);
+            continue;
+        }
         match o {
-            Obj::Kept(_) => continue,
+            Obj::Kept(_) | Obj::Raw(_) => continue,
             Obj::Image(img, rid) => {
                 let (open, close) = anchor_open(sheet, &img.anchor);
                 close_tag = close;

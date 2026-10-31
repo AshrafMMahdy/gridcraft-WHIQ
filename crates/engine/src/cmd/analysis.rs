@@ -1086,7 +1086,7 @@ fn write_report(s: &mut Session, p: &Json, tool: &str, g: Grid) -> Result<Json> 
         }
         None => {
             if d.wb.protected_structure {
-                return Err(EngineError::Other("The workbook is protected and cannot be changed.".into()));
+                return Err(EngineError::Other(super::STRUCTURE_LOCKED.into()));
             }
             let name = match p.get("newSheet") {
                 Some(Json::String(n)) if !n.trim().is_empty() => n.trim().to_string(),

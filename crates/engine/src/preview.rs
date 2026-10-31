@@ -181,7 +181,6 @@ fn sheet_meta(wb: &Workbook, i: usize, sh: &Sheet, exact: bool) -> Json {
         Visibility::Hidden => "hidden",
         Visibility::VeryHidden => "veryHidden",
     };
-    let _ = wb;
     json!({
         "index": i,
         "name": sh.name,
@@ -197,6 +196,8 @@ fn sheet_meta(wb: &Workbook, i: usize, sh: &Sheet, exact: bool) -> Json {
         "images": sh.images.len(),
         "right_to_left": sh.right_to_left,
         "in_memory": sh.cells.is_resident(),
+        "protected": sh.protection.is_some(),
+        "protection": crate::cmd::inspect::protection_summary(wb, sh),
     })
 }
 
@@ -894,6 +895,10 @@ fn sheet_div(
             col_to_letters(cols.saturating_sub(1))
         );
     }
+    // WHIQ: a protected sheet says so, and what can still be edited.
+    if let Some(note) = crate::cmd::inspect::protection_summary(wb, sh) {
+        let _ = write!(out, "<div class=\"cap protected\">This is a protected sheet: {}.</div>", esc(&note));
+    }
     let d = SheetDraw::new(wb, si, sh, w, headings);
     let merges = d.merges();
     out.push_str("<div class=\"grid\">");
@@ -944,6 +949,12 @@ pub fn render(wb: &Workbook, o: &Options) -> Result<Json, String> {
                 esc(&o.title),
                 esc(&o.title)
             );
+            if wb.protected_structure {
+                // The head line of the page: the workbook's sheets can't be changed.
+                if let Some(i) = out.rfind("</div>\n<div class=\"bar\">") {
+                    out.insert_str(i, " · the workbook's structure is protected");
+                }
+            }
             let tabs: Vec<usize> = if visible.contains(&si) { visible.clone() } else { std::iter::once(si).chain(visible.iter().copied()).collect() };
             for (k, i) in tabs.iter().enumerate() {
                 let name = wb.sheet(*i).map(|s| s.name.as_str()).unwrap_or_default();
@@ -1029,6 +1040,7 @@ pub fn render(wb: &Workbook, o: &Options) -> Result<Json, String> {
         "sheets": sheets,
         "window": window,
         "cells": cells,
+        "structure_protected": wb.protected_structure,
     });
     v["bytes"] = json!(v["html"].as_str().map_or(0, str::len));
     if !notes.is_empty() {
@@ -1063,6 +1075,51 @@ fn md_cell(s: &str) -> String {
     s.replace('\\', "\\\\").replace('|', "\\|").replace("\r\n", "<br>").replace(['\n', '\r'], "<br>")
 }
 
+/// WHIQ: the sheet's charts as a Markdown list: title, type, anchor, axis titles, and each series
+/// with its kind, references and axis.
+fn charts_md(sh: &Sheet) -> String {
+    if sh.charts.is_empty() {
+        return String::new();
+    }
+    let mut t = format!("Charts on {}:\n\n", md_cell(&sh.name));
+    for c in &sh.charts {
+        let (kind, sub) = crate::cmd::inspect::chart_type_name(c.kind);
+        let title = c.title.as_deref().map(|x| format!(" \"{}\"", md_cell(x))).unwrap_or_default();
+        let _ = write!(
+            t,
+            "- Chart {}{title} ({kind}{}) at {}, {:.0} × {:.0} pt",
+            c.id,
+            sub.map(|s| format!(", {s}")).unwrap_or_default(),
+            c.anchor.cell.a1(),
+            c.anchor.width,
+            c.anchor.height
+        );
+        for (label, v) in [("x axis", &c.x_title), ("y axis", &c.y_title), ("secondary axis", &c.y2_title)] {
+            if let Some(v) = v {
+                let _ = write!(t, "; {label} \"{}\"", md_cell(v));
+            }
+        }
+        t.push('\n');
+        for (i, se) in c.series.iter().enumerate() {
+            let (k, _) = crate::cmd::inspect::chart_type_name(crate::cmd::inspect::series_kind(c, i));
+            let name = se.name.as_deref().map(|n| format!(" {}", md_cell(n))).unwrap_or_default();
+            let _ = write!(
+                t,
+                "  - series {}{name} ({k}, {} axis): values {}",
+                i + 1,
+                if se.secondary { "secondary" } else { "primary" },
+                md_cell(&se.values)
+            );
+            if let Some(cat) = &se.categories {
+                let _ = write!(t, ", categories {}", md_cell(cat));
+            }
+            t.push('\n');
+        }
+    }
+    t.push('\n');
+    t
+}
+
 /// `sheet.markdown`: sheets as Markdown tables (the row number first, column letters as the
 /// header), paged by rows (`row_start`, `row_count`) and by bytes; `next` says where to go on.
 pub fn markdown(wb: &Workbook, o: &MarkdownOptions) -> Result<Json, String> {
@@ -1083,6 +1140,10 @@ pub fn markdown(wb: &Workbook, o: &MarkdownOptions) -> Result<Json, String> {
     let mut next: Option<Json> = None;
     let mut rows_out = 0u64;
     let headings = o.continue_sheets || wb.sheets.len() > 1;
+    // WHIQ: what protection allows, said where an agent reads it.
+    if wb.protected_structure {
+        text.push_str("> The workbook's structure is protected: sheets can't be inserted, deleted, renamed, moved, copied, hidden, unhidden or recoloured (ask the owner to unprotect the workbook).\n\n");
+    }
     'sheets: for (k, &si) in list.iter().enumerate() {
         let Some(sh) = wb.sheet(si) else { continue };
         let used = sh.used_range();
@@ -1104,8 +1165,12 @@ pub fn markdown(wb: &Workbook, o: &MarkdownOptions) -> Result<Json, String> {
         if headings {
             let _ = write!(text, "## {}{}\n\n", md_cell(&sh.name), used.map(|u| format!(" ({})", u.a1())).unwrap_or_default());
         }
+        if let Some(note) = crate::cmd::inspect::protection_summary(wb, sh) {
+            let _ = write!(text, "> This is a protected sheet: {}; ask the owner to unprotect it for anything else.\n\n", md_cell(&note));
+        }
         let Some(u) = used else {
             text.push_str("(empty sheet)\n\n");
+            text.push_str(&charts_md(sh));
             parts.push(meta(None, None));
             continue;
         };
@@ -1166,10 +1231,12 @@ pub fn markdown(wb: &Workbook, o: &MarkdownOptions) -> Result<Json, String> {
             last = Some(row);
         }
         text.push('\n');
+        text.push_str(&charts_md(sh));
         parts.push(meta(Some(r_start + 1), Some(u.end.row + 1)));
     }
     let sheets: Vec<Json> = wb.sheets.iter().enumerate().map(|(i, s)| sheet_meta(wb, i, s, list.contains(&i))).collect();
     let mut v = json!({
+        "structure_protected": wb.protected_structure,
         "markdown": text,
         "sheets": sheets,
         "read": parts,

@@ -201,10 +201,16 @@ fn read_package(pkg: Package<'_>) -> Result<(Workbook, ReadReport), IoError> {
     }
 
     // Workbook properties.
-    if let Some(p) = wb_xml.child("workbookPr")
-        && p.flag("date1904", false)
-    {
-        cx.date_system = DateSystem::D1904;
+    if let Some(p) = wb_xml.child("workbookPr") {
+        if p.flag("date1904", false) {
+            cx.date_system = DateSystem::D1904;
+        }
+        // WHIQ: the VBA code name, and the properties the model does not hold, kept as read.
+        wb.code_name = p.attr("codeName").map(str::trim).filter(|c| !c.is_empty()).map(str::to_string);
+        let extra = crate::kept::schema_attrs(p, crate::kept::WORKBOOK_PR_ATTRS);
+        if !extra.is_empty() {
+            cx.kept_xml.push(gridcraft_model::PreservedXml { slot: "workbookPr".into(), xml: extra });
+        }
     }
     wb.date_system = cx.date_system;
     if let Some(c) = wb_xml.child("calcPr") {
@@ -291,7 +297,14 @@ fn read_package(pkg: Package<'_>) -> Result<(Workbook, ReadReport), IoError> {
             Err(IoError::TooLarge(m)) => return Err(IoError::TooLarge(m)),
             Err(e) => cx.warn(format!("PivotTables on sheet \"{name}\" could not be read: {e}")),
         }
+        // WHIQ: what the sheet part kept itself (`sheetPr` attributes) joins the pass-through.
+        let own = sheet.preserved.take();
         sheet.preserved = kept.sheet(&mut cx, &rel.target, &name);
+        if let Some(own) = own.filter(|o| !o.is_empty()) {
+            let mut p = sheet.preserved.take().map(|a| (*a).clone()).unwrap_or_default();
+            p.elements.extend(own.elements.iter().cloned());
+            sheet.preserved = Some(Arc::new(p));
+        }
         kept.charts(&mut cx, &mut sheet);
         sheet.visibility = match se.attr("state") {
             Some("hidden") => Visibility::Hidden,

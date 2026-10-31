@@ -23,7 +23,11 @@ pub struct Canvas {
     pixmap: Pixmap,
     clip: Option<(f32, f32, f32, f32)>,
     stack: Vec<Option<(f32, f32, f32, f32)>>,
+    /// WHIQ: one canvas-sized clip mask, reused: only the pixels of the clip it holds
+    /// (`mask_rect`, x0, y0, x1, y1) are set, so moving it to another clip costs those two
+    /// rectangles, not the canvas.
     mask: Option<Mask>,
+    mask_rect: Option<(u32, u32, u32, u32)>,
 }
 
 fn paint(c: Rgb) -> Paint<'static> {
@@ -83,7 +87,7 @@ impl Canvas {
         }
         let mut pixmap = Pixmap::new(width, height)?;
         pixmap.fill(Color::from_rgba8(background[0], background[1], background[2], 255));
-        Some(Canvas { pixmap, clip: None, stack: Vec::new(), mask: None })
+        Some(Canvas { pixmap, clip: None, stack: Vec::new(), mask: None, mask_rect: None })
     }
 
     pub fn width(&self) -> u32 {
@@ -99,17 +103,59 @@ impl Canvas {
         Some([p.red(), p.green(), p.blue()])
     }
 
-    fn mask(&mut self) -> Option<&Mask> {
+    /// The clip in whole pixels (x0, y0, x1, y1), as a non-antialiased fill of it covers them
+    /// (a pixel whose centre is inside).
+    fn clip_pixels(&self) -> Option<(u32, u32, u32, u32)> {
         let (x, y, w, h) = self.clip?;
+        let (pw, ph) = (self.pixmap.width() as f32, self.pixmap.height() as f32);
+        let px = |v: f32, max: f32| (v - 0.5).ceil().clamp(0.0, max) as u32;
+        Some((px(x, pw), px(y, ph), px(x + w.max(0.0), pw), px(y + h.max(0.0), ph)))
+    }
+
+    /// Makes the mask hold the current clip (allocated once, then only the rectangles change).
+    fn ensure_mask(&mut self) {
+        let Some(want) = self.clip_pixels() else { return };
         if self.mask.is_none() {
-            let mut m = Mask::new(self.pixmap.width(), self.pixmap.height())?;
-            if let Some(r) = Rect::from_xywh(x, y, w.max(0.0), h.max(0.0)) {
-                let path = PathBuilder::from_rect(r);
-                m.fill_path(&path, FillRule::Winding, false, Transform::identity());
-            }
-            self.mask = Some(m);
+            self.mask = Mask::new(self.pixmap.width(), self.pixmap.height());
+            self.mask_rect = None;
         }
-        self.mask.as_ref()
+        if self.mask_rect == Some(want) {
+            return;
+        }
+        let w = self.pixmap.width() as usize;
+        let Some(m) = self.mask.as_mut() else { return };
+        let data = m.data_mut();
+        let mut set = |(x0, y0, x1, y1): (u32, u32, u32, u32), v: u8| {
+            for row in y0..y1 {
+                let start = row as usize * w;
+                if let Some(line) = data.get_mut(start + x0 as usize..start + x1 as usize) {
+                    line.fill(v);
+                }
+            }
+        };
+        if let Some(old) = self.mask_rect {
+            set(old, 0);
+        }
+        set(want, 255);
+        self.mask_rect = Some(want);
+    }
+
+    /// Whether a drawing whose ink lies inside `bounds` (x0, y0, x1, y1) is wholly inside the
+    /// clip: then it needs no mask.
+    fn inside_clip(&self, (x0, y0, x1, y1): (f32, f32, f32, f32)) -> bool {
+        match self.clip_pixels() {
+            None => true,
+            Some((cx0, cy0, cx1, cy1)) => x0 >= cx0 as f32 && y0 >= cy0 as f32 && x1 <= cx1 as f32 && y1 <= cy1 as f32,
+        }
+    }
+
+    /// The mask a drawing with ink inside `bounds` needs (`None`: no clip, or wholly inside it).
+    fn mask_for(&mut self, bounds: (f32, f32, f32, f32)) -> bool {
+        if self.inside_clip(bounds) {
+            return false;
+        }
+        self.ensure_mask();
+        self.mask.is_some()
     }
 
     /// Everything outside the clip is hidden: with an empty clip nothing at all.
@@ -123,9 +169,6 @@ impl Canvas {
 
     pub fn restore(&mut self) {
         if let Some(c) = self.stack.pop() {
-            if c != self.clip {
-                self.mask = None;
-            }
             self.clip = c;
         }
     }
@@ -145,7 +188,6 @@ impl Canvas {
             }
         };
         self.clip = Some(next);
-        self.mask = None;
     }
 
     pub fn fill_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: Rgb) {
@@ -154,8 +196,8 @@ impl Canvas {
         }
         let Some(r) = Rect::from_xywh(x, y, w, h) else { return };
         let p = paint(color);
-        let m = self.mask().cloned();
-        self.pixmap.fill_rect(r, &p, Transform::identity(), m.as_ref());
+        let masked = self.mask_for((x, y, x + w, y + h));
+        self.pixmap.fill_rect(r, &p, Transform::identity(), if masked { self.mask.as_ref() } else { None });
     }
 
     fn stroke(&mut self, pb: PathBuilder, width: f32, color: Rgb, dash: &[f32], round: bool) {
@@ -173,8 +215,10 @@ impl Canvas {
             s.dash = StrokeDash::new(d, 0.0);
         }
         let p = paint(color);
-        let m = self.mask().cloned();
-        self.pixmap.stroke_path(&path, &p, &s, Transform::identity(), m.as_ref());
+        let b = path.bounds();
+        let pad = s.width / 2.0 + 2.0;
+        let masked = self.mask_for((b.left() - pad, b.top() - pad, b.right() + pad, b.bottom() + pad));
+        self.pixmap.stroke_path(&path, &p, &s, Transform::identity(), if masked { self.mask.as_ref() } else { None });
     }
 
     pub fn rect_stroke(&mut self, x: f32, y: f32, w: f32, h: f32, width: f32, color: Rgb) {
@@ -239,8 +283,9 @@ impl Canvas {
             && let Some(path) = build().finish()
         {
             let p = paint(f);
-            let m = self.mask().cloned();
-            self.pixmap.fill_path(&path, &p, FillRule::Winding, Transform::identity(), m.as_ref());
+            let b = path.bounds();
+            let masked = self.mask_for((b.left() - 1.0, b.top() - 1.0, b.right() + 1.0, b.bottom() + 1.0));
+            self.pixmap.fill_path(&path, &p, FillRule::Winding, Transform::identity(), if masked { self.mask.as_ref() } else { None });
         }
         if let Some((c, w)) = stroke {
             self.stroke(build(), w, c, &[], true);
@@ -255,8 +300,9 @@ impl Canvas {
             && let Some(path) = PathBuilder::from_circle(cx, cy, r)
         {
             let p = paint(f);
-            let m = self.mask().cloned();
-            self.pixmap.fill_path(&path, &p, FillRule::Winding, Transform::identity(), m.as_ref());
+            let b = path.bounds();
+            let masked = self.mask_for((b.left() - 1.0, b.top() - 1.0, b.right() + 1.0, b.bottom() + 1.0));
+            self.pixmap.fill_path(&path, &p, FillRule::Winding, Transform::identity(), if masked { self.mask.as_ref() } else { None });
         }
         if let Some((c, w)) = stroke {
             let mut pb = PathBuilder::new();
@@ -289,8 +335,9 @@ impl Canvas {
         }
         let Some(path) = pb.finish() else { return };
         let p = paint(color);
-        let m = self.mask().cloned();
-        self.pixmap.fill_path(&path, &p, FillRule::Winding, Transform::identity(), m.as_ref());
+        let b = path.bounds();
+        let masked = self.mask_for((b.left() - 1.0, b.top() - 1.0, b.right() + 1.0, b.bottom() + 1.0));
+        self.pixmap.fill_path(&path, &p, FillRule::Winding, Transform::identity(), if masked { self.mask.as_ref() } else { None });
     }
 
     /// Text at `(x, y)` (baseline) in the embedded faces, in the default family.
@@ -341,8 +388,8 @@ impl Canvas {
         }
         let t = Transform::from_row(w / pw as f32, 0.0, 0.0, h / ph as f32, x, y);
         let paint = PixmapPaint { quality: FilterQuality::Bilinear, ..PixmapPaint::default() };
-        let m = self.mask().cloned();
-        self.pixmap.draw_pixmap(0, 0, img.as_ref(), &paint, t, m.as_ref());
+        let masked = self.mask_for((x - 1.0, y - 1.0, x + w + 1.0, y + h + 1.0));
+        self.pixmap.draw_pixmap(0, 0, img.as_ref(), &paint, t, if masked { self.mask.as_ref() } else { None });
     }
 
     /// The canvas as a PNG file (8-bit RGBA).
@@ -370,6 +417,32 @@ impl Canvas {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    /// WHIQ 0.7.6 (G1): a clipped draw costs what it draws, not the canvas. Each cell of a sheet
+    /// picture is drawn under its own clip; a full-canvas mask copied and rebuilt per draw made a
+    /// 252 × 264 sheet take minutes.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // the clock, in a native test
+    fn clipped_draws_do_not_cost_the_whole_canvas() {
+        let (w, h) = (8000u32, 3000u32);
+        let mut c = Canvas::new(w, h, [255, 255, 255]).unwrap();
+        let t0 = std::time::Instant::now();
+        for i in 0..2000u32 {
+            let (x, y) = ((i % 100) as f32 * 64.0 + 0.5, (i / 100) as f32 * 20.0 + 0.5);
+            c.save();
+            c.clip_rect(x, y, 64.0, 20.0);
+            c.fill_rect(x - 10.0, y, 80.0, 20.0, [200, 220, 255]);
+            c.stroke_line(x - 5.0, y + 10.0, x + 70.0, y + 10.0, 1.0, [0, 0, 0]);
+            c.polygon(&[[x, y], [x + 80.0, y], [x + 80.0, y + 30.0]], Some([255, 0, 0]), None);
+            c.restore();
+        }
+        let took = t0.elapsed();
+        assert!(took.as_secs_f64() < 3.0, "2,000 clipped cells took {took:?}");
+        // And the clip still holds: nothing past the last cell's right edge (x + 64).
+        let (x, y) = (99.0 * 64.0 + 0.5, 19.0 * 20.0 + 0.5);
+        assert_eq!(c.pixel((x + 66.0) as u32, (y + 2.0) as u32), Some([255, 255, 255]), "clipped away");
+        assert_ne!(c.pixel((x + 30.0) as u32, (y + 2.0) as u32), Some([255, 255, 255]), "drawn inside");
+    }
 
     #[test]
     fn draws_shapes_and_clips() {

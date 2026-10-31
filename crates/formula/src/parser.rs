@@ -35,7 +35,7 @@ pub(crate) fn parse_syntax(src: &str, locale: crate::FormulaLocale) -> Result<Ex
     }
     let toks = tokenize_locale(body, locale).map_err(|e| ParseError { msg: e.msg, pos: e.pos })?;
     let toks = significant_spaces(toks);
-    let mut p = Parser { toks, i: 0, depth: 0, input: locale == crate::FormulaLocale::Es };
+    let mut p = Parser { toks, i: 0, prev: 0, depth: 0, input: locale == crate::FormulaLocale::Es };
     let e = p.expr(0, false)?;
     match p.peek() {
         Tok::Eof => Ok(e),
@@ -48,6 +48,12 @@ fn describe(t: &Tok) -> String {
         Tok::RParen => "`)`".into(),
         Tok::Comma => "`,`".into(),
         Tok::Eof => "end of formula".into(),
+        // WHIQ: what the user typed, not the token's debug form.
+        Tok::Text(t) => format!("the text \"{t}\""),
+        Tok::Word(w) => format!("`{w}`"),
+        Tok::Func(f) => format!("`{f}(`"),
+        Tok::Number(n) => format!("the number {n}"),
+        Tok::Op(o) => format!("`{o}`"),
         other => format!("{other:?}"),
     }
 }
@@ -74,6 +80,8 @@ fn significant_spaces(toks: Vec<Token>) -> Vec<Token> {
 struct Parser {
     toks: Vec<Token>,
     i: usize,
+    /// WHIQ: where the token `next` last returned starts (errors about it point there).
+    prev: usize,
     depth: usize,
     input: bool,
 }
@@ -120,10 +128,11 @@ impl Parser {
         self.toks.get(self.i + k).map(|t| &t.tok).unwrap_or(&Tok::Eof)
     }
     fn pos(&self) -> usize {
-        self.toks.get(self.i).map(|t| t.start).unwrap_or(0)
+        self.toks.get(self.i).or(self.toks.last()).map(|t| t.start).unwrap_or(0)
     }
     fn next(&mut self) -> Tok {
         let t = self.peek().clone();
+        self.prev = self.pos();
         if self.i < self.toks.len() {
             self.i += 1;
         }
@@ -131,6 +140,10 @@ impl Parser {
     }
     fn err(&self, msg: impl Into<String>) -> ParseError {
         ParseError { msg: msg.into(), pos: self.pos() }
+    }
+    /// An error about the token just taken.
+    fn err_prev(&self, msg: impl Into<String>) -> ParseError {
+        ParseError { msg: msg.into(), pos: self.prev }
     }
     fn expect(&mut self, t: Tok) -> Result<(), ParseError> {
         if *self.peek() == t {
@@ -237,7 +250,7 @@ impl Parser {
             match self.next() {
                 Tok::Comma => continue,
                 Tok::RParen => break,
-                t => return Err(self.err(format!("expected `,` or `)`, found {}", describe(&t)))),
+                t => return Err(self.err_prev(format!("expected `,` or `)`, found {}", describe(&t)))),
             }
         }
         if args.len() > 255 {
@@ -301,7 +314,7 @@ impl Parser {
                 match self.next() {
                     Tok::Word(w) => self.reference_from_word(sheet, &w),
                     Tok::Error(CellError::Ref) => Ok(Expr::Error(CellError::Ref)),
-                    t => Err(self.err(format!("expected a reference after the sheet name, found {}", describe(&t)))),
+                    t => Err(self.err_prev(format!("expected a reference after the sheet name, found {}", describe(&t)))),
                 }
             }
             Tok::Word(w) => {
@@ -315,7 +328,7 @@ impl Parser {
                 self.reference_from_word(SheetSel::Current, &w)
             }
             Tok::Struct(body) => parse_struct("", &body).map(Expr::Struct).map_err(|msg| self.err(msg)),
-            t => Err(self.err(format!("unexpected {}", describe(&t)))),
+            t => Err(self.err_prev(format!("unexpected {}", describe(&t)))),
         }
     }
 
@@ -395,11 +408,11 @@ impl Parser {
                 Tok::Number(n) => Expr::Number(n),
                 Tok::Op("-") => match self.next() {
                     Tok::Number(n) => Expr::Number(-n),
-                    t => return Err(self.err(format!("expected a number in array, found {}", describe(&t)))),
+                    t => return Err(self.err_prev(format!("expected a number in array, found {}", describe(&t)))),
                 },
                 Tok::Op("+") => match self.next() {
                     Tok::Number(n) => Expr::Number(n),
-                    t => return Err(self.err(format!("expected a number in array, found {}", describe(&t)))),
+                    t => return Err(self.err_prev(format!("expected a number in array, found {}", describe(&t)))),
                 },
                 Tok::Text(s) => Expr::Text(Arc::from(s)),
                 Tok::Bool(b) => Expr::Bool(b),
@@ -407,7 +420,7 @@ impl Parser {
                     .map(Expr::Bool)
                     .ok_or_else(|| self.err(format!("array constants may only contain constants, found {}", describe(&Tok::Word(w)))))?,
                 Tok::Error(e) => Expr::Error(e),
-                t => return Err(self.err(format!("array constants may only contain constants, found {}", describe(&t)))),
+                t => return Err(self.err_prev(format!("array constants may only contain constants, found {}", describe(&t)))),
             };
             if let Some(r) = rows.last_mut() {
                 r.push(el);
@@ -416,7 +429,7 @@ impl Parser {
                 Tok::Comma => {}
                 Tok::Semicolon => rows.push(Vec::new()),
                 Tok::RBrace => break,
-                t => return Err(self.err(format!("expected `,`, `;` or `}}`, found {}", describe(&t)))),
+                t => return Err(self.err_prev(format!("expected `,`, `;` or `}}`, found {}", describe(&t)))),
             }
         }
         let w = rows.first().map_or(0, Vec::len);

@@ -317,6 +317,21 @@ fn base_definitions() -> Vec<Value> {
                     "markers": boolean("Scatter: draw a marker at each point (default true; false = the line alone)"),
                     "line_width": {"type": "number", "exclusiveMinimum": 0, "maximum": 20, "description": "Scatter: line width in points (default 2.25)"},
                     "color": color("Scatter: one line/marker color \"#RRGGBB\" for every series (default: the theme's accent colors, one per series)"),
+                    "x_title": string("Category (x) axis title"),
+                    "y_title": string("Value (y) axis title"),
+                    "y2_title": string("Secondary value axis title (a combo with a series on the secondary axis)"),
+                    "series": {
+                        "type": "array",
+                        "description": "Per series, in the order the range makes them: its own `type` and whether it is plotted on the `secondary` axis. \
+                                        A series of another type or on the secondary axis makes a combo, e.g. [{\"type\": \"column\"}, {\"type\": \"line\", \"secondary\": true}] \
+                                        for columns with a line on a second axis. An existing chart's series: execute_command chart.setSeries {chart, series: n, secondary, type}.",
+                        "items": {"type": "object", "properties": {
+                            "type": {"type": "string", "enum": ["column", "bar", "line", "area", "scatter"]},
+                            "secondary": {"type": "boolean"},
+                            "name": {"type": "string"},
+                            "color": {"type": "string"}
+                        }}
+                    },
                 }),
                 &["range", "type"],
             ),
@@ -669,13 +684,24 @@ pub(crate) fn dispatch(b: &mut dyn Backend, name: &str, a: &Args) -> Result<Valu
             let formula = if f.starts_with('=') { f.to_string() } else { format!("={f}") };
             let mut p = pick(a, &["cell"]);
             p["formula"] = json!(formula);
+            p["report"] = json!(true);
+            // WHIQ: the engine reads the formula as set_cell does (errors, corrections, warnings).
             let v = exec(b, "formulas.evaluate", p)?;
-            Ok(json!({"formula": formula, "result": v}))
+            let mut out = json!({"formula": formula, "result": v["result"]});
+            for k in ["corrected_to", "warnings"] {
+                if let Some(x) = v.get(k) {
+                    out[k] = x.clone();
+                }
+            }
+            Ok(out)
         }
         "select" => exec(b, "selection.set", pick(a, &["range", "active"])),
         "format_range" => format_range(b, a),
         "insert_chart" => {
-            let mut p = pick(a, &["range", "type", "subtype", "title", "at", "line", "markers", "line_width", "color"]);
+            let mut p = pick(
+                a,
+                &["range", "type", "subtype", "title", "at", "line", "markers", "line_width", "color", "x_title", "y_title", "y2_title", "series"],
+            );
             // WHIQ: a scatter chart is drawn with straight lines unless `line: false` (or subtype lines, no markers).
             let scatter = p.get("type").and_then(Value::as_str).is_some_and(|t| t.eq_ignore_ascii_case("scatter"));
             let subtype = p.get("subtype").and_then(Value::as_str).unwrap_or("");

@@ -46,6 +46,7 @@ fn chart(kind: ChartKind) -> Chart {
         style: 0,
         x_title: Some("Quarter".into()),
         y_title: Some("Revenue".into()),
+        y2_title: None,
         source: None,
         by_rows: false,
         pivot: None,
@@ -1086,4 +1087,24 @@ fn area_charts_draw_source_value_labels_only_when_enabled() {
         let first_label = on.iter().position(|p| matches!(p, Prim::Text { text, .. } if text == "$12,000"));
         assert!(first_label > last_poly, "{kind:?}: label drawn under a later area");
     }
+}
+
+/// WHIQ 0.7.6: a combo with a series on the secondary axis draws that axis' title, on the right.
+#[test]
+fn the_secondary_axis_title_is_drawn_when_a_series_is_on_it() {
+    let m = ApproxMeasure;
+    let mut c = chart(ChartKind::Combo);
+    c.y2_title = Some("Margin %".into());
+    let d = sample(ChartKind::Combo);
+    let (w, h) = (640.0, 400.0);
+    assert!(!texts(&render(&c, &d, w, h, &m)).contains(&"Margin %"), "no series on the secondary axis: no title");
+    c.series = vec![gridcraft_model::Series::default(), gridcraft_model::Series { secondary: true, ..Default::default() }];
+    let prims = render(&c, &d, w, h, &m);
+    assert_sane(&prims, w, h);
+    let title = prims.iter().find_map(|p| match p {
+        Prim::Text { text, x, rotation, .. } if text == "Margin %" => Some((*x, *rotation)),
+        _ => None,
+    });
+    let (x, rot) = title.expect("the secondary axis title is drawn");
+    assert!(x > w * 0.8 && rot > 0.0, "on the right, reading downwards: x {x}, rotation {rot}");
 }

@@ -289,6 +289,8 @@ pub struct Session {
 
 impl Session {
     pub fn new() -> Session {
+        // WHIQ: the file writer tells built-in functions from unknown ones by the registry.
+        gridcraft_xlsx::set_function_oracle(gridcraft_calc::is_known_function);
         Session::default()
     }
     pub fn documents(&self) -> &[DocState] {

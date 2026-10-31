@@ -152,12 +152,25 @@ fn save(s: &mut Session, p: &Json) -> Result<Json> {
     let wb = rebased.as_ref().unwrap_or(&d.wb);
     // WHIQ: an .xlsx streams into the file.
     let bytes = crate::io::save_to_path(wb, &path, kind)?;
+    // WHIQ: a macro-enabled workbook saved in a format without macros loses them: say so.
+    let mut warnings: Vec<String> = vec![];
+    if wb.vba_project.is_some() && !matches!(kind, Some(crate::io::FileKind::Json)) && !gridcraft_xlsx::XlsxKind::from_path(&path).is_macro_enabled()
+    {
+        let stem = std::path::Path::new(&path).file_stem().and_then(|x| x.to_str()).unwrap_or("book");
+        warnings.push(format!(
+            "the workbook's macros (VBA project) were not saved: {path} has no room for them. Save it as .xlsm (e.g. {stem}.xlsm) to keep the macros; the workbook still holds them"
+        ));
+    }
     // Only a full-fidelity format clears the dirty flag and becomes the document's file.
     if matches!(kind, Some(crate::io::FileKind::Xlsx | crate::io::FileKind::Json)) {
         d.saved = d.wb.clone();
         d.path = Some(path.clone());
     }
-    Ok(json!({"path": path, "bytes": bytes}))
+    let mut out = json!({"path": path, "bytes": bytes});
+    if !warnings.is_empty() {
+        out["warnings"] = json!(warnings);
+    }
+    Ok(out)
 }
 
 fn save_as(s: &mut Session, p: &Json) -> Result<Json> {

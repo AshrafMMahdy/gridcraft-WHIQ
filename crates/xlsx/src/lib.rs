@@ -48,6 +48,7 @@ mod tests;
 use gridcraft_core::DateSystem;
 use gridcraft_model::Workbook;
 
+pub use array_formula::set_function_oracle;
 pub use crypto::{DecryptError, check_encryption, decrypt};
 pub use csv::{read_csv, write_csv, write_csv_range_into};
 pub use ods::read_ods;

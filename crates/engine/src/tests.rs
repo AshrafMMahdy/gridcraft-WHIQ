@@ -3323,3 +3323,49 @@ fn cancelled_commands_roll_back() {
     assert!(r.is_ok());
     assert_eq!(s.doc().unwrap().wb.sheet(0).unwrap().value(CellRef::new(1, 1)).as_f64(), Some(2.0));
 }
+
+/// WHIQ 0.7.6 (found by the command-sequence fuzzer, seed 3): shifting cells never cuts a merged
+/// cell, so two merges can't end up overlapping. Excel refuses these with "We can't do that to a
+/// merged cell".
+#[test]
+fn cell_shifts_never_cut_a_merged_cell() {
+    let mut s = Session::new();
+    s.new_workbook();
+    s.execute("home.mergeCells", json!({"range": "C10:G16"})).unwrap();
+    s.execute("home.mergeCells", json!({"range": "I10:J10"})).unwrap();
+    // The rows that would move hold only part of C10:G16.
+    let e = s.execute("home.deleteCells", json!({"range": "B10:F15", "shift": "left"})).unwrap_err().to_string();
+    assert!(e.contains("merged cell") && e.contains("C10:G16"), "{e}");
+    assert!(s.execute("home.insertCells", json!({"range": "B10:B12", "shift": "right"})).is_err());
+    assert!(s.execute("home.insertCells", json!({"range": "E12:E12", "shift": "down"})).is_err(), "inside a merge");
+    let merges = |s: &Session| s.doc().unwrap().wb.sheet(0).unwrap().merges.iter().map(|m| m.a1()).collect::<Vec<_>>();
+    assert_eq!(merges(&s), ["C10:G16", "I10:J10"]);
+    // Whole merges move.
+    s.execute("home.deleteCells", json!({"range": "A10:B16", "shift": "left"})).unwrap();
+    assert_eq!(merges(&s), ["A10:E16", "G10:H10"]);
+    s.execute("home.insertCells", json!({"range": "A1:K2", "shift": "down"})).unwrap();
+    assert_eq!(merges(&s), ["A12:E18", "G12:H12"]);
+}
+
+/// WHIQ 0.7.6 (G1): a sheet picture reports how far it is while it draws (the liveness rule), and
+/// a 260 × 250 sheet is drawn in seconds, not minutes.
+#[test]
+#[allow(clippy::disallowed_methods)] // the clock, in a native test
+fn a_large_sheet_picture_reports_progress_and_is_quick() {
+    let mut s = Session::new();
+    s.new_workbook();
+    let rows: Vec<serde_json::Value> = (0..260).map(|r| json!((0..250).map(|c| json!(r * 1000 + c)).collect::<Vec<_>>())).collect();
+    s.execute("range.setValues", json!({"range": "A1", "values": rows})).unwrap();
+    let wb = s.doc().unwrap().wb.clone();
+    gridcraft_core::progress::watch_this_thread();
+    gridcraft_core::progress::reset("render_sheet");
+    let t0 = std::time::Instant::now();
+    let o = crate::cmd::print::PngOptions { scale: 1.0, ..Default::default() };
+    let (png, w, h, _) = crate::cmd::print::render_png(&wb, 0, None, &o).unwrap();
+    let took = t0.elapsed();
+    assert!(png.len() > 1000 && w > 10_000 && h > 4_000, "{w}×{h}");
+    let p = gridcraft_core::progress::current().unwrap();
+    assert!(p.stages.iter().any(|st| st == "drawing cells"), "{p:?}");
+    assert!(p.done > 0 && p.overall > 0.5, "{p:?}");
+    assert!(took.as_secs_f64() < 60.0, "took {took:?}");
+}

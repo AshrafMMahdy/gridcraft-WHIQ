@@ -33,6 +33,7 @@ fn chart_xml(kind: ChartKind, series: Vec<Series>) -> (String, Chart) {
         style: 2,
         x_title: None,
         y_title: None,
+        y2_title: None,
         source: None,
         by_rows: false,
         pivot: None,

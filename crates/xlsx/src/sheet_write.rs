@@ -167,17 +167,8 @@ fn write_sheet_with(wb: &Workbook, si: usize, selected: bool, out: &mut Out, sin
 
     let mut s = format!("{XML_DECL}<worksheet xmlns=\"{NS_MAIN}\" xmlns:r=\"{NS_REL}\">");
     // sheetPr
-    let fit = sheet.print.fit_to.is_some();
-    if sheet.tab_color.is_some() || fit {
-        s.push_str("<sheetPr>");
-        if let Some(c) = &sheet.tab_color {
-            let _ = write!(s, "<tabColor {}/>", color_attrs(c));
-        }
-        if fit {
-            s.push_str("<pageSetUpPr fitToPage=\"1\"/>");
-        }
-        s.push_str("</sheetPr>");
-    }
+    // WHIQ: with the VBA code name and what the file had that the model does not hold.
+    s.push_str(&crate::kept::sheet_pr_xml(sheet, sheet.tab_color.as_ref().map(|c| format!("<tabColor {}/>", color_attrs(c)))));
     let mut used = sheet.cells.used_range();
     for c in extra.keys().chain(overrides.keys()) {
         let r = RangeRef::cell(*c);
@@ -380,17 +371,26 @@ fn write_sheet_with(wb: &Workbook, si: usize, selected: bool, out: &mut Out, sin
 
     // sheetProtection
     if let Some(p) = &sheet.protection {
-        s.push_str("<sheetProtection sheet=\"1\" objects=\"1\" scenarios=\"1\"");
+        s.push_str("<sheetProtection sheet=\"1\"");
+        // WHIQ: objects and scenarios are protected unless the protection allows editing them.
+        if !p.edit_objects {
+            s.push_str(" objects=\"1\"");
+        }
+        if !p.edit_scenarios {
+            s.push_str(" scenarios=\"1\"");
+        }
         for (attr, allowed) in [
             ("formatCells", p.format_cells),
             ("formatColumns", p.format_columns),
             ("formatRows", p.format_rows),
             ("insertColumns", p.insert_columns),
             ("insertRows", p.insert_rows),
+            ("insertHyperlinks", p.insert_hyperlinks),
             ("deleteColumns", p.delete_columns),
             ("deleteRows", p.delete_rows),
             ("sort", p.sort),
             ("autoFilter", p.autofilter),
+            ("pivotTables", p.pivot_tables),
         ] {
             if allowed {
                 let _ = write!(s, " {attr}=\"0\"");
@@ -560,7 +560,14 @@ fn write_sheet_with(wb: &Workbook, si: usize, selected: bool, out: &mut Out, sin
     // Drawing: pictures, charts, shapes.
     let slicer_frames: Vec<(&gridcraft_model::Slicer, String)> =
         sheet.slicers.iter().filter_map(|sl| crate::slicers::frame_name(&out.slicer_plan, si, sl).map(|n| (sl, n.to_string()))).collect();
-    if !sheet.images.is_empty() || !sheet.charts.is_empty() || !sheet.shapes.is_empty() || !slicer_frames.is_empty() {
+    // WHIQ: Excel 2010 form controls' drawing twins, while the controls themselves are kept.
+    let twins: Vec<&str> = match sheet.preserved.as_deref() {
+        Some(p) if p.elements.iter().any(|e| e.slot == "controls") => {
+            p.elements.iter().filter(|e| e.slot == "controlTwin").map(|e| e.xml.as_str()).collect()
+        }
+        _ => vec![],
+    };
+    if !sheet.images.is_empty() || !sheet.charts.is_empty() || !sheet.shapes.is_empty() || !slicer_frames.is_empty() || !twins.is_empty() {
         out.drawings += 1;
         let dn = out.drawings;
         let mut drels = Rels::default();
@@ -612,6 +619,7 @@ fn write_sheet_with(wb: &Workbook, si: usize, selected: bool, out: &mut Out, sin
         for (sl, name) in &slicer_frames {
             objs.push(Obj::Slicer(sl, name.clone()));
         }
+        objs.extend(twins.iter().map(|x| Obj::Raw(x)));
         out.part(&format!("xl/drawings/drawing{dn}.xml"), Some(CT_DRAWING), crate::drawing::write_drawing(sheet, &wb.theme, &objs).into_bytes());
         if !drels.is_empty() {
             out.part(&format!("xl/drawings/_rels/drawing{dn}.xml.rels"), None, drels.xml().into_bytes());

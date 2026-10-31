@@ -312,6 +312,26 @@ fn axis_titles(ctx: &mut Ctx, chart: &Chart, mut area: Bx) -> Bx {
         area.x += lh;
         area.w -= lh;
     }
+    // WHIQ: the secondary value axis' title, on the right, when a series is plotted there.
+    if chart.series.iter().any(|s| s.secondary)
+        && let Some(t) = chart.y2_title.as_deref().map(str::trim).filter(|t| !t.is_empty())
+    {
+        let t = ctx.fit(t, AXIS_TITLE_SIZE, area.h);
+        if !t.is_empty() {
+            ctx.out.push(Prim::Text {
+                x: area.x + area.w,
+                y: area.cy(),
+                text: t,
+                size: AXIS_TITLE_SIZE,
+                color: TEXT,
+                bold: false,
+                align: HAlign::Center,
+                valign: VAlign::Top,
+                rotation: PI / 2.0,
+            });
+        }
+        area.w -= lh;
+    }
     area
 }
 

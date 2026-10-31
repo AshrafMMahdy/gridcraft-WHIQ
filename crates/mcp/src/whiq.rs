@@ -1931,6 +1931,23 @@ pub fn classify(b: &mut dyn Backend, tool: &str, a: &Args, msg: &str) -> ToolErr
         }
         return e;
     }
+    // WHIQ: protection refusals say what is protected and what can still be edited.
+    if m.contains("on a protected sheet")
+        || m.contains("is on a protected sheet")
+        || m.contains("needs its password before it can be changed")
+        || m.contains("workbook is protected")
+        || m.contains("sheet is protected with a password")
+    {
+        return protected_error(b, a, msg, &m);
+    }
+    // WHIQ: every formula the engine refuses to store is an argument to fix.
+    if m.contains("problem with this formula") || m.contains("has too few arguments") || m.contains("has too many arguments") {
+        return ToolError::new(
+            "invalid_argument",
+            msg,
+            "fix the formula where the reason says (characters count from the `=`) and send it again; evaluate_formula checks a formula without writing it, list_functions finds a function's name",
+        );
+    }
     if m.starts_with("cancelled:") || m.contains(": cancelled:") {
         return ToolError::new("cancelled", msg, "the call was stopped as asked and changed nothing; run it again when you need it");
     }
@@ -2052,6 +2069,73 @@ pub fn classify(b: &mut dyn Backend, tool: &str, a: &Args, msg: &str) -> ToolErr
         return ToolError::new("invalid_argument", msg, next);
     }
     ToolError::new("failed", msg, "check the arguments against the tool's schema; inspect_workbook shows the current state")
+}
+
+/// WHIQ: a refusal by sheet or workbook protection: code `protected`, and a next step naming the
+/// sheet, the cells and Allow Edit Ranges that can still be edited, and who can unprotect it.
+fn protected_error(b: &mut dyn Backend, a: &Args, msg: String, lower: &str) -> ToolError {
+    if lower.contains("workbook is protected") {
+        return ToolError::new(
+            "protected",
+            msg,
+            "the workbook's structure is protected: no sheet can be inserted, deleted, renamed, moved, copied, hidden, unhidden or given a tab colour. \
+             Work in the sheets that exist (their cells can still be edited unless the sheet itself is protected), or ask the owner to unprotect the workbook (Review › Protect Workbook)",
+        )
+        .with("protected", json!("workbook"));
+    }
+    let info = b.call("document.inspect", json!({})).unwrap_or(Value::Null);
+    let sheets = info["sheets"].as_array().cloned().unwrap_or_default();
+    // The sheet the engine named (`sheet "Data"`), else the one the call names, else the active one.
+    let named = msg.rfind("sheet \"").and_then(|i| {
+        let rest = msg.get(i + 7..)?;
+        rest.get(..rest.rfind("\")")?).map(str::to_string)
+    });
+    let wanted = named
+        .or_else(|| a.get("sheet").and_then(Value::as_str).map(str::to_string))
+        .or_else(|| a.get("range").or(a.get("cell")).and_then(Value::as_str).and_then(|r| split_sheet(r).0))
+        .or_else(|| info["activeSheet"].as_u64().and_then(|i| sheets.get(i as usize)).and_then(|s| s["name"].as_str()).map(str::to_string))
+        .unwrap_or_default();
+    let sh = sheets.iter().find(|s| s["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(&wanted))).cloned().unwrap_or(Value::Null);
+    let name = sh["name"].as_str().unwrap_or(&wanted).to_string();
+    let pr = &sh["protection"];
+    let cells: Vec<String> = pr["unlockedCells"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string).collect();
+    let more = pr["unlockedMore"].as_u64().unwrap_or(0);
+    let ranges: Vec<String> = pr["editRanges"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|r| {
+            let refs: Vec<&str> = r["ranges"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+            format!(
+                "\"{}\" ({}{})",
+                r["title"].as_str().unwrap_or(""),
+                refs.join(","),
+                if r["password"] == true { ", unlocked with its password" } else { "" }
+            )
+        })
+        .collect();
+    let mut can = vec![];
+    if !cells.is_empty() {
+        can.push(format!("its unlocked cells {}{}", cells.join(", "), if more > 0 { format!(" (and {more} more)") } else { String::new() }));
+    }
+    if !ranges.is_empty() {
+        can.push(format!("its Allow Edit Ranges {}", ranges.join(", ")));
+    }
+    let next = if can.is_empty() {
+        format!(
+            "sheet \"{name}\" is protected and has no unlocked cells or Allow Edit Ranges: ask the owner to unprotect it (Review › Unprotect Sheet)"
+        )
+    } else {
+        format!(
+            "sheet \"{name}\" is protected: you can still write {}. For anything else ask the owner to unprotect the sheet (Review › Unprotect Sheet)",
+            can.join(" and ")
+        )
+    };
+    ToolError::new("protected", msg, next)
+        .with("protected", json!("sheet"))
+        .with("sheet", json!(name))
+        .with("unlocked_cells", json!(cells))
+        .with("edit_ranges", pr["editRanges"].clone())
 }
 
 /// Files next to `path` whose names are close to its name (only inside the read root, if any).

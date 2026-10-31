@@ -16,6 +16,102 @@ use crate::passthrough::{anchor_fingerprint, chart_fingerprint, map_rel_ids, par
 use crate::write::Out;
 use crate::xml::{self, esc, num};
 
+/// WHIQ: attributes of `<workbookPr>` (CT_WorkbookPr) the model does not hold, kept as read.
+pub(crate) const WORKBOOK_PR_ATTRS: &[&str] = &[
+    "showObjects",
+    "showBorderUnselectedTables",
+    "filterPrivacy",
+    "promptedSolutions",
+    "showInkAnnotation",
+    "backupFile",
+    "saveExternalLinkValues",
+    "updateLinks",
+    "hidePivotFieldList",
+    "showPivotChartFilter",
+    "allowRefreshQuery",
+    "publishItems",
+    "checkCompatibility",
+    "autoCompressPictures",
+    "refreshAllConnections",
+    "defaultThemeVersion",
+];
+/// Attributes of `<sheetPr>` (CT_SheetPr) the model does not hold (`filterMode` is written only
+/// while the sheet has a filter).
+pub(crate) const SHEET_PR_ATTRS: &[&str] = &[
+    "syncHorizontal",
+    "syncVertical",
+    "syncRef",
+    "transitionEvaluation",
+    "transitionEntry",
+    "published",
+    "filterMode",
+    "enableFormatConditionsCalculation",
+];
+/// `<outlinePr>` (not modelled) and `<pageSetUpPr>` without `fitToPage` (modelled).
+pub(crate) const OUTLINE_PR_ATTRS: &[&str] = &["applyStyles", "summaryBelow", "summaryRight", "showOutlineSymbols"];
+pub(crate) const PAGE_SETUP_PR_ATTRS: &[&str] = &["autoPageBreaks"];
+
+/// ` a="v" b="w"`: the attributes of `e` named in `names`, in the schema's order, escaped.
+pub(crate) fn schema_attrs(e: &xml::El, names: &[&str]) -> String {
+    let mut s = String::new();
+    for n in names {
+        if let Some(v) = e.attr(n) {
+            let _ = write!(s, " {n}=\"{}\"", xml::esc_attr(v));
+        }
+    }
+    s
+}
+
+/// The kept text of a workbook or sheet slot (attribute lists of `workbookPr`, `sheetPr`…).
+pub(crate) fn kept_slot<'a>(p: Option<&'a gridcraft_model::Preserved>, slot: &str) -> &'a str {
+    p.and_then(|p| p.elements.iter().find(|e| e.slot == slot)).map_or("", |e| e.xml.as_str())
+}
+
+/// `<sheetPr>` from the model and the attributes and children kept from the file.
+pub(crate) fn sheet_pr_xml(sheet: &Sheet, tab_color: Option<String>) -> String {
+    let p = sheet.preserved.as_deref();
+    let mut attrs = String::new();
+    if let Some(cn) = sheet.code_name.as_deref().filter(|c| !c.is_empty()) {
+        let _ = write!(attrs, " codeName=\"{}\"", xml::esc_attr(cn));
+    }
+    let kept = kept_slot(p, "sheetPr");
+    if sheet.autofilter.is_some() {
+        attrs.push_str(kept);
+    } else {
+        // A filter mode without a filter would be stale.
+        for part in split_attrs(kept).into_iter().filter(|a| !a.trim_start().starts_with("filterMode=")) {
+            attrs.push_str(&part);
+        }
+    }
+    let mut kids = tab_color.unwrap_or_default();
+    let outline = kept_slot(p, "outlinePr");
+    if !outline.is_empty() {
+        let _ = write!(kids, "<outlinePr{outline}/>");
+    }
+    let page = kept_slot(p, "pageSetUpPr");
+    let fit = sheet.print.fit_to.is_some();
+    if fit || !page.is_empty() {
+        let _ = write!(kids, "<pageSetUpPr{page}{}/>", if fit { " fitToPage=\"1\"" } else { "" });
+    }
+    match (attrs.is_empty(), kids.is_empty()) {
+        (true, true) => String::new(),
+        (_, true) => format!("<sheetPr{attrs}/>"),
+        _ => format!("<sheetPr{attrs}>{kids}</sheetPr>"),
+    }
+}
+
+/// ` a="1" b="2"` → [` a="1"`, ` b="2"`] (values are escaped: no `"` inside).
+fn split_attrs(s: &str) -> Vec<String> {
+    let mut out = vec![];
+    let mut rest = s;
+    while let Some(q1) = rest.find('"') {
+        let Some(q2) = rest.get(q1 + 1..).and_then(|r| r.find('"')).map(|j| q1 + 1 + j) else { break };
+        out.push(rest.get(..=q2).unwrap_or("").to_string());
+        rest = rest.get(q2 + 1..).unwrap_or("");
+    }
+    out
+}
+
 /// The kept part of `ch` when the chart is the one read (not edited since).
 pub(crate) fn kept_chart<'a>(sheet: &'a Sheet, ch: &Chart) -> Option<&'a PreservedChart> {
     let k = sheet.preserved.as_deref()?.charts.iter().find(|k| k.id == ch.id)?;
