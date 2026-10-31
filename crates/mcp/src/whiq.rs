@@ -501,7 +501,8 @@ fn preview_definitions() -> Vec<Value> {
             "define_name",
             "Define name",
             "Create a named range or constant (or change one, with `old_name`): {name, refers_to: \"=Sheet1!$A$2:$A$20\", scope?}. \
-             inspect_workbook lists the names.",
+             A custom function is a name whose refers_to is a LAMBDA, as in Excel 365: refers_to \"=LAMBDA(qty,rate,qty*rate)\" \
+             makes =NAME(B2,C2) usable in any cell (saved as Excel saves it; no VBA). inspect_workbook lists the names.",
             obj(
                 json!({
                     "name": string("The name, e.g. \"Rates\""),
