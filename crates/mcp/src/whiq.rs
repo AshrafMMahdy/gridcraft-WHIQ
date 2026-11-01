@@ -931,7 +931,10 @@ fn named_sheet(op: &Value) -> Option<String> {
     if let Some(s) = o.get("sheet").and_then(Value::as_str) {
         return Some(s.to_string());
     }
-    ["range", "cell", "ref", "target"].iter().find_map(|k| o.get(*k).and_then(Value::as_str)).and_then(|r| r.rsplit_once('!').map(|(sh, _)| sh.trim_matches('\'').to_string()))
+    ["range", "cell", "ref", "target"]
+        .iter()
+        .find_map(|k| o.get(*k).and_then(Value::as_str))
+        .and_then(|r| r.rsplit_once('!').map(|(sh, _)| sh.trim_matches('\'').to_string()))
 }
 
 fn with_sheet(b: &mut dyn Backend, a: &Args, f: impl FnOnce(&mut dyn Backend) -> Result<Value, String>) -> Result<Value, String> {
