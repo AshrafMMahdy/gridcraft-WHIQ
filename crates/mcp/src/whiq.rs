@@ -855,11 +855,17 @@ pub(crate) fn dispatch_extra(b: &mut dyn Backend, name: &str, a: &Args) -> Resul
             }
             Ok(v)
         }
-        "insert_rows" => with_sheet(b, a, |b| exec(b, "home.insertRows", json!({"rows": span(a, "rows")}))),
-        "insert_columns" => with_sheet(b, a, |b| exec(b, "home.insertColumns", json!({"cols": span(a, "cols")}))),
-        "delete_rows" => with_sheet(b, a, |b| exec(b, "home.deleteRows", json!({"rows": span(a, "rows")}))),
-        "delete_columns" => with_sheet(b, a, |b| exec(b, "home.deleteColumns", json!({"cols": span(a, "cols")}))),
-        "rename_sheet" => exec(b, "sheet.rename", pick(a, &["sheet", "name"])),
+        // WHIQ (2026-11-01): these commands answer null — the tool says what it did and where, so an agent need not read back.
+        "insert_rows" => with_sheet(b, a, |b| exec(b, "home.insertRows", json!({"rows": span(a, "rows")})))
+            .and_then(|v| confirmed(b, a, v, json!({"inserted_rows": span(a, "rows")}))),
+        "insert_columns" => with_sheet(b, a, |b| exec(b, "home.insertColumns", json!({"cols": span(a, "cols")})))
+            .and_then(|v| confirmed(b, a, v, json!({"inserted_columns": span(a, "cols")}))),
+        "delete_rows" => with_sheet(b, a, |b| exec(b, "home.deleteRows", json!({"rows": span(a, "rows")})))
+            .and_then(|v| confirmed(b, a, v, json!({"deleted_rows": span(a, "rows")}))),
+        "delete_columns" => with_sheet(b, a, |b| exec(b, "home.deleteColumns", json!({"cols": span(a, "cols")})))
+            .and_then(|v| confirmed(b, a, v, json!({"deleted_columns": span(a, "cols")}))),
+        "rename_sheet" => exec(b, "sheet.rename", pick(a, &["sheet", "name"]))
+            .map(|v| if v.is_null() { json!({"ok": true, "renamed": {"from": a.get("sheet").cloned().unwrap_or(Value::Null), "to": a.get("name").cloned().unwrap_or(Value::Null)}}) } else { v }),
         "add_sheet" => exec(b, "home.insertSheet", pick(a, &["name", "before"])),
         "conditional_format" => exec(b, "home.conditionalFormat", pick(a, &["range", "rule"])),
         "data_validation" => exec(
@@ -899,6 +905,35 @@ fn span(a: &Args, key: &str) -> String {
 }
 
 /// Runs `f` with `sheet` (when given) active, then puts the previous active sheet back.
+/// The name of the workbook's active sheet (document.inspect), if it says.
+fn active_sheet_name(b: &mut dyn Backend) -> Option<String> {
+    let info = b.call("document.inspect", json!({})).ok()?;
+    let i = info["activeSheet"].as_u64()? as usize;
+    let sh = info["sheets"].as_array()?.get(i)?.clone();
+    sh.as_str().map(str::to_string).or_else(|| sh["name"].as_str().map(str::to_string))
+}
+
+/// A structural command's null answer made a confirmation: what it did and on which sheet (WHIQ, 2026-11-01).
+fn confirmed(b: &mut dyn Backend, a: &Args, v: Value, what: Value) -> Result<Value, String> {
+    if !v.is_null() {
+        return Ok(v);
+    }
+    let sheet = a.get("sheet").and_then(Value::as_str).map(str::to_string).or_else(|| active_sheet_name(b));
+    let mut out = what;
+    out["ok"] = json!(true);
+    out["sheet"] = json!(sheet);
+    Ok(out)
+}
+
+/// The sheet an operation names (its `sheet`, or a `Sheet!A1` range / cell), if any.
+fn named_sheet(op: &Value) -> Option<String> {
+    let o = op.get("args").or_else(|| op.get("arguments")).unwrap_or(op);
+    if let Some(s) = o.get("sheet").and_then(Value::as_str) {
+        return Some(s.to_string());
+    }
+    ["range", "cell", "ref", "target"].iter().find_map(|k| o.get(*k).and_then(Value::as_str)).and_then(|r| r.rsplit_once('!').map(|(sh, _)| sh.trim_matches('\'').to_string()))
+}
+
 fn with_sheet(b: &mut dyn Backend, a: &Args, f: impl FnOnce(&mut dyn Backend) -> Result<Value, String>) -> Result<Value, String> {
     let Some(sheet) = a.get("sheet").and_then(Value::as_str) else { return f(b) };
     let before = b.call("document.inspect", json!({}))?["activeSheet"].as_u64();
@@ -1687,8 +1722,21 @@ fn batch(b: &mut dyn Backend, st: &mut CallState, a: &Args, warnings: &mut Vec<S
             .with("stopped_at", json!(i))
             .with("rolled_back", json!(rolled)));
         }
+        // WHIQ (2026-11-01): an operation that names no sheet acts on the ACTIVE one — the result says which, and a
+        // workbook of several sheets gets a warning (a hosted run overwrote another sheet's formula this way, silently).
+        let implicit = if named_sheet(op).is_none() { active_sheet_name(b) } else { None };
         match batch_op(b, st, &defs, op, warnings) {
-            Ok((name, v)) => results.push(json!({"index": i, "op": name, "ok": true, "result": v})),
+            Ok((name, v)) => {
+                let mut r = json!({"index": i, "op": name, "ok": true, "result": v});
+                if let Some(sh) = implicit {
+                    let several = b.call("document.inspect", json!({})).ok().and_then(|x| x["sheets"].as_array().map(Vec::len)).unwrap_or(1) > 1;
+                    if several {
+                        warnings.push(format!("operation {} (`{name}`) named no sheet: it acted on the active sheet \"{sh}\" — name the sheet (Sheet!A1) when the workbook has several", i + 1));
+                    }
+                    r["sheet"] = json!(sh);
+                }
+                results.push(r)
+            }
             Err((name, e)) => {
                 failed += 1;
                 results.push(json!({"index": i, "op": name, "ok": false, "error": e.to_value()}));

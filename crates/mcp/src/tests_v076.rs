@@ -478,3 +478,27 @@ fn pivot_tables_that_share_a_cache_keep_sharing_it() {
     let info = ok(&mut t, "inspect_workbook", json!({}));
     assert!(text(&info).contains("Pivot2"));
 }
+
+// ---------------------------------------------------------------- WHIQ 0.7.7 (hosted test 2026-11-01)
+
+#[test]
+fn structural_tools_confirm_and_a_sheetless_batch_op_names_the_active_sheet() {
+    let mut s = server();
+    ok(&mut s, "build_workbook", json!({"sheets": [{"name": "Costs", "rows": [["Item"], [1], [2], [3]]}, {"name": "Overview", "rows": [["x"]]}]}));
+    let r = ok(&mut s, "insert_rows", json!({"rows": "2", "sheet": "Costs"}));
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["sheet"], "Costs", "{r}");
+    assert!(r.get("inserted_rows").is_some(), "{r}");
+    let r = ok(&mut s, "delete_rows", json!({"rows": "2", "sheet": "Costs"}));
+    assert_eq!(r["ok"], true, "{r}");
+    assert!(r.get("deleted_rows").is_some(), "{r}");
+    let r = ok(&mut s, "rename_sheet", json!({"sheet": "Overview", "name": "Summary"}));
+    assert_eq!(r["renamed"]["to"], "Summary", "{r}");
+    // A batch op with no sheet acts on the active sheet: the result says which, and several sheets warn.
+    let r = ok(&mut s, "batch", json!({"ops": [{"op": "set", "cell": "B2", "value": 5}, {"op": "set", "cell": "Costs!C2", "value": 6}]}));
+    let res = r["results"].as_array().unwrap();
+    assert!(res[0]["sheet"].is_string(), "{r}");
+    assert!(res[1].get("sheet").is_none(), "{r}");
+    let w = r["warnings"].to_string();
+    assert!(w.contains("named no sheet"), "{r}");
+}

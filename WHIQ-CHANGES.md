@@ -958,3 +958,13 @@ progress notifications.
   italic face in craft-fonts, so bold CJK is the regular weight and italic CJK is slanted.
   System fonts are not looked up (every export looks the same on every machine).
 - Upstream's docs (`docs/*.md`, ROADMAP) are not edited by the fork; this file is the record.
+
+## v0.7.7 — hosted-test findings (2026-11-01)
+
+- **Structural tools confirm** — `insert_rows`, `delete_rows`, `insert_columns`, `delete_columns` answer
+  `{ok, sheet, inserted_rows|deleted_rows|…}` and `rename_sheet` `{ok, renamed: {from, to}}` instead of `null`, so an
+  agent need not read back to know what happened and where (`crates/mcp/src/whiq.rs` `confirmed`).
+- **A sheetless batch operation names the sheet it used** — an op with no `sheet` and no `Sheet!A1` reference acts on
+  the active sheet; its result now carries `sheet`, and a workbook of several sheets adds a warning (a hosted run had
+  overwritten another sheet's formula silently). Test: `tests_v076.rs`
+  `structural_tools_confirm_and_a_sheetless_batch_op_names_the_active_sheet`.
