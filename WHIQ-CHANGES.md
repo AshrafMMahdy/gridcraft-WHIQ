@@ -968,3 +968,10 @@ progress notifications.
   the active sheet; its result now carries `sheet`, and a workbook of several sheets adds a warning (a hosted run had
   overwritten another sheet's formula silently). Test: `tests_v076.rs`
   `structural_tools_confirm_and_a_sheetless_batch_op_names_the_active_sheet`.
+
+## add_sheet without a position appends at the end (2026-11-02, whiq-v0.7.8)
+
+The tool says "default: after the last"; the engine's own default is Excel's "+" (after the ACTIVE sheet), so after
+`build_workbook` (active sheet 0) an agent's new sheets landed at position 1 and it had to reorder them by hand (pilot).
+`add_sheet` with no `before` now passes the end position. Test `add_sheet_without_a_position_appends_at_the_end`
+(`crates/mcp/src/tests_v076.rs`).

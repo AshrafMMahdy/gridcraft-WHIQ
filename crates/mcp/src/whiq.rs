@@ -866,7 +866,17 @@ pub(crate) fn dispatch_extra(b: &mut dyn Backend, name: &str, a: &Args) -> Resul
             .and_then(|v| confirmed(b, a, v, json!({"deleted_columns": span(a, "cols")}))),
         "rename_sheet" => exec(b, "sheet.rename", pick(a, &["sheet", "name"]))
             .map(|v| if v.is_null() { json!({"ok": true, "renamed": {"from": a.get("sheet").cloned().unwrap_or(Value::Null), "to": a.get("name").cloned().unwrap_or(Value::Null)}}) } else { v }),
-        "add_sheet" => exec(b, "home.insertSheet", pick(a, &["name", "before"])),
+        // WHIQ: no position given → after the LAST sheet, as the tool says (the engine's own default is Excel's "+":
+        // after the active sheet, which put an agent's second new sheet at position 1).
+        "add_sheet" => {
+            let mut args = pick(a, &["name", "before"]);
+            if args.get("before").is_none_or(Value::is_null)
+                && let Some(o) = args.as_object_mut()
+            {
+                o.insert("before".into(), json!(u32::MAX));
+            }
+            exec(b, "home.insertSheet", args)
+        }
         "conditional_format" => exec(b, "home.conditionalFormat", pick(a, &["range", "rule"])),
         "data_validation" => exec(
             b,

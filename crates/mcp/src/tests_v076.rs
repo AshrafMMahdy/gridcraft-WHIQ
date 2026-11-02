@@ -502,3 +502,17 @@ fn structural_tools_confirm_and_a_sheetless_batch_op_names_the_active_sheet() {
     let w = r["warnings"].to_string();
     assert!(w.contains("named no sheet"), "{r}");
 }
+
+/// WHIQ 2026-11-02 (pilot): `add_sheet` without a position appends after the LAST sheet, as its description says — the
+/// engine's Excel "+" default (after the active sheet) put an agent's new sheets at position 1 of a built workbook.
+#[test]
+fn add_sheet_without_a_position_appends_at_the_end() {
+    let mut s = server();
+    ok(&mut s, "build_workbook", json!({"sheets": [{"name": "Basis", "rows": [[1]]}, {"name": "Findings", "rows": [[2]]}]}));
+    ok(&mut s, "execute_command", json!({"command": "sheet.activate", "params": {"sheet": "Basis"}}));
+    ok(&mut s, "add_sheet", json!({"name": "L1"}));
+    ok(&mut s, "add_sheet", json!({"name": "L2", "before": 0}));
+    let wb = ok(&mut s, "inspect_workbook", json!({}));
+    let names: Vec<String> = wb["sheets"].as_array().unwrap().iter().map(|x| x["name"].as_str().unwrap_or_default().to_string()).collect();
+    assert_eq!(names, ["L2", "Basis", "Findings", "L1"], "{wb}");
+}
