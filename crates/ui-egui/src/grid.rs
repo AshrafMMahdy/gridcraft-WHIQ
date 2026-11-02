@@ -2240,7 +2240,7 @@ fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &
                 let d = (p - start) / geo.z;
                 let (cell, dx, dy, w, h) = orig;
                 let params = if resize {
-                    json!({"kind": kind, "id": id, "width": (w + d.x).max(20.0), "height": (h + d.y).max(20.0)})
+                    json!({"kind": kind, "id": id, "width": (w + d.x).max(20.0), "height": (h + d.y).max(20.0), "lockAspect": false})
                 } else {
                     // Re-anchor at the cell under the new top-left.
                     let x0 = sh.col_left(cell.col) as f32 + dx + d.x;

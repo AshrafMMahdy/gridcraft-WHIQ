@@ -3369,3 +3369,36 @@ fn a_large_sheet_picture_reports_progress_and_is_quick() {
     assert!(p.done > 0 && p.overall > 0.5, "{p:?}");
     assert!(took.as_secs_f64() < 60.0, "took {took:?}");
 }
+
+/// WHIQ (owner, 2026-11-02): a picture keeps its aspect ratio unless `lockAspect: false` — one side given, the other follows;
+/// both given while locked, the width wins and the answer says the height was not used; unlocked, both apply with a note.
+#[test]
+fn whiq_pictures_keep_their_aspect_ratio_unless_unlocked() {
+    let mut s = s();
+    let img = image::RgbaImage::from_pixel(200, 100, image::Rgba([10, 20, 30, 255]));
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(img).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    let b64 = crate::io::base64_encode(&png);
+    let size = |s: &Session, id: u32| {
+        let a = &s.doc().unwrap().wb.active().unwrap().images.iter().find(|i| i.id == id).unwrap().anchor;
+        (a.width, a.height)
+    };
+    // a width alone: the height follows (it used to stay at the picture's own, stretching it)
+    let r = s.execute("insert.picture", json!({"base64": b64, "at": "B2", "width": 100})).unwrap();
+    let id = r["image"].as_u64().unwrap() as u32;
+    assert_eq!(size(&s, id), (100.0, 50.0));
+    // both while locked: the width wins, the answer says so
+    let r = s.execute("object.move", json!({"kind": "image", "id": id, "width": 300, "height": 300})).unwrap();
+    assert_eq!(size(&s, id), (300.0, 150.0));
+    assert!(r["note"].as_str().unwrap().contains("was not used"), "{r}");
+    // a height alone: the width follows
+    s.execute("object.move", json!({"kind": "image", "id": id, "height": 40})).unwrap();
+    assert_eq!(size(&s, id), (80.0, 40.0));
+    // unlocked: both apply and the answer warns of the change of shape
+    let r = s.execute("object.move", json!({"kind": "image", "id": id, "width": 50, "height": 50, "lockAspect": false})).unwrap();
+    assert_eq!(size(&s, id), (50.0, 50.0));
+    assert!(r["note"].as_str().unwrap().contains("squeezed or stretched"), "{r}");
+    // both on insert while locked
+    let r = s.execute("insert.picture", json!({"base64": b64, "width": 60, "height": 60})).unwrap();
+    assert_eq!(size(&s, r["image"].as_u64().unwrap() as u32), (60.0, 30.0));
+}

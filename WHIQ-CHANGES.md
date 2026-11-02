@@ -975,3 +975,13 @@ The tool says "default: after the last"; the engine's own default is Excel's "+"
 `build_workbook` (active sheet 0) an agent's new sheets landed at position 1 and it had to reorder them by hand (pilot).
 `add_sheet` with no `before` now passes the end position. Test `add_sheet_without_a_position_appends_at_the_end`
 (`crates/mcp/src/tests_v076.rs`).
+
+## A picture keeps its aspect ratio unless unlocked (2026-11-02, whiq-v0.7.9)
+
+Owner's rule, as in Excel and PowerPoint: `insert.picture` (floating) and `object.move` on an image lock the ratio by
+default. One side given, the other follows (a width alone used to leave the height at the picture's own, stretching it);
+both given, the width wins and the answer's `note` says the height asked for was not used and that `lockAspect: false`
+sets both freely, warning that a large change of shape squeezes or stretches the photo. With `lockAspect: false` both
+apply as given and the note says the shape changed. Answers carry `width` / `height`. Charts and shapes move and size as
+before; the desktop app's drag handle passes `lockAspect: false` and resizes freely as it did.
+Test: `tests.rs` `whiq_pictures_keep_their_aspect_ratio_unless_unlocked`.

@@ -119,7 +119,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Picture",
             ["Insert", "Illustrations"],
             None,
-            "{path? | base64?: \"...\", mime?, at?: \"B2\", width?, height?, alt?, mode?: moveOnly|moveAndSize|absolute, placement?: cell|overCells}",
+            "{path? | base64?: \"...\", mime?, at?: \"B2\", width?, height?, alt?, mode?: moveOnly|moveAndSize|absolute, placement?: cell|overCells, lockAspect?: bool (default true: one side follows the other; both given, the width wins)}",
             has_doc,
             insert_picture
         ),
@@ -147,7 +147,7 @@ pub fn specs() -> Vec<CommandSpec> {
         )),
         cmd!("shape.setText", "Edit Text Box", [], None, "{id: textBox id, text: string}", has_doc, shape_set_text),
         cmd!("object.delete", "Delete Object", [], None, "{kind: chart|image|shape, id}", has_doc, delete_object),
-        cmd!("object.move", "Move Object", [], None, "{kind: chart|image|shape, id, at?: \"C3\", dx?, dy?, width?, height?}", has_doc, move_object),
+        cmd!("object.move", "Move Object", [], None, "{kind: chart|image|shape, id, at?: \"C3\", dx?, dy?, width?, height?, lockAspect?: bool (an image: default true — one side follows the other; both given, the width wins)}", has_doc, move_object),
         cmd!(
             "object.setAnchorMode",
             "Object Properties",
@@ -1139,14 +1139,19 @@ fn insert_picture(s: &mut Session, p: &Json) -> Result<Json> {
     let id = d.wb.next_object_id();
     let at = cell_param(s, p, "at")?.unwrap_or(d.selection.active);
     let scale = (640.0 / w.max(1) as f32).min(1.0);
+    // WHIQ (owner, 2026-11-02): a picture keeps its aspect ratio unless `lockAspect: false`, as in Excel and PowerPoint — one
+    // side given, the other follows (a width alone used to leave the height at the picture's own, stretching it); both given
+    // while locked, the width wins and the answer says the height asked for was not used.
+    let ratio = if h > 0 { w as f32 / h as f32 } else { 1.0 };
+    let (pw, ph, note) = picture_size(f64_param(p, "width").map(|v| v as f32), f64_param(p, "height").map(|v| v as f32), (w as f32 * scale, h as f32 * scale), ratio, bool_param(p, "lockAspect").unwrap_or(true));
     let img = Image {
         id,
         anchor: Anchor {
             cell: at,
             dx: 0.0,
             dy: 0.0,
-            width: f64_param(p, "width").map(|v| v as f32).unwrap_or(w as f32 * scale),
-            height: f64_param(p, "height").map(|v| v as f32).unwrap_or(h as f32 * scale),
+            width: pw,
+            height: ph,
             // Excel inserts pictures as "Move but don't size with cells" (`editAs="oneCell"`).
             mode: anchor_mode_param(p).unwrap_or(gridcraft_model::AnchorMode::MoveOnly),
         },
@@ -1157,8 +1162,40 @@ fn insert_picture(s: &mut Session, p: &Json) -> Result<Json> {
     let sheet = d.wb.active_sheet;
     edit(s, |cx| {
         cx.sheet_mut(sheet)?.images.push(img);
-        Ok(json!({"image": id}))
+        let mut out = json!({"image": id, "width": pw, "height": ph});
+        if let Some(n) = &note {
+            out["note"] = json!(n);
+        }
+        Ok(out)
     })
+}
+
+/// A picture's size from the width / height asked for: with the ratio locked one side follows the other and, both given, the
+/// width wins (the note says so); unlocked, both apply and the note warns of a change of shape. `own` is the size used when
+/// neither is given.
+fn picture_size(w: Option<f32>, h: Option<f32>, own: (f32, f32), ratio: f32, lock: bool) -> (f32, f32, Option<String>) {
+    let ratio = if ratio.is_finite() && ratio > 0.0 { ratio } else { 1.0 };
+    match (w, h, lock) {
+        (Some(w), Some(h), true) => (
+            w,
+            w / ratio,
+            Some(format!(
+                "Aspect ratio locked (a picture's default): the width was applied and the height followed to {:.2} pt; the height you asked ({h} pt) was not used. To set both sides freely pass lockAspect: false — a large change of shape squeezes or stretches the photo.",
+                w / ratio
+            )),
+        ),
+        (Some(w), None, true) => (w, w / ratio, None),
+        (None, Some(h), true) => (h * ratio, h, None),
+        (Some(w), Some(h), false) if h > 0.0 && ((w / h) / ratio - 1.0).abs() > 1e-4 => (
+            w,
+            h,
+            Some(format!(
+                "Aspect ratio unlocked: the picture's shape is {:.3}:1 instead of its own {ratio:.3}:1, so the photo is squeezed or stretched — render the range to check it reads right.",
+                w / h
+            )),
+        ),
+        (w, h, _) => (w.unwrap_or(own.0), h.unwrap_or(own.1), None),
+    }
 }
 
 /// Validate before mutating the workbook; header dimensions alone do not prove the pixels decode.
@@ -1302,11 +1339,24 @@ fn move_object(s: &mut Session, p: &Json) -> Result<Json> {
         if let Some(v) = f64_param(p, "dy") {
             a.dy = v as f32;
         }
-        if let Some(v) = f64_param(p, "width") {
-            a.width = v.clamp(1.0, 10000.0) as f32;
+        let (w, h) = (f64_param(p, "width").map(|v| v.clamp(1.0, 10000.0) as f32), f64_param(p, "height").map(|v| v.clamp(0.0, 10000.0) as f32));
+        if kind == "image" && (w.is_some() || h.is_some()) {
+            // WHIQ (owner, 2026-11-02): a picture keeps its current ratio unless `lockAspect: false` (see picture_size).
+            let ratio = if a.height > 0.0 { a.width / a.height } else { 1.0 };
+            let (nw, nh, note) = picture_size(w, h, (a.width, a.height), ratio, bool_param(p, "lockAspect").unwrap_or(true));
+            a.width = nw.clamp(1.0, 10000.0);
+            a.height = nh.clamp(0.0, 10000.0);
+            let mut out = json!({"width": a.width, "height": a.height});
+            if let Some(n) = note {
+                out["note"] = json!(n);
+            }
+            return Ok(out);
         }
-        if let Some(v) = f64_param(p, "height") {
-            a.height = v.clamp(0.0, 10000.0) as f32;
+        if let Some(v) = w {
+            a.width = v;
+        }
+        if let Some(v) = h {
+            a.height = v;
         }
         Ok(Json::Null)
     })
