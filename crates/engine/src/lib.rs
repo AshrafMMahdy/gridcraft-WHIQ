@@ -71,6 +71,8 @@ pub type Result<T> = std::result::Result<T, EngineError>;
 pub struct CallMark {
     uid: u64,
     wb: Arc<Workbook>,
+    saved: Arc<Workbook>,
+    saves: u64,
     selection: Selection,
     undo: Vec<HistoryEntry>,
     redo: Vec<HistoryEntry>,
@@ -123,6 +125,9 @@ pub struct DocState {
     pub redo: Vec<HistoryEntry>,
     pub path: Option<String>,
     pub saved: Arc<Workbook>,
+    /// WHIQ: how many times a command saved the workbook to its file (`saved` also moves on a
+    /// view change of a clean workbook; a call that is undone tells the two apart with this).
+    pub saves: u64,
     pub revision: u64,
     pub uid: u64,
     pub title: String,
@@ -152,6 +157,7 @@ impl DocState {
         let sel = Selection::at(wb.active().map(|s| s.view_active).unwrap_or_default());
         DocState {
             saved: wb.clone(),
+            saves: 0,
             wb,
             calc,
             selection: sel,
@@ -345,13 +351,15 @@ impl Session {
     }
 
     /// Runs a command by id. Undoable commands record a history step when the workbook changed.
-    /// Panics inside commands are caught and reported; the workbook is restored.
+    /// WHIQ (owner, 2026-11-05 "Undo the call"): a command that fails — an error, a panic or a
+    /// stop — leaves the workbook exactly as it was before it (cells, selection, undo and redo)
+    /// and records no history step.
     pub fn execute(&mut self, id: &str, params: Json) -> Result<Json> {
         let spec = find_command(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
         if let Err(why) = (spec.enabled)(self) {
             return Err(EngineError::Disabled(id.to_string(), why));
         }
-        let before = self.active().map(|d| (d.uid, d.wb.clone(), d.selection.clone()));
+        let mut before = self.mark();
         let params = if params.is_null() { Json::Object(Default::default()) } else { params };
         // WHIQ: a sheet that cannot fit in the memory budget by itself is refused with the numbers.
         if let Some(e) = self.sheet_too_large_for(id, &params) {
@@ -362,26 +370,14 @@ impl Session {
             Ok(r) => r,
             Err(p) if gridcraft_core::cancel::is_cancelled(&*p) => {
                 // WHIQ: a cancellation unwinds like a failure: the workbook goes back as it was.
-                if let Some((uid, wb, sel)) = &before
-                    && let Some(d) = self.docs.iter_mut().find(|d| d.uid == *uid)
-                {
-                    d.wb = wb.clone();
-                    d.selection = sel.clone();
-                    d.calc.rebuild(&d.wb);
-                }
+                self.restore(before, true);
                 return Err(EngineError::Cancelled(id.to_string()));
             }
             Err(p) => {
                 let msg =
                     p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".into());
                 // Restore the workbook as it was.
-                if let Some((uid, wb, sel)) = &before
-                    && let Some(d) = self.docs.iter_mut().find(|d| d.uid == *uid)
-                {
-                    d.wb = wb.clone();
-                    d.selection = sel.clone();
-                    d.calc.rebuild(&d.wb);
-                }
+                self.restore(before, true);
                 return Err(EngineError::Internal(id.to_string(), msg));
             }
         };
@@ -390,14 +386,14 @@ impl Session {
         let result = match result {
             Err(e) if gridcraft_core::cancel::requested() && !matches!(e, EngineError::Cancelled(_)) => {
                 let _ = e;
-                if let Some((uid, wb, sel)) = &before
-                    && let Some(d) = self.docs.iter_mut().find(|d| d.uid == *uid)
-                {
-                    d.wb = wb.clone();
-                    d.selection = sel.clone();
-                    d.calc.rebuild(&d.wb);
-                }
+                self.restore(before.take(), true);
                 Err(EngineError::Cancelled(id.to_string()))
+            }
+            Err(e) => {
+                // WHIQ: an ordinary failure half way (after steps that changed the workbook) is
+                // undone too; a command that changed nothing before failing is left alone.
+                self.restore(before.take(), false);
+                Err(e)
             }
             r => r,
         };
@@ -408,7 +404,8 @@ impl Session {
             }
         }
         if spec.undoable
-            && let Some((uid, wb, sel)) = before
+            && result.is_ok()
+            && let Some(CallMark { uid, wb, selection: sel, .. }) = before
             && let Some(d) = self.docs.iter_mut().find(|d| d.uid == uid)
             && !Arc::ptr_eq(&d.wb, &wb)
         {
@@ -433,6 +430,8 @@ impl Session {
         Some(CallMark {
             uid: d.uid,
             wb: d.wb.clone(),
+            saved: d.saved.clone(),
+            saves: d.saves,
             selection: d.selection.clone(),
             undo: d.undo.clone(),
             redo: d.redo.clone(),
@@ -440,19 +439,45 @@ impl Session {
         })
     }
 
-    /// WHIQ: the workbook of `m` back as it was (cells, selection, undo and redo); false when that
-    /// workbook is no longer open.
+    /// WHIQ: the workbook of `m` back as it was (cells, selection, undo and redo, saved or not);
+    /// false when that workbook is no longer open.
     pub fn rollback_to(&mut self, m: CallMark) -> bool {
+        self.restore_to(m, false)
+    }
+
+    /// WHIQ: whether the workbook of `m` changed since (its cells, formats or structure).
+    pub fn changed_since(&self, m: &CallMark) -> bool {
+        self.docs.iter().find(|d| d.uid == m.uid).is_some_and(|d| !Arc::ptr_eq(&d.wb, &m.wb))
+    }
+
+    /// [`Session::rollback_to`]; `rebuild_calc` rebuilds the calculation state even when the
+    /// workbook did not change (after a panic or a stop it may be half updated).
+    fn restore_to(&mut self, m: CallMark, rebuild_calc: bool) -> bool {
         let Some(d) = self.docs.iter_mut().find(|d| d.uid == m.uid) else { return false };
         if !Arc::ptr_eq(&d.wb, &m.wb) {
             d.wb = m.wb;
             d.calc.rebuild(&d.wb);
+        } else if rebuild_calc {
+            d.calc.rebuild(&d.wb);
+        }
+        // Unsaved or not as before (a view change keeps a clean workbook clean by moving `saved`);
+        // after a save during the call the file holds that save, so the workbook is unsaved.
+        if d.saves == m.saves {
+            d.saved = m.saved;
         }
         d.selection = m.selection;
         d.undo = m.undo;
         d.redo = m.redo;
         d.revision = m.revision;
         true
+    }
+
+    /// The state before a command that failed back ([`Session::execute`]); nothing when no
+    /// workbook was open.
+    fn restore(&mut self, before: Option<CallMark>, rebuild_calc: bool) {
+        if let Some(m) = before {
+            self.restore_to(m, rebuild_calc);
+        }
     }
 
     /// WHIQ: the undo steps recorded since `m` become one step labelled `label` (undo goes back to
@@ -480,12 +505,17 @@ impl Session {
 
     /// Runs a command for a caller with no UI (MCP, CLI): queued UI requests are dropped, and a command that only
     /// queued a file dialog because it got no file (`file.open`, `file.saveAs`, `file.save` on a workbook with no
-    /// file yet, `data.getData`) is an error instead of a silent success.
+    /// file yet, `data.getData`) is an error instead of a silent success — and, like any failure, leaves the
+    /// workbook as it was.
     pub fn execute_headless(&mut self, id: &str, params: Json) -> Result<Json> {
+        let before = self.mark();
         let r = self.execute(id, params);
         let requests = self.take_ui_requests();
         let asked_for_file = requests.iter().any(|q| matches!(q, UiRequest::Dialog(name, _) if name == "open" || name == "saveAs"));
         if r.is_ok() && asked_for_file {
+            if let Some(m) = before {
+                self.rollback_to(m);
+            }
             let what = match id {
                 "file.open" => "`path` or `base64`",
                 "data.getData" | "data.fromTextCsv" => "`path` or `text`",

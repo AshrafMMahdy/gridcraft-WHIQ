@@ -87,6 +87,7 @@ impl Bridge {
             && let Some(doc) = app.session.active_mut()
         {
             doc.saved = doc.wb.clone();
+            doc.saves += 1;
             if doc.path.is_none() {
                 doc.title = name.clone();
             }

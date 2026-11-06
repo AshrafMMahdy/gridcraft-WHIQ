@@ -599,9 +599,12 @@ fn format_range(b: &mut dyn Backend, a: &Args) -> Result<Value, String> {
     if steps.is_empty() {
         return Err("nothing to apply: give at least one of bold, italic, underline, fontName, fontSize, fontColor, fillColor, numberFormat, horizontalAlign, wrapText, direction, borders".into());
     }
+    // WHIQ: all or nothing — when a step fails, the call is undone as a whole (`whiq::whole`),
+    // the steps before it too.
     let mut applied = Vec::new();
     for (id, p) in steps {
-        exec(b, id, p).map_err(|e| format!("{id}: {e} (applied before the failure: {applied:?})"))?;
+        exec(b, id, p)
+            .map_err(|e| if applied.is_empty() { format!("{id}: {e}") } else { format!("{id}: {e} (it came after {})", applied.join(", ")) })?;
         applied.push(id);
     }
     Ok(json!({"range": range, "applied": applied}))

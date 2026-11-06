@@ -434,6 +434,29 @@ fn panic_is_an_answer_not_a_crash() {
     assert_eq!(m.ok("get_cell", json!({"cell": "B2"}))["value"], 42.0);
 }
 
+// WHIQ (owner, 2026-11-05 "Undo the call"): a panic half way through a batch undoes the call:
+// the live workbook and the recovered file are both as they were before it.
+#[test]
+fn panic_half_way_through_a_batch_undoes_the_call() {
+    let dir = folder("panic-batch");
+    let mut m = start(&dir, &[]);
+    m.ok("set_cell", json!({"cell": "A1", "input": "before"}));
+    for transactional in [true, false] {
+        let e = m.err(
+            "batch",
+            json!({"ops": [{"op": "set", "cell": "A1", "input": "changed"}, {"op": "write", "range": "B1", "values": [[1, 2]]}, {"tool": "debug_panic"}], "transactional": transactional}),
+        );
+        assert_eq!(e["code"], "internal", "{e}");
+        let path = std::path::PathBuf::from(e["recovered_path"].as_str().unwrap());
+        assert_eq!(cells_of(&path, "A1"), json!([["before"]]), "{transactional}");
+        assert_eq!(m.ok("get_cell", json!({"cell": "A1"}))["value"], "before", "{transactional}");
+        assert!(m.ok("get_cell", json!({"cell": "B1"}))["value"].is_null(), "{transactional}");
+    }
+    // The next call starts clean: a batch after it is undone on its own failure only.
+    m.ok("batch", json!({"ops": [{"op": "set", "cell": "C1", "input": "kept"}]}));
+    assert_eq!(m.ok("get_cell", json!({"cell": "C1"}))["value"], "kept");
+}
+
 // Hanging up with unsaved changes keeps them.
 #[test]
 fn hang_up_keeps_unsaved_work() {

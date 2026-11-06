@@ -1208,14 +1208,19 @@ pub fn run_tool(b: &mut dyn Backend, st: &mut CallState, name: &str, args: &Valu
         || raw.get("overwrite").is_some_and(|v| v.as_bool() == Some(true) || v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("true")));
     let previous_user = caller.as_deref().and_then(|c| b.set_user(c));
     // Saves carry who saved; exports and renders change nothing in the workbook.
-    if let Some(c) = &caller
-        && (name == "save_workbook"
-            || (name == "execute_command" && matches!(a.get("command").and_then(Value::as_str), Some("file.save" | "file.saveAs"))))
-    {
-        b.stamp_author(c);
-    }
+    let stamp = caller.as_deref().filter(|_| {
+        name == "save_workbook"
+            || (name == "execute_command" && matches!(a.get("command").and_then(Value::as_str), Some("file.save" | "file.saveAs")))
+    });
     let _ = gridcraft_engine::io::save_policy::take_reports();
-    let r = gridcraft_engine::io::save_policy::allow_overwrite(overwrite, || dispatch(b, st, name, &a, &mut warnings));
+    let r = gridcraft_engine::io::save_policy::allow_overwrite(overwrite, || {
+        whole(b, name, "call", |b| {
+            if let Some(c) = stamp {
+                b.stamp_author(c);
+            }
+            dispatch(b, st, name, &a, &mut warnings)
+        })
+    });
     if let Some(p) = previous_user {
         b.set_user(&p);
     }
@@ -1442,6 +1447,27 @@ fn dispatch(b: &mut dyn Backend, st: &mut CallState, name: &str, a: &Args, warni
     }
 }
 
+/// WHIQ (owner, 2026-11-05 "Undo the call"): one call (or one operation of a `batch`) runs whole
+/// or not at all: when it fails after some of its steps changed the workbook, the workbook goes
+/// back to how it was before it and the error says so (`rolled_back`). A `batch` keeps its own
+/// rule (undone as a whole unless keepGoing / transactional: false).
+fn whole(b: &mut dyn Backend, name: &str, what: &str, f: impl FnOnce(&mut dyn Backend) -> Result<Value, ToolError>) -> Result<Value, ToolError> {
+    if name == "batch" {
+        return f(b);
+    }
+    b.begin_batch();
+    let r = f(b);
+    let undone = b.end_call(r.is_ok());
+    r.map_err(|mut e| {
+        if !undone {
+            return e;
+        }
+        e.reason = format!("{} — nothing of this {what} was applied: the workbook is as it was before it", e.reason);
+        e.next_step = format!("send the {what} again with that fixed: {}", e.next_step);
+        e.with("rolled_back", json!(true))
+    })
+}
+
 // ---------------------------------------------------------------- preview, Markdown, batch
 
 /// Whether two paths name the same file (relative ones inside `root`).
@@ -1590,7 +1616,8 @@ fn find_replace(b: &mut dyn Backend, a: &Args) -> Result<Value, ToolError> {
     Ok(v)
 }
 
-/// Tools a batch does not run (they open, close or watch documents, or are batches).
+/// Tools a batch does not run (they open, close or watch documents, or are batches). The test
+/// hook `debug_panic` does run in one: the contract tests panic half way through a batch.
 const NOT_IN_BATCH: &[&str] = &[
     "batch",
     "cancel",
@@ -1605,7 +1632,6 @@ const NOT_IN_BATCH: &[&str] = &[
     "undo",
     "redo",
     "debug_sleep",
-    "debug_panic",
 ];
 
 /// One operation of a batch: its label and its answer.
@@ -1695,7 +1721,7 @@ fn batch_op(
     if let Err(e) = check_arguments(&name, &Value::Object(a.clone())) {
         return Err((name.clone(), invalid_argument(def, &e)));
     }
-    dispatch(b, st, &name, &a, warnings).map(|v| (name.clone(), v)).map_err(|e| (name.clone(), e))
+    whole(b, &name, "operation", |b| dispatch(b, st, &name, &a, warnings)).map(|v| (name.clone(), v)).map_err(|e| (name.clone(), e))
 }
 
 /// batch: a list of operations in one call, one undo step, undone as a whole on a failure

@@ -776,6 +776,116 @@ fn a_failing_batch_is_rolled_back_unless_keep_going() {
     assert_eq!(r["structuredContent"]["error"]["code"], "invalid_argument", "{r}");
 }
 
+// WHIQ (owner, 2026-11-05 "Undo the call"): one call that fails half way changes nothing.
+#[test]
+fn a_call_that_fails_half_way_changes_nothing() {
+    let mut s = server();
+    structured(&mut s, "set_cell", json!({"cell": "A1", "input": "x"}));
+    // format_range: bold runs, then the font color fails. Bold used to stay.
+    let r = call(&mut s, "format_range", json!({"range": "A1", "bold": true, "fontColor": "not a colour"}));
+    assert_eq!(r["isError"], true, "{r}");
+    let e = &r["structuredContent"]["error"];
+    assert_eq!(e["rolled_back"], true, "{e}");
+    assert!(e["reason"].as_str().unwrap().contains("nothing of this call was applied"), "{e}");
+    assert!(e["next_step"].as_str().unwrap().starts_with("send the call again"), "{e}");
+    assert_eq!(structured(&mut s, "get_cell", json!({"cell": "A1"}))["style"]["font"]["bold"], false);
+    // No undo step of it: undo takes back the set_cell before it.
+    structured(&mut s, "undo", json!({}));
+    assert!(structured(&mut s, "get_cell", json!({"cell": "A1"}))["value"].is_null());
+    // A failure before any change says nothing about a roll back.
+    let r = call(&mut s, "format_range", json!({"range": "A1", "fontColor": "not a colour"}));
+    assert_eq!(r["isError"], true, "{r}");
+    assert!(r["structuredContent"]["error"].get("rolled_back").is_none(), "{r}");
+    // A success keeps every step (one undo step each, as before).
+    structured(&mut s, "format_range", json!({"range": "B2", "bold": true, "italic": true}));
+    let cell = structured(&mut s, "get_cell", json!({"cell": "B2"}));
+    assert_eq!((cell["style"]["font"]["bold"].clone(), cell["style"]["font"]["italic"].clone()), (json!(true), json!(true)), "{cell}");
+    structured(&mut s, "undo", json!({}));
+    let cell = structured(&mut s, "get_cell", json!({"cell": "B2"}));
+    assert_eq!((cell["style"]["font"]["bold"].clone(), cell["style"]["font"]["italic"].clone()), (json!(true), json!(false)), "{cell}");
+}
+
+#[test]
+fn a_batch_operation_that_fails_half_way_changes_nothing_even_with_keep_going() {
+    let mut s = server();
+    let ops = json!([
+        {"op": "set", "cell": "A1", "input": "kept"},
+        {"op": "format", "range": "B1", "bold": true, "fontColor": "not a colour"},
+        {"op": "set", "cell": "C1", "input": "after"},
+    ]);
+    let v = structured(&mut s, "batch", json!({"ops": ops, "keepGoing": true}));
+    assert_eq!((v["ok"].clone(), v["failed"].clone()), (json!(2), json!(1)), "{v}");
+    let e = &v["results"][1]["error"];
+    assert_eq!(e["rolled_back"], true, "{e}");
+    assert!(e["reason"].as_str().unwrap().contains("nothing of this operation was applied"), "{e}");
+    assert_eq!(structured(&mut s, "get_cell", json!({"cell": "A1"}))["value"], "kept");
+    assert_eq!(structured(&mut s, "get_cell", json!({"cell": "C1"}))["value"], "after");
+    assert_eq!(structured(&mut s, "get_cell", json!({"cell": "B1"}))["style"]["font"]["bold"], false);
+    // The batch is still one undo step.
+    structured(&mut s, "undo", json!({}));
+    assert!(structured(&mut s, "get_cell", json!({"cell": "A1"}))["value"].is_null());
+    // Transactional (the default): the whole batch goes, as before.
+    let r = call(&mut s, "batch", json!({"ops": ops}));
+    assert_eq!(r["structuredContent"]["error"]["rolled_back"], true, "{r}");
+    assert!(structured(&mut s, "get_cell", json!({"cell": "A1"}))["value"].is_null());
+}
+
+#[test]
+fn a_failed_call_leaves_a_saved_workbook_saved() {
+    // A call on another sheet switches to it and back (view changes that keep a saved workbook
+    // saved); undoing such a call must not leave the workbook looking unsaved.
+    let mut s = server();
+    structured(&mut s, "add_sheet", json!({"name": "Other"}));
+    structured(&mut s, "execute_command", json!({"command": "sheet.activate", "params": {"sheet": 0}}));
+    let path = tmp("failed-call-stays-saved.xlsx");
+    let _ = std::fs::remove_file(&path);
+    structured(&mut s, "save_workbook", json!({"path": path.to_str().unwrap(), "overwrite": true}));
+    let before = structured(&mut s, "inspect_workbook", json!({}));
+    assert_eq!((before["dirty"].clone(), before["activeSheet"].clone()), (json!(false), json!(0)), "{before}");
+    let r = call(&mut s, "delete_chart", json!({"sheet": "Other"}));
+    assert_eq!(r["isError"], true, "there is no chart: {r}");
+    let after = structured(&mut s, "inspect_workbook", json!({}));
+    assert_eq!(after["dirty"], false, "{after}");
+    assert_eq!(after["activeSheet"], before["activeSheet"], "{after}");
+}
+
+#[test]
+fn marks_nest_and_an_unwound_call_goes_back_to_the_first() {
+    let mut h = Headless::new();
+    let set = |h: &mut Headless, cell: &str, v: &str| {
+        h.call("engine.execute", json!({"command": "cell.set", "params": {"cell": cell, "input": v}})).unwrap();
+    };
+    let get =
+        |h: &mut Headless, cell: &str| h.call("engine.execute", json!({"command": "cell.get", "params": {"cell": cell}})).unwrap()["value"].clone();
+    set(&mut h, "A1", "before");
+    // A call that succeeds keeps its changes and its undo steps.
+    assert!(h.begin_batch());
+    set(&mut h, "A1", "one");
+    set(&mut h, "A2", "two");
+    assert!(!h.end_call(true));
+    assert_eq!(get(&mut h, "A2"), "two");
+    h.call("engine.execute", json!({"command": "edit.undo", "params": {}})).unwrap();
+    assert!(get(&mut h, "A2").is_null());
+    assert_eq!(get(&mut h, "A1"), "one");
+    // A failed call inside a batch goes back to its own mark; the batch's is still there.
+    assert!(h.begin_batch());
+    set(&mut h, "B1", "batch");
+    assert!(h.begin_batch());
+    set(&mut h, "B2", "op");
+    assert!(h.end_call(false));
+    assert!(get(&mut h, "B2").is_null());
+    assert_eq!(get(&mut h, "B1"), "batch");
+    // A panic half way through a batch's operation: every open mark goes, back to the first.
+    assert!(h.begin_batch());
+    set(&mut h, "B3", "op");
+    assert!(h.abandon_call());
+    assert!(get(&mut h, "B1").is_null());
+    assert!(get(&mut h, "B3").is_null());
+    assert_eq!(get(&mut h, "A1"), "one");
+    assert!(!h.end_batch(false, "gone"), "no mark is left open");
+    assert!(!h.abandon_call());
+}
+
 // ---------- WHIQ: working a workbook fully, like a person in Excel (coverage table) ----------
 //
 // Each test opens a real .xlsx written to disk (built, saved, then read back by a fresh server),

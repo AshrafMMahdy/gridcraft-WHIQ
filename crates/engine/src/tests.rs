@@ -3402,3 +3402,45 @@ fn whiq_pictures_keep_their_aspect_ratio_unless_unlocked() {
     let r = s.execute("insert.picture", json!({"base64": b64, "width": 60, "height": 60})).unwrap();
     assert_eq!(size(&s, r["image"].as_u64().unwrap() as u32), (60.0, 30.0));
 }
+
+#[test]
+fn a_command_that_fails_half_way_leaves_the_workbook_as_it_was() {
+    // WHIQ (owner, 2026-11-05 "Undo the call"): a script whose third step fails used to keep its
+    // first two steps (and their undo steps).
+    let mut s = s();
+    s.execute("cell.set", json!({"cell": "A1", "input": "before"})).unwrap();
+    s.execute(
+        "automate.newScript",
+        json!({"name": "half", "commands": [
+            {"command": "cell.set", "params": {"cell": "A1", "input": "changed"}},
+            {"command": "cell.set", "params": {"cell": "B2", "input": "also"}},
+            {"command": "cell.set", "params": {"cell": "not a cell!!", "input": "x"}}
+        ]}),
+    )
+    .unwrap();
+    // A step to redo: the script's own edits would clear it.
+    s.execute("cell.set", json!({"cell": "C1", "input": "undone"})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    let (wb, sel, undo, redo, revision) = {
+        let d = s.doc().unwrap();
+        (d.wb.clone(), d.selection.clone(), d.undo.len(), d.redo.len(), d.revision)
+    };
+    assert_eq!(redo, 1);
+    assert!(s.execute("automate.runScript", json!({"name": "half"})).is_err());
+    assert_eq!(v(&s, "A1"), Value::from("before"));
+    assert_eq!(v(&s, "B2"), Value::Empty);
+    let d = s.doc().unwrap();
+    assert!(std::sync::Arc::ptr_eq(&d.wb, &wb), "the very workbook of before the call");
+    assert_eq!(d.selection, sel);
+    assert_eq!((d.undo.len(), d.redo.len(), d.revision), (undo, redo, revision), "no undo step, the steps' own ones gone, redo kept");
+    // An undo still goes back to the step before the call; a later success records its step.
+    s.execute("cell.set", json!({"cell": "D4", "input": "kept"})).unwrap();
+    assert_eq!(s.doc().unwrap().undo.len(), undo + 1);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(v(&s, "D4"), Value::Empty);
+    assert_eq!(v(&s, "A1"), Value::from("before"));
+    // A command that fails before changing anything is left as it is.
+    let wb = s.doc().unwrap().wb.clone();
+    assert!(s.execute("cell.set", json!({"cell": "not a cell!!", "input": "x"})).is_err());
+    assert!(std::sync::Arc::ptr_eq(&s.doc().unwrap().wb, &wb));
+}

@@ -1084,10 +1084,17 @@ fn worker_loop(server: &mut Server, shared: &Shared, rx: mpsc::Receiver<Work>) {
                 } else {
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| server.handle(msg)))
                 };
+                // WHIQ: a call that unwound (a panic, or a stop between commands) is undone as a
+                // whole: a batch's mark or a call's own is left open by the unwind, and the
+                // workbook goes back to the first of them — as it was before the call.
+                if call.is_err() {
+                    server.backend().abandon_call();
+                    *lock(&shared.snapshot) = server.backend().snapshot();
+                }
                 let reply = match call {
                     Ok(Some(r)) => r,
                     Ok(None) => json!({"jsonrpc": "2.0", "id": id, "result": {}}),
-                    // Stopped by `cancel` between commands: each command is whole, nothing half done.
+                    // Stopped by `cancel` between commands: the call was undone above.
                     Err(p) if gridcraft_engine::core::cancel::is_cancelled(&*p) => {
                         let e = ToolError::new(
                             code::CANCELLED,

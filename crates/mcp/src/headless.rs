@@ -18,8 +18,9 @@ pub struct Headless {
     /// WHIQ: the folders this session's commands may read and write (`--automation-read-root`,
     /// `--automation-write-root`); `None` confines nothing.
     roots: Option<Arc<AutomationRoots>>,
-    /// WHIQ: the workbook as it stood when a `batch` began.
-    batch_mark: Option<gridcraft_engine::CallMark>,
+    /// WHIQ: the workbook as it stood when each open `batch` or call began, innermost last (`None`
+    /// when no workbook was open then).
+    marks: Vec<Option<gridcraft_engine::CallMark>>,
 }
 
 impl Default for Headless {
@@ -29,16 +30,22 @@ impl Default for Headless {
 }
 
 impl Headless {
+    /// The workbook of `m` back as it was; true when that undid a change.
+    fn roll_back(&mut self, m: gridcraft_engine::CallMark) -> bool {
+        let changed = self.session.changed_since(&m);
+        self.session.rollback_to(m) && changed
+    }
+
     /// A session with a blank workbook (`Book1`) open.
     pub fn new() -> Self {
         let mut session = Session::new();
         session.new_workbook();
-        Self { session, roots: None, batch_mark: None }
+        Self { session, roots: None, marks: Vec::new() }
     }
 
     /// A session wrapping an existing one (e.g. with a file already open).
     pub fn with_session(session: Session) -> Self {
-        Self { session, roots: None, batch_mark: None }
+        Self { session, roots: None, marks: Vec::new() }
     }
 
     /// Confine every file the session's commands read and write to `roots`.
@@ -146,17 +153,31 @@ impl Backend for Headless {
     }
 
     fn begin_batch(&mut self) -> bool {
-        self.batch_mark = self.session.mark();
-        self.batch_mark.is_some()
+        let m = self.session.mark();
+        let marked = m.is_some();
+        self.marks.push(m);
+        marked
     }
 
     fn end_batch(&mut self, keep: bool, label: &str) -> bool {
-        let Some(m) = self.batch_mark.take() else { return false };
+        let Some(Some(m)) = self.marks.pop() else { return false };
         if keep {
             self.session.squash_since(&m, label);
             true
         } else {
             self.session.rollback_to(m)
+        }
+    }
+
+    fn end_call(&mut self, ok: bool) -> bool {
+        let Some(Some(m)) = self.marks.pop() else { return false };
+        !ok && self.roll_back(m)
+    }
+
+    fn abandon_call(&mut self) -> bool {
+        match std::mem::take(&mut self.marks).into_iter().next().flatten() {
+            Some(m) => self.roll_back(m),
+            None => false,
         }
     }
 

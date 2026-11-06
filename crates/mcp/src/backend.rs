@@ -84,14 +84,26 @@ pub trait Backend {
     fn select_document(&mut self, _handle: &str) -> Result<(), Vec<String>> {
         Err(vec![])
     }
-    /// WHIQ: remember where the active workbook stands, for a `batch` that is undone as a whole
-    /// when one of its operations fails. False when the backend cannot roll back.
+    /// WHIQ: remember where the active workbook stands, for a `batch` (or one call) that is undone
+    /// as a whole when it fails. Marks nest: each one is closed by one [`Backend::end_batch`] or
+    /// [`Backend::end_call`], innermost first. False when the backend cannot roll back.
     fn begin_batch(&mut self) -> bool {
         false
     }
     /// WHIQ: end a `batch`: `keep` true makes its changes one undo step (`label`), false puts the
     /// workbook back as it was at [`Backend::begin_batch`]. True when that was done.
     fn end_batch(&mut self, _keep: bool, _label: &str) -> bool {
+        false
+    }
+    /// WHIQ: end one call's mark: `ok` leaves the workbook as the call left it (its undo steps
+    /// too); otherwise the workbook goes back as it was at [`Backend::begin_batch`]. True when
+    /// that undid a change.
+    fn end_call(&mut self, _ok: bool) -> bool {
+        false
+    }
+    /// WHIQ: after a call unwound (a panic or a stop), every mark it left open is dropped and the
+    /// workbook goes back to the first: as it was before the call. True when that undid a change.
+    fn abandon_call(&mut self) -> bool {
         false
     }
     /// WHIQ: the automation read and write roots in force.
