@@ -799,7 +799,7 @@ fn mcp(args: &[String]) -> Result<(), String> {
         }
     };
     let describe = backend.describe();
-    config.has_ui = backend.has_ui();   // WHIQ: the desktop-only tools are listed only with the app attached
+    config.has_ui = backend.has_ui(); // WHIQ: the desktop-only tools are listed only with the app attached
     eprintln!("gridcraft-cli: MCP server on stdio ({describe})");
     let factory: gridcraft_mcp::runtime::BackendFactory = Box::new(move || backend as Box<dyn Backend>);
     gridcraft_mcp::runtime::serve(factory, describe, config, std::io::BufReader::new(std::io::stdin()), std::io::stdout()).map_err(|e| e.to_string())

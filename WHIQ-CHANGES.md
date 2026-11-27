@@ -988,8 +988,10 @@ Test: `tests.rs` `whiq_pictures_keep_their_aspect_ratio_unless_unlocked`.
 
 ## Desktop-only tools are not listed headless (2026-11-27)
 
-The platform runs the server headless, where `screenshot` can only answer that they need the desktop app; an agent offered
-them wastes a call on a refusal. `tools/list` now lists them only when the app is attached (`--connect`): hidden, not removed —
+The platform runs the server headless, where `screenshot` can only answer that it needs the desktop app; an agent offered
+it wastes a call on a refusal. `tools/list` now lists it only when the app is attached (`--connect`): hidden, not removed —
 a call still answers that it needs the app, and the pictures an agent can have headless stay listed. With the app every tool is
 listed as before, annotations unchanged. `crates/mcp/src/whiq.rs` (`DESKTOP_ONLY`, `listed_tools`); `server.rs`; the runtime answers `tools/list` through its local server, whose backend now carries the real one's `has_ui` (`RuntimeConfig::has_ui`, set by the CLI).
-Test: `crates/mcp/src/tests.rs` `desktop_only_tools_are_listed_only_with_the_app`.
+Test: `crates/mcp/src/tests.rs` `desktop_only_tools_are_listed_only_with_the_app` (headless every tool but those named, a
+hidden call still answers that it needs the app; with an app every tool, the hidden ones' annotations checked) and
+`the_stdio_loop_lists_desktop_only_tools_only_with_the_app` (the same through `runtime::serve`).
