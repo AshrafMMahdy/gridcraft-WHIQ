@@ -232,7 +232,7 @@ impl Server {
                 }))
             }
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({"tools": all_definitions()})),
+            "tools/list" => Ok(json!({"tools": crate::whiq::listed_tools(self.backend.has_ui())})),
             "resources/list" => Ok(json!({"resources": [
                 {"uri": WORKBOOK_URI, "name": "workbook", "title": "Active workbook", "description": "Sheets, used ranges, tables, charts, names, selection and undo history of the active workbook (document.inspect)", "mimeType": "application/json"},
                 {"uri": COMMANDS_URI, "name": "commands", "title": "Commands", "description": "Every command: id, label, ribbon path, shortcut, params, enabled (engine.commands)", "mimeType": "application/json"},

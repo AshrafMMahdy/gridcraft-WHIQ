@@ -985,3 +985,11 @@ sets both freely, warning that a large change of shape squeezes or stretches the
 apply as given and the note says the shape changed. Answers carry `width` / `height`. Charts and shapes move and size as
 before; the desktop app's drag handle passes `lockAspect: false` and resizes freely as it did.
 Test: `tests.rs` `whiq_pictures_keep_their_aspect_ratio_unless_unlocked`.
+
+## Desktop-only tools are not listed headless (2026-11-27)
+
+The platform runs the server headless, where `screenshot` can only answer that they need the desktop app; an agent offered
+them wastes a call on a refusal. `tools/list` now lists them only when the app is attached (`--connect`): hidden, not removed —
+a call still answers that it needs the app, and the pictures an agent can have headless stay listed. With the app every tool is
+listed as before, annotations unchanged. `crates/mcp/src/whiq.rs` (`DESKTOP_ONLY`, `listed_tools`); `server.rs`; the runtime answers `tools/list` through its local server, whose backend now carries the real one's `has_ui` (`RuntimeConfig::has_ui`, set by the CLI).
+Test: `crates/mcp/src/tests.rs` `desktop_only_tools_are_listed_only_with_the_app`.

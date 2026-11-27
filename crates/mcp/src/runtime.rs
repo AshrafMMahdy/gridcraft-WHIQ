@@ -60,6 +60,8 @@ pub struct RuntimeConfig {
     /// `--busy-after-ms`: a call arriving while another runs waits this long for it before
     /// answering `busy`.
     pub busy_grace: Duration,
+    /// WHIQ: a desktop app is attached (`--connect`): `tools/list` lists its desktop-only tools (`whiq::listed_tools`).
+    pub has_ui: bool,
     /// Checkpoint unsaved work to the recovered file after this many changing calls (0: never).
     pub checkpoint_edits: u64,
     /// … and when unsaved changes are this old (`None`: never).
@@ -79,6 +81,7 @@ impl Default for RuntimeConfig {
             read_root: None,
             handle_signals: true,
             busy_grace: Duration::from_millis(300),
+            has_ui: false,
             checkpoint_edits: 20,
             checkpoint_interval: Some(Duration::from_secs(60)),
         }
@@ -675,14 +678,15 @@ fn find_recovered(dir: &Path) -> Vec<Value> {
 
 /// A backend that only describes itself: the stdio loop's own server answers the protocol
 /// methods (initialize, tools/list, ping…) with it.
-struct Describe(String);
+struct Describe(String, bool);
 
 impl Backend for Describe {
     fn call(&mut self, method: &str, _params: Value) -> Result<Value, String> {
         Err(format!("`{method}` is answered by the document worker"))
     }
+    /// WHIQ: what the real backend says (`RuntimeConfig::has_ui`), so `tools/list` answers for it.
     fn has_ui(&self) -> bool {
-        false
+        self.1
     }
     fn describe(&self) -> String {
         self.0.clone()
@@ -816,7 +820,7 @@ pub fn serve(
         }
     });
 
-    let mut local = Server::with_settings(Box::new(Describe(describe)), config.settings.clone());
+    let mut local = Server::with_settings(Box::new(Describe(describe, config.has_ui)), config.settings.clone());
     let names: Vec<String> = all_definitions().iter().filter_map(|d| d["name"].as_str().map(str::to_string)).collect();
     while let Ok(Some(line)) = line_rx.recv() {
         if line.starts_with('\u{0}') {

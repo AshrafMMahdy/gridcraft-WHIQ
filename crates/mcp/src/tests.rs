@@ -104,12 +104,12 @@ fn tools_list_has_schemas() {
         "new_workbook",
         "undo",
         "redo",
-        "screenshot",
         "list_functions",
     ] {
         assert!(names.contains(&want), "missing tool {want}");
     }
-    for t in tools {
+    // every tool's schema, the desktop-only ones too (headless they are not listed: whiq::listed_tools)
+    for t in &tool_definitions() {
         assert_eq!(t["inputSchema"]["type"], "object", "{t}");
         assert!(t["description"].as_str().unwrap().len() > 20, "{t}");
         let name = t["name"].as_str().unwrap();
@@ -118,7 +118,7 @@ fn tools_list_has_schemas() {
             assert!(t["inputSchema"]["properties"].get(r.as_str().unwrap()).is_some(), "{name}: required {r} not in properties");
         }
     }
-    assert_eq!(tools.len(), tool_definitions().len());
+    assert_eq!(tools.len(), tool_definitions().len() - crate::whiq::DESKTOP_ONLY.len());
 }
 
 #[test]
@@ -561,6 +561,44 @@ fn invalid_sort_keys_are_invalid_params() {
 }
 
 // ---------- WHIQ ----------
+
+/// A backend standing in for a running app: only says that a UI is attached.
+struct FakeApp;
+
+impl Backend for FakeApp {
+    fn call(&mut self, method: &str, _params: Value) -> Result<Value, String> {
+        Err(format!("unexpected {method}"))
+    }
+    fn has_ui(&self) -> bool {
+        true
+    }
+    fn describe(&self) -> String {
+        "fake app".into()
+    }
+}
+
+/// WHIQ: the tools that drive the desktop app's window are listed only with an app attached. The headless server
+/// hides them (an agent there could only get an error from them); a call to one still answers that it needs the app.
+#[test]
+fn desktop_only_tools_are_listed_only_with_the_app() {
+    let names = |s: &mut Server| -> Vec<String> {
+        let v = rpc(s, 2, "tools/list", json!({}));
+        v["result"]["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str().map(str::to_string)).collect()
+    };
+    let mut headless = server();
+    let listed = names(&mut headless);
+    for n in crate::whiq::DESKTOP_ONLY {
+        assert!(!listed.iter().any(|t| t == n), "{n} is listed headless");
+    }
+    assert!(listed.iter().any(|t| t == "render_range"), "the picture of a range is still listed");
+    let v = rpc(&mut headless, 3, "tools/call", json!({"name": "screenshot", "arguments": {"path": "/tmp/x.png"}}));
+    assert_eq!(v["result"]["isError"], true, "a hidden tool still answers: {v}");
+    let mut app = Server::new(Box::new(FakeApp));
+    let listed = names(&mut app);
+    for n in crate::whiq::DESKTOP_ONLY {
+        assert!(listed.iter().any(|t| t == n), "{n} is not listed with the app");
+    }
+}
 
 #[test]
 fn annotations_say_what_each_tool_does() {

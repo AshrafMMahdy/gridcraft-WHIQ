@@ -1050,6 +1050,16 @@ fn export_pdf(b: &mut dyn Backend, a: &Args) -> Result<Value, String> {
     exec(b, "file.exportPdf", p)
 }
 
+/// WHIQ: the tools that drive the desktop app's window (they work only with `--connect` to a running app).
+pub const DESKTOP_ONLY: [&str; 1] = ["screenshot"];
+
+/// WHIQ: the tools as `tools/list` answers them: without a desktop app attached (`has_ui` false: the headless
+/// server), the desktop-only tools are not listed — hidden, not removed: their code stays, and a call to one still
+/// answers that it needs the desktop app.
+pub fn listed_tools(has_ui: bool) -> Vec<Value> {
+    all_definitions().into_iter().filter(|t| has_ui || !DESKTOP_ONLY.iter().any(|n| t["name"].as_str() == Some(*n))).collect()
+}
+
 /// Upstream's and the WHIQ tools with the test hooks when enabled.
 pub fn all_definitions() -> Vec<Value> {
     let mut defs = crate::tools::tool_definitions();
