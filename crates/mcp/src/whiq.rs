@@ -955,7 +955,8 @@ fn with_sheet(b: &mut dyn Backend, a: &Args, f: impl FnOnce(&mut dyn Backend) ->
     r
 }
 
-/// Largest inline picture (bytes of PNG).
+/// Largest inline picture (bytes of PNG). The picture is an image block of its own, outside the answer-size rule.
+// AGREED LIMIT (owner, 2026-11-28): 2 MiB — a picture larger than this is not returned inline, said ("pass `path`") — why: item 26 rule 5, "Timers, memory, and safety - agreed" — arbitrary by agreement.
 const MAX_INLINE_PNG: usize = 2 * 1024 * 1024;
 
 fn render(b: &mut dyn Backend, name: &str, a: &Args) -> Result<Value, String> {
@@ -1044,7 +1045,18 @@ fn export_pdf(b: &mut dyn Backend, a: &Args) -> Result<Value, String> {
     } else {
         p["fonts"] = json!(a.get("fonts").and_then(Value::as_str).unwrap_or("embedded"));
     }
-    exec(b, "file.exportPdf", p)
+    let v = exec(b, "file.exportPdf", p)?;
+    // an inline PDF is base64 text in the answer: one larger than the answer-size rule can carry is refused with the way to
+    // get it (item 26: the trim replaced it with "ask for a smaller part", and a cut base64 is no PDF)
+    if let Some(data) = v.get("base64").and_then(Value::as_str)
+        && data.len() > crate::answer_cap::MAX_ANSWER_CHARS - 4096
+    {
+        return Err(format!(
+            "the PDF is too large to return inline ({} bytes of base64): pass `path` to save it in the write root",
+            data.len()
+        ));
+    }
+    Ok(v)
 }
 
 /// WHIQ: the tools that drive the desktop app's window (they work only with `--connect` to a running app).
@@ -1278,6 +1290,9 @@ pub fn run_tool(b: &mut dyn Backend, st: &mut CallState, name: &str, args: &Valu
             }
             // WHIQ (item 26): the answer-size rule, the platform's (answer_cap). A read-only tool pages by size under it; any other
             // tool's answer over it is cut by structure, the whole answer saved in the write root.
+            // a picture is its own content block, not part of the JSON the rule measures (item 26: it was replaced by "ask for a
+            // smaller part" when the trim counted it)
+            let image = v.as_object_mut().and_then(|o| o.remove("__image"));
             let mut v = if read_only {
                 contract::trim_from(v, from as usize, crate::answer_cap::MAX_ANSWER_CHARS)
             } else {
@@ -1315,7 +1330,6 @@ pub fn run_tool(b: &mut dyn Backend, st: &mut CallState, name: &str, args: &Valu
                     None => v["warnings"] = json!(warnings),
                 }
             }
-            let image = v.as_object_mut().and_then(|o| o.remove("__image"));
             let mut r = ToolResult::json(&v);
             if let Some((key, text)) = big {
                 if let Some(s) = r.structured.as_mut().and_then(Value::as_object_mut) {

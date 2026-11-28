@@ -56,11 +56,31 @@ fn cut(v: &Value, text: &str, max: usize) -> (Value, usize, usize) {
             return (c, n, keep);
         }
     }
+    // the plain cut is a JSON string of the answer's JSON: its quotes and backslashes are escaped again, so it is sized by its
+    // escaped length (what the platform counts), not by its characters
     let limit = max.max(FLOOR_CHARS).saturating_sub(200);
-    let plain: String = text.chars().take(limit).collect();
-    let s = format!("{plain} …[{} characters cut]", text.chars().count().saturating_sub(limit));
-    let n = s.encode_utf16().count();
+    let (mut used, mut taken) = (0usize, 0usize);
+    for c in text.chars() {
+        let w = escaped_units(c);
+        if used + w > limit {
+            break;
+        }
+        used += w;
+        taken += 1;
+    }
+    let plain: String = text.chars().take(taken).collect();
+    let s = format!("{plain} …[{} characters cut]", text.chars().count() - taken);
+    let n = answer_chars(&Value::String(s.clone()));
     (Value::String(s), n, 0)
+}
+
+/// UTF-16 units a character takes inside a JSON string, as serde_json writes it.
+fn escaped_units(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf16(),
+    }
 }
 
 /// A UTC stamp for the file name (yyyymmdd-hhmmss), from the system clock.
@@ -170,6 +190,17 @@ mod tests {
         assert!(list.last().unwrap().as_str().unwrap().starts_with("… +"));
         assert!(t["note"].as_str().unwrap().contains("read the file for the rest"));
         assert!(out.get("continue_from").is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_plain_cut_of_quote_heavy_json_fits_once_escaped() {
+        // a flat object of many keys: no list or text to shrink, so the plain cut; every quote of its JSON is escaped again
+        let dir = std::env::temp_dir().join(format!("gc-cap3-{}", std::process::id()));
+        let o: Map<String, Value> = (0..20_000).map(|i| (format!("k{i}"), json!("\"q\""))).collect();
+        let out = cap_at(Value::Object(o), "x", Some(&dir), "", 50_000);
+        assert!(answer_chars(&out) <= 50_000, "{}", answer_chars(&out));
+        assert!(out["result"].as_str().unwrap().ends_with("characters cut]"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
