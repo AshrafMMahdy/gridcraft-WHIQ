@@ -337,6 +337,25 @@ fn a_password_protected_workbook_opens_with_its_password() {
 
 /// WHIQ (item 26, faults B50, B15, B17, A28, B54): the arguments a tool reads say what is done, or are refused in words.
 #[test]
+fn item26_a_cell_takes_at_most_32767_characters() {
+    // 26.3.1 (owner 2026-11-28: "Excel character limit - agreed, refuse and let agent know")
+    let dir = folder("item26-cell-text");
+    let mut m = start(&dir, &[]);
+    m.ok("new_workbook", json!({}));
+    let e = m.err("set_cell", json!({"cell": "B2", "input": "x".repeat(32_768)}));
+    assert_eq!(e["code"], "invalid_argument", "{e}");
+    assert!(e["reason"].as_str().unwrap().contains("B2 is 32,768 characters long; an Excel cell holds at most 32,767"), "{e}");
+    assert!(e["next_step"].as_str().unwrap().contains("in parts"), "{e}");
+    assert_eq!(m.ok("read_range", json!({"range": "B2"}))["values"], json!([[null]]));
+    m.ok("set_cell", json!({"cell": "B2", "input": "x".repeat(32_767)}));
+    let e = m.err("build_workbook", json!({"sheets": [{"name": "Notes", "rows": [["short"], ["n".repeat(50_000)]]}]}));
+    assert!(e["reason"].as_str().unwrap().contains("50,000 characters long"), "{e}");
+    let e = m.err("write_range", json!({"range": "D1", "values": [["k".repeat(40_000)]]}));
+    assert!(e["reason"].as_str().unwrap().contains("D1 is 40,000 characters long"), "{e}");
+    drop(m);
+}
+
+#[test]
 fn item26_arguments_do_what_they_say_or_are_refused() {
     let dir = folder("item26-args");
     let mut m = start(&dir, &[]);
@@ -460,23 +479,24 @@ fn a_cut_row_names_the_rows_after_it_and_a_cut_cell_is_said() {
     assert_eq!(cells["H3"], "r3c7");
     assert!(cut.is_empty());
     drop(m);
-    // larger than one answer: row 1 of three 60,000-character cells, a 200,000-character cell in row 2, a short row 3
+    // larger than one answer: row 1 of three cells of 60,000 characters as written in the answer, a cell of 196,602 in row 2, a short row 3
+    // (a cell holds at most 32,767 characters, as in Excel: control characters, each "\u0001" in the answer, make a cell larger than an answer)
     let mut m = start(&dir, &[]);
     let long = |ch: char, n: usize| ch.to_string().repeat(n);
-    m.ok("write_range", json!({"range": "A1", "values": [[long('a', 60_000), long('b', 60_000), long('c', 60_000)], [long('d', 200_000), "e", "f"], ["g", "h", "i"]]}));
+    m.ok("write_range", json!({"range": "A1", "values": [[long('\u{1}', 10_000), long('\u{2}', 10_000), long('\u{3}', 10_000)], [long('\u{4}', 32_767), "e", "f"], ["g", "h", "i"]]}));
     let first = m.ok("read_range", json!({"range": "A1:C3"}));
     assert_eq!(first["range"], "A1:B1", "{}", first.to_string().chars().take(300).collect::<String>());
     assert_eq!(first["next_range"], "Sheet1!C1");
     assert_eq!(first["then_range"], "Sheet1!A2:C3");
     let (cells, cut) = read_all(&mut m, "A1:C3");
     assert_eq!(cells.len(), 9, "{:?}", cells.keys().collect::<Vec<_>>());
-    assert_eq!(cells["C1"].as_str().map(str::len), Some(60_000));
+    assert_eq!(cells["C1"].as_str().map(str::len), Some(10_000));
     assert_eq!((cells["B2"].clone(), cells["C3"].clone()), (json!("e"), json!("i")), "the cells after the cut cell are read");
     assert_eq!(cut.len(), 1);
     assert_eq!(cut[0]["cell"], "Sheet1!A2");
-    assert_eq!(cut[0]["characters"], 200_000);
+    assert_eq!(cut[0]["characters"], 32_767);
     let shown = cut[0]["shown"].as_u64().unwrap() as usize;
-    assert!(shown > 100_000 && cells["A2"].as_str().map(str::len) == Some(shown), "{shown}");
+    assert!(shown > 15_000 && shown < 32_767 && cells["A2"].as_str().map(str::len) == Some(shown), "{shown}");
     assert!(cut[0]["note"].as_str().unwrap().contains("export_range writes the whole cell"));
 }
 
@@ -1015,11 +1035,12 @@ fn item26_review_findings_answer_as_they_should() {
     let dir = folder("item26-review");
     let mut m = start(&dir, &[]);
     // 1. whole rows are read within the used range, and the part is labelled by the cells it holds
-    let long = |ch: char| ch.to_string().repeat(60_000);
-    m.ok("write_range", json!({"range": "C6", "values": [[long('a'), long('b'), long('c')], [long('d'), long('e'), long('f')]]}));
+    // (cells of 60,000 characters as written in the answer: 10,000 control characters, each "\u0001" — a cell holds at most 32,767)
+    let long = |ch: char| ch.to_string().repeat(10_000);
+    m.ok("write_range", json!({"range": "C6", "values": [[long('\u{1}'), long('\u{2}'), long('\u{3}')], [long('\u{4}'), long('\u{5}'), long('\u{6}')]]}));
     let r = m.ok("read_range", json!({"range": "5:7", "max_cells": 50_000}));
     assert_eq!(r["range"], "C6:D6", "{}", r.to_string().chars().take(300).collect::<String>());
-    assert_eq!(r["values"][0][0].as_str().map(|s| &s[..1]), Some("a"));
+    assert_eq!(r["values"][0][0].as_str().map(|s| &s[..1]), Some("\u{1}"));
     assert_eq!((r["next_range"].as_str(), r["then_range"].as_str()), (Some("Sheet1!E6"), Some("Sheet1!C7:E7")));
     // 2. read_range takes no continue_from: it is not read, and no rows are dropped
     m.ok("write_range", json!({"range": "H1", "values": (1..=10).map(|i| json!([i])).collect::<Vec<_>>()}));

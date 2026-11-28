@@ -2322,6 +2322,10 @@ pub fn classify(b: &mut dyn Backend, tool: &str, a: &Args, msg: &str) -> ToolErr
             "fix the formula where the reason says (characters count from the `=`) and send it again; evaluate_formula checks a formula without writing it, list_functions finds a function's name",
         );
     }
+    // (item 26, 26.3.1) Excel's 32,767 characters in a cell
+    if m.contains("an excel cell holds at most 32,767") {
+        return ToolError::new("invalid_argument", msg, "send the text again in parts, one cell each (write_range takes a row of them)");
+    }
     if m.starts_with("cancelled:") || m.contains(": cancelled:") {
         return ToolError::new("cancelled", msg, "the call was stopped as asked and changed nothing; run it again when you need it");
     }

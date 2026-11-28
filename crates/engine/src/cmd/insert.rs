@@ -1303,7 +1303,7 @@ fn insert_shape(s: &mut Session, p: &Json) -> Result<Json> {
 }
 
 /// A text box holds at most as many characters as a cell.
-const SHAPE_TEXT_MAX_CHARS: usize = 32_767;
+const SHAPE_TEXT_MAX_CHARS: usize = gridcraft_functions::MAX_TEXT;
 
 fn shape_set_text(s: &mut Session, p: &Json) -> Result<Json> {
     let id =

@@ -84,6 +84,7 @@ pub fn criterion_matches_blank(criterion: &Value) -> bool {
     criteria::Criterion::parse_arg_truncated(criterion).matches(&Value::Empty)
 }
 pub use stat::{aggregate_values, aggregate_values_k};
+pub use util::MAX_TEXT;
 
 /// An evaluated argument. Ranges arrive as `Value::Array` (blank cells = `Value::Empty`) with
 /// `from_ref = true`.

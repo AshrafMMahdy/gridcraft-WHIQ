@@ -1002,6 +1002,11 @@ The platform's ledger item 26 (the owner's nine rules for the limits inside the 
 in the inventory (`docs/item26-inventory/gridcraft.md` in the platform) is now one of: refused in words, said in the answer,
 marked `AGREED LIMIT (owner, 2026-11-28)` with its reason, or removed.
 
+- **Excel's 32,767 characters in a cell** (decision 26.3.1, owner 2026-11-28: "Excel character limit - agreed, refuse and let agent
+  know") — `cmd/edit.rs` `text_fits_cell`: a write of longer text into a cell is refused in words and writes nothing (typed input,
+  `range.setValues` and so `write_range` / `build_workbook`, a paste, Find and Replace, Text to Columns; before, it was stored whole
+  and Excel cut it when it opened the file). A file that holds a longer cell is read as it is. The number is one constant,
+  `gridcraft_functions::MAX_TEXT`, which a formula's text result over it (`#VALUE!`) and a text box share.
 - **One answer rule** (rule 2) — `crates/mcp/src/answer_cap.rs`: an answer over 131,072 characters (sized as sent: escaped
   length) is cut by structure, `result_truncated` says what was kept, and the whole answer is saved in the write root. A picture is
   its own content block, outside the rule; an inline PDF too large for it is refused with the way to get it as a file. Reading

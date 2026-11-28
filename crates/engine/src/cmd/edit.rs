@@ -258,6 +258,41 @@ pub(crate) fn input_to_cell(input: &str, sheet: usize, at: CellRef, wb: &mut gri
     input_to_cell_noted(input, sheet, at, wb, &mut EntryNotes::default())
 }
 
+/// WHIQ (item 26, 26.3.1): Excel holds at most 32,767 characters in a cell, and cuts a longer one when it opens the file; a write
+/// of longer text is refused, in words (it was stored and saved whole). A file read keeps what the file holds.
+pub(crate) fn text_fits_cell(input: &str, wb: &gridcraft_model::Workbook, sheet: usize, at: CellRef) -> Result<()> {
+    match too_long_for_cell(input, wb, sheet, at) {
+        Some(fact) => Err(EngineError::Other(format!("{fact}. Nothing was written: split the text over several cells"))),
+        None => Ok(()),
+    }
+}
+
+/// `The text for Sheet1!A1 is 40,000 characters long; …` when `input` is longer than a cell holds.
+pub(crate) fn too_long_for_cell(input: &str, wb: &gridcraft_model::Workbook, sheet: usize, at: CellRef) -> Option<String> {
+    let max = gridcraft_functions::MAX_TEXT;
+    let n = if input.len() <= max { return None } else { input.chars().count() };
+    if n <= max {
+        return None;
+    }
+    let name = wb.sheet(sheet).map(|s| format!("{}!{}", gridcraft_formula::quote_sheet(&s.name), at.a1())).unwrap_or_else(|| at.a1());
+    Some(format!(
+        "The text for {name} is {} characters long; an Excel cell holds at most 32,767 (Excel cuts a longer one when it opens the file)",
+        with_thousands(n)
+    ))
+}
+
+fn with_thousands(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// [`input_to_cell`] that also says what the entry did (`notes`).
 pub(crate) fn input_to_cell_noted(
     input: &str,
@@ -266,6 +301,7 @@ pub(crate) fn input_to_cell_noted(
     wb: &mut gridcraft_model::Workbook,
     notes: &mut EntryNotes,
 ) -> Result<Option<Cell>> {
+    text_fits_cell(input, wb, sheet, at)?;
     let style = wb.sheet(sheet).map(|sh| sh.style_id(at)).unwrap_or_default();
     if input.is_empty() {
         let c = Cell { value: Value::Empty, formula: None, style };
@@ -997,6 +1033,8 @@ fn paste_text(s: &mut Session, p: &Json, text: &str) -> Result<Json> {
         for (ri, row) in rows.iter().enumerate() {
             for (ci, v) in row.iter().enumerate() {
                 let Some(c) = at.offset(ri as i64, ci as i64) else { continue };
+                // (item 26, 26.3.1: text too long for a cell is refused — the fallback below kept it whole)
+                text_fits_cell(v, &cx.wb, sheet, c)?;
                 let mut cell = input_to_cell(v, sheet, c, &mut cx.wb).unwrap_or_else(|_| Some(Cell::value(Value::text(v.as_str()))));
                 if let Some(cl) = cell.as_mut() {
                     numeric_from_html(cl, v, html.get(ri).and_then(|r| r.get(ci)), &mut cx.wb);
@@ -1725,6 +1763,10 @@ fn replace(s: &mut Session, p: &Json) -> Result<Json> {
                 } else {
                     replace_ci(&text, &what, &with)
                 };
+                // (item 26, 26.3.1: a replacement that makes the text too long for a cell is refused, said as itself)
+                if let Some(fact) = too_long_for_cell(&new, &cx.wb, si, c) {
+                    return Err(bad("edit.replace", format!("replacing in {} makes it too long. {fact}. Nothing was replaced", c.a1())));
+                }
                 // WHIQ (item 26, B48): a replacement that makes a formula invalid is refused, as Excel refuses it (it was stored as text)
                 let cell = input_to_cell(&new, si, c, &mut cx.wb).map_err(|e| {
                     bad("edit.replace", format!("replacing in {} makes `{new}`, which is not a valid formula ({e}); nothing was replaced", c.a1()))
@@ -1818,6 +1860,41 @@ mod tests {
         assert_eq!(get(&mut s, "A3")["value"], json!(true));
         assert_eq!(get(&mut s, "A4")["value"], json!(200.5));
         assert!(s.execute("cell.set", json!({"cell": "A5"})).is_err());
+    }
+
+    #[test]
+    fn a_cell_takes_at_most_32767_characters_as_excel() {
+        // WHIQ (item 26, 26.3.1): a longer write is refused in words and writes nothing; a cell that already holds more keeps it
+        let mut s = Session::new();
+        s.new_workbook();
+        let get = |s: &mut Session, a: &str| s.execute("cell.get", json!({"cell": a})).unwrap();
+        let len = |v: &Json| v["value"].as_str().map_or(0, |t| t.chars().count());
+        s.execute("cell.set", json!({"cell": "A1", "input": "é".repeat(32_767)})).unwrap();
+        assert_eq!(len(&get(&mut s, "A1")), 32_767, "32,767 characters (not bytes) fit");
+        let e = s.execute("cell.set", json!({"cell": "A2", "input": "x".repeat(40_000)})).unwrap_err().to_string();
+        assert!(e.contains("A2 is 40,000 characters long") && e.contains("at most 32,767") && e.contains("Nothing was written"), "{e}");
+        assert_eq!(get(&mut s, "A2")["value"], Json::Null);
+        // a text-formatted cell and a value list alike; the whole write is refused, its other cells too
+        s.execute("range.setValues", json!({"range": "C1", "values": [["kept"]]})).unwrap();
+        let e = s.execute("range.setValues", json!({"range": "C1", "values": [["new"], ["y".repeat(32_768)]]})).unwrap_err().to_string();
+        assert!(e.contains("C2 is 32,768 characters long"), "{e}");
+        assert_eq!(get(&mut s, "C1")["value"], json!("kept"));
+        // a paste (the system clipboard's text) that holds one over-long cell
+        let e = s.execute("edit.paste", json!({"text": format!("a\t{}", "z".repeat(33_000)), "at": "E1"})).unwrap_err().to_string();
+        assert!(e.contains("F1 is 33,000 characters long"), "{e}");
+        assert_eq!(get(&mut s, "E1")["value"], Json::Null);
+        // a replacement that makes a cell too long
+        s.execute("cell.set", json!({"cell": "G1", "input": "ab".repeat(10_000)})).unwrap();
+        let e = s.execute("edit.replace", json!({"what": "a", "with": "aaa", "all": true})).unwrap_err().to_string();
+        assert!(e.contains("replacing in G1 makes it too long") && e.contains("40,000 characters"), "{e}");
+        assert_eq!(len(&get(&mut s, "G1")), 20_000);
+        // a cell a file brought in longer than Excel holds is read whole, and Text to Columns refuses a part too long for a cell
+        let long = format!("{},b", "w".repeat(40_000));
+        std::sync::Arc::make_mut(&mut s.doc_mut().unwrap().wb).sheet_mut(0).unwrap().set_cell(CellRef::parse("H1").unwrap(), Cell::value(Value::text(long.as_str())));
+        assert_eq!(len(&get(&mut s, "H1")), 40_002);
+        let e = s.execute("data.textToColumns", json!({"range": "H1", "delimiters": [","], "destination": "I1"})).unwrap_err().to_string();
+        assert!(e.contains("I1 is 40,000 characters long"), "{e}");
+        assert_eq!(get(&mut s, "J1")["value"], Json::Null, "nothing of the split was written");
     }
 
     #[test]

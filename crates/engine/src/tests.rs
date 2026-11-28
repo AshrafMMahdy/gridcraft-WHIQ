@@ -538,11 +538,12 @@ fn rich_clipboard_omits_html_for_large_ranges_without_truncating_text() {
 #[test]
 fn rich_clipboard_omits_html_when_escaping_exceeds_byte_budget() {
     let mut s = s();
-    let text = "&".repeat(1_000_000);
-    s.execute("range.setValues", json!({"range": "A1", "values": [[text]]})).unwrap();
-    let copied = s.execute("edit.copy", json!({"range": "A1", "html": true})).unwrap();
+    // (31 cells of 32,767 "&", a cell's most: 5 MB once escaped, over the 4 MB budget)
+    let text = "&".repeat(32_767);
+    s.execute("range.setValues", json!({"range": "A1", "values": [vec![text; 31]]})).unwrap();
+    let copied = s.execute("edit.copy", json!({"range": "A1:AE1", "html": true})).unwrap();
     assert!(copied.get("html").is_none(), "an oversized escaped value must not produce partial HTML");
-    assert_eq!(copied["text"].as_str().unwrap().len(), 1_000_001);
+    assert_eq!(copied["text"].as_str().unwrap().len(), 31 * 32_767 + 30 + 1);
     assert!(copied["text"].as_str().unwrap().ends_with("&\n"));
 }
 

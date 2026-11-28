@@ -12,7 +12,10 @@ pub(crate) type R<T> = Result<T, CellError>;
 /// Largest array a function may build.
 pub(crate) const MAX_CELLS: usize = 10_000_000;
 /// Longest text a cell can hold.
-pub(crate) const MAX_TEXT: usize = 32_767;
+// AGREED LIMIT (owner, 2026-11-28): 32,767 characters in a cell — a formula's text result over it is #VALUE!, a write of longer text
+// is refused — why: item 26 decision 26.3.1, "Excel character limit - agreed, refuse and let agent know" — necessary because it is
+// Excel's own limit, and Excel cuts a longer cell when it opens the file.
+pub const MAX_TEXT: usize = 32_767;
 
 /// Scalar-position lifting tables.
 pub(crate) const S: &[bool] = &[true];

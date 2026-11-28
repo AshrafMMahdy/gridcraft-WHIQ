@@ -842,6 +842,8 @@ fn text_to_columns(s: &mut Session, p: &Json) -> Result<Json> {
             }
         }
         for (c, t) in out {
+            // (item 26, 26.3.1: a part too long for a cell is refused — `unwrap_or(None)` below left the cell empty)
+            super::edit::text_fits_cell(&t, &cx.wb, sheet, c)?;
             let cell = super::edit::input_to_cell(&t, sheet, c, &mut cx.wb).unwrap_or(None);
             let shm = cx.sheet_mut(sheet)?;
             match cell {
