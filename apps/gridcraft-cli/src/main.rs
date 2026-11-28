@@ -728,7 +728,8 @@ fn mcp(args: &[String]) -> Result<(), String> {
         eprintln!("gridcraft-cli: removed {swept} stale spill file(s) from {}", gridcraft_engine::model::spill::spill_base().display());
     }
     if let Some(n) = within("idle-evict-secs", 0.05, f64::MAX)? {
-        config.idle_evict = Some(std::time::Duration::from_secs_f64(n));
+        // (a number of seconds past what a duration holds is refused: it panicked — item 26 blind review)
+        config.idle_evict = Some(std::time::Duration::try_from_secs_f64(n).map_err(|_| format!("mcp: --idle-evict-secs is too large (got {n})"))?);
     }
     if let Some(n) = num("open-job-mb")? {
         config.job_open_bytes = (n * 1024.0 * 1024.0) as u64;
@@ -747,7 +748,11 @@ fn mcp(args: &[String]) -> Result<(), String> {
         if n > 0.0 && n < 0.2 {
             return Err(format!("mcp: --checkpoint-secs is 0 (off) or 0.2 or more (got {n})"));
         }
-        config.checkpoint_interval = (n > 0.0).then(|| std::time::Duration::from_secs_f64(n));
+        config.checkpoint_interval = if n > 0.0 {
+            Some(std::time::Duration::try_from_secs_f64(n).map_err(|_| format!("mcp: --checkpoint-secs is too large (got {n})"))?)
+        } else {
+            None
+        };
     }
     config.handle_signals = !a.has("no-signals");
     if let Some(r) = &roots {

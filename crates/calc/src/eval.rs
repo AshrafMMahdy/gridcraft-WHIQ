@@ -65,6 +65,8 @@ fn used_read(name: &str, n: usize, scalar: &mut dyn FnMut(usize) -> Option<Value
         Some(Value::Number(m)) => ok.contains(&m),
         Some(_) => false,
     };
+    // an exact match: the match type given as 0 or FALSE (left out, VLOOKUP and MATCH search approximately)
+    let exact = |v: Option<Value>| matches!(v, Some(Value::Number(m)) if m == 0.0) || matches!(v, Some(Value::Bool(false)));
     if LEAVE_OUT_BLANKS.contains(&name) {
         return Some((UsedRead::Each, (0..n).collect()));
     }
@@ -89,12 +91,16 @@ fn used_read(name: &str, n: usize, scalar: &mut dyn FnMut(usize) -> Option<Value
                 .all(|i| scalar(*i).is_some_and(|c| !matches!(c, Value::Array(_)) && !gridcraft_functions::criterion_matches_blank(&c)))
                 .then_some((UsedRead::Joint, ranges))
         }
-        // lookups of a value that cannot match an empty cell (an approximate match passes over empty cells)
-        "VLOOKUP" => scalar(0).is_some_and(|k| finds_no_blank(&k)).then(|| (UsedRead::Rows, vec![1])),
-        "HLOOKUP" => scalar(0).is_some_and(|k| finds_no_blank(&k)).then(|| (UsedRead::Cols, vec![1])),
-        "MATCH" => scalar(0).is_some_and(|k| finds_no_blank(&k)).then(|| (UsedRead::Each, vec![1])),
-        "XMATCH" => (scalar(0).is_some_and(|k| finds_no_blank(&k)) && (n < 3 || mode_is(scalar(2), &[0.0, 1.0, -1.0])))
-            .then(|| (UsedRead::Each, vec![1])),
+        // exact lookups of a value that cannot match an empty cell; a linear search (XMATCH's next smaller / larger too, which
+        // compares every value). An approximate or binary search is read at full size: on unsorted data the window it halves
+        // changes its answer (item 26 blind review: MATCH(40,A1:A20000,-1) answered 795 trimmed, 1000 whole)
+        "VLOOKUP" => (scalar(0).is_some_and(|k| finds_no_blank(&k)) && exact(scalar(3))).then(|| (UsedRead::Rows, vec![1])),
+        "HLOOKUP" => (scalar(0).is_some_and(|k| finds_no_blank(&k)) && exact(scalar(3))).then(|| (UsedRead::Cols, vec![1])),
+        "MATCH" => (scalar(0).is_some_and(|k| finds_no_blank(&k)) && exact(scalar(2))).then(|| (UsedRead::Each, vec![1])),
+        "XMATCH" => (scalar(0).is_some_and(|k| finds_no_blank(&k))
+            && (n < 3 || mode_is(scalar(2), &[0.0, 1.0, -1.0]))
+            && (n < 4 || mode_is(scalar(3), &[1.0, -1.0])))
+        .then(|| (UsedRead::Each, vec![1])),
         _ => None,
     }
 }
@@ -285,6 +291,11 @@ impl<'h> Evaluator<'h> {
                     Ev::R(a) if a.len() == 1 => areas.push((*i, a[0])),
                     _ => return out,
                 }
+            }
+            // (ranges of different shapes are read whole, so that the function answers #VALUE! as Excel does: trimmed to one
+            // extent they were made to match — item 26 blind review)
+            if areas.windows(2).any(|w| (w[0].1.range.height(), w[0].1.range.width()) != (w[1].1.range.height(), w[1].1.range.width())) {
+                return out;
             }
             if !areas.iter().any(|(_, a)| big(&a.range)) {
                 return out;
@@ -1463,8 +1474,14 @@ impl<'h> Evaluator<'h> {
                     None | Some(Expr::Missing) => Some(0.0),
                     Some(e) => self.value(e).as_f64(),
                 };
+                // (a binary search, search_mode ±2, is read at full size: on unsorted data its window changes its answer)
+                let search = match args.get(5) {
+                    None | Some(Expr::Missing) => Some(1.0),
+                    Some(e) => self.value(e).as_f64(),
+                };
                 let trim = finds_no_blank(&key)
                     && mode.is_some_and(|m| [0.0, 1.0, -1.0].contains(&m))
+                    && search.is_some_and(|m| m == 1.0 || m == -1.0)
                     && u64::from(l.range.height()) * u64::from(l.range.width()) > FULL_SIZE_CELLS;
                 let looked = if trim { self.trim(&l) } else { l.range };
                 let mut xargs = vec![Arg { value: key, from_ref: false }, Arg { value: self.range_value(l.sheet, looked), from_ref: true }];

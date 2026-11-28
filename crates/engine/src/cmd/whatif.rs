@@ -344,11 +344,15 @@ fn goal_seek(s: &mut Session, p: &Json) -> Result<Json> {
     // (item 26, rule 7: the limit that stopped it is said)
     if !r.converged {
         out["note"] = json!(format!(
-            "{} was not brought to {target} within the workbook's Maximum Change ({}) in {} iterations (its Maximum Iterations: {}; formulas.calculationOptions sets both)",
+            "{} was not brought to {target} within the workbook's Maximum Change ({}) in {} iterations ({}; formulas.calculationOptions sets both)",
             set.a1(),
             r.tol,
             r.iterations,
-            r.max_iter
+            if r.max_iter == max_iter {
+                format!("its Maximum Iterations: {max_iter}")
+            } else {
+                format!("the workbook's Maximum Iterations is {max_iter}; Goal Seek runs at most {}", r.max_iter)
+            }
         ));
     }
     Ok(out)

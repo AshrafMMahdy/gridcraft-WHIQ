@@ -294,6 +294,7 @@ fn read(s: &mut Session, p: &Json) -> Result<Json> {
         Some(u) if r.is_full_cols() || r.is_full_rows() => r.intersection(&u).unwrap_or(RangeRef::cell(r.start)),
         _ => r,
     };
+    // AGREED LIMIT (owner, 2026-11-28): 1,000,000 cells — the largest range one sheet.read reads; larger is refused, naming the parts — why: item 26 rule 6, "Necessary limits - agreed" — necessary because the values are held in memory whole.
     if r.count() > 1_000_000 {
         return Err(bad("sheet.read", "range larger than 1,000,000 cells; read it in parts"));
     }

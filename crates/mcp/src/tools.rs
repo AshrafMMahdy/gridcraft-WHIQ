@@ -19,11 +19,12 @@ impl ToolResult {
     pub fn text(t: impl Into<String>) -> Self {
         Self { content: vec![json!({"type": "text", "text": t.into()})], is_error: false, structured: None }
     }
-    /// A successful result: `v` as pretty JSON text and as `structuredContent` (an object:
-    /// anything else is wrapped as `{"result": v}`).
+    /// A successful result: `v` as compact JSON text and as `structuredContent` (an object:
+    /// anything else is wrapped as `{"result": v}`). (Item 26: the text is the size the answer rule measures; pretty-printed it
+    /// was about twice that, for a client that reads the text.)
     pub fn json(v: &Value) -> Self {
         let structured = if v.is_object() { v.clone() } else { json!({"result": v}) };
-        Self { structured: Some(structured), ..Self::text(serde_json::to_string_pretty(v).unwrap_or_default()) }
+        Self { structured: Some(structured), ..Self::text(serde_json::to_string(v).unwrap_or_default()) }
     }
     pub fn error(t: impl Into<String>) -> Self {
         let t = t.into();

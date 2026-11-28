@@ -32,6 +32,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             author: None,
+            // AGREED LIMIT (owner, 2026-11-28): 10,000 cells — read_range's part when `max_cells` is not given; the rest is named by next_range — why: item 26 rule 4, "Defaults - agreed" — arbitrary by agreement (a part of 10,000 short cells fits the answer rule).
             max_read_cells: 10_000,
             test_hooks: test_hooks_from_env(),
             old_copies: true,
@@ -1181,7 +1182,7 @@ pub fn with_globals(mut tools: Vec<Value>) -> Vec<Value> {
             if name == "export_markdown" {
                 props.insert(
                     "max_bytes".into(),
-                    int("Largest page of Markdown to return (default and most: 131072, the answer-size rule; at least 1024)"),
+                    int("Largest page of Markdown to return (default and most: 114688, the answer-size rule less the room for the rest of the answer; at least 1024)"),
                 );
             }
         }
@@ -1207,6 +1208,7 @@ pub fn with_globals(mut tools: Vec<Value>) -> Vec<Value> {
             // (item 26: 1 to 1,000,000, the engine's most for one read; outside it the call is refused, it was clamped)
             props.insert(
                 "max_cells".into(),
+                // AGREED LIMIT (owner, 2026-11-28): 1,000,000 cells — the most one read_range part asks for (sheet.read's own most) — why: item 26 rule 6, "Necessary limits - agreed" — necessary because a part is held in memory whole before it is cut to the answer.
                 json!({"type": "integer", "minimum": 1, "maximum": 1_000_000, "description": "Most cells to return in one call (default 10000, at most 1000000); the rest is reached with next_range"}),
             );
         }
@@ -1221,11 +1223,20 @@ pub fn with_globals(mut tools: Vec<Value>) -> Vec<Value> {
 pub fn run_tool(b: &mut dyn Backend, st: &mut CallState, name: &str, args: &Value) -> ToolResult {
     let mut warnings = std::mem::take(&mut st.call_warnings);
     // (item 26, A32: the first call that works on the blank workbook the server starts with says so)
+    // (checked once, on the workbook itself: a session started on a file — --in, --sample, the app's workbook with --connect — is
+    // not on the blank one; item 26 blind review)
     if !st.opened && !st.blank_said && !NEEDS_NO_DOCUMENT.contains(&name) && !CONTROL_TOOLS.contains(&name) && args.get("document").is_none() {
         st.blank_said = true;
-        warnings.push(
+        let blank = b.call("document.inspect", json!({})).is_ok_and(|i| {
+            i["path"].is_null()
+                && i["dirty"] != true
+                && i["sheets"].as_array().is_some_and(|s| s.len() == 1 && s[0]["usedRange"].is_null())
+        });
+        if blank {
+            warnings.push(
             "no workbook was opened or created in this session: this call worked on the blank workbook the server starts with (Book1); open_workbook or new_workbook first, or save_workbook with a path to keep this one".into(),
-        );
+            );
+        }
     }
     let defs = all_definitions();
     let Some(def) = defs.iter().find(|d| d["name"] == name) else {
@@ -1352,7 +1363,8 @@ pub fn run_tool(b: &mut dyn Backend, st: &mut CallState, name: &str, args: &Valu
             let from = raw
                 .get("continue_from")
                 .and_then(Value::as_u64)
-                .filter(|_| read_only && !def["inputSchema"]["properties"]["offset"].is_object())
+                // (read_range pages by range and takes no continue_from: it is not read here either)
+                .filter(|_| read_only && name != "read_range" && !def["inputSchema"]["properties"]["offset"].is_object())
                 .unwrap_or(0);
             // WHIQ: a preview's HTML and a read's Markdown are paged by their tools (window,
             // max_bytes), not cut by the result trim; they also come as their own content block.
@@ -1368,7 +1380,10 @@ pub fn run_tool(b: &mut dyn Backend, st: &mut CallState, name: &str, args: &Valu
             // smaller part" when the trim counted it)
             let image = v.as_object_mut().and_then(|o| o.remove("__image"));
             let mut v = if read_only {
-                contract::trim_from(v, from as usize, crate::answer_cap::MAX_ANSWER_CHARS)
+                // (a page that still does not fit — no list to page, or one item larger than the rule — is cut by structure, the
+                // whole answer in the write root: item 26 blind review, a get_cell of a long text was replaced by "too large")
+                let dir = b.roots().1;
+                crate::answer_cap::cap(contract::trim_from(v, from as usize, crate::answer_cap::MAX_ANSWER_CHARS), name, dir.as_deref(), "")
             } else {
                 // (the list rule first: a tool that changes the workbook lists 25 of a long list, with the total and the file)
                 let dir = b.roots().1;
@@ -1685,8 +1700,11 @@ fn render_preview(b: &mut dyn Backend, st: &CallState, a: &Args) -> Result<Value
 /// export_markdown: the engine's `sheet.markdown`, paged by rows and bytes.
 fn export_markdown(b: &mut dyn Backend, st: &CallState, a: &Args) -> Result<Value, ToolError> {
     let mut p = pick(a, &["sheet", "continue_sheets", "row_start", "row_count", "col_start", "col_count", "formulas", "keep_empty_rows"]);
-    // a page size the answer-size rule can carry: 1,024 to 131,072, refused otherwise (it was clamped silently)
-    let most = crate::answer_cap::MAX_ANSWER_CHARS as u64;
+    // a page size the answer-size rule can carry, refused otherwise (it was clamped silently): the rule less 16 KiB, the room the
+    // answer's other fields and the escaping of the text take (item 26 blind review: a page of the rule's whole size was an answer
+    // of 135,476 characters)
+    // AGREED LIMIT (owner, 2026-11-28): 1,024 to 114,688 bytes of Markdown a page, 114,688 when not given — the answer-size rule (131,072) less 16 KiB — why: item 26 rule 2, "Answer Size - Agreed, unify it" — necessary because a page must fit the rule with the answer around it.
+    let most = crate::answer_cap::MAX_ANSWER_CHARS as u64 - 16 * 1024;
     let max_bytes = match a.get("max_bytes").and_then(Value::as_u64) {
         None => most,
         Some(m) if (1024..=most).contains(&m) => m,
@@ -1694,7 +1712,7 @@ fn export_markdown(b: &mut dyn Backend, st: &CallState, a: &Args) -> Result<Valu
             return Err(ToolError::new(
                 "invalid_argument",
                 format!("max_bytes {m} is outside 1024..{most}"),
-                format!("give max_bytes from 1024 to {most} (the answer-size rule), or leave it out"),
+                format!("give max_bytes from 1024 to {most} (the answer-size rule, with room for the rest of the answer), or leave it out"),
             ));
         }
     };
@@ -2108,6 +2126,13 @@ fn read_range(b: &mut dyn Backend, st: &CallState, a: &Args) -> Result<Value, To
     let sheet_name = sheet["name"].as_str().unwrap_or("").to_string();
     let used = sheet["usedRange"].as_str().and_then(RangeRef::parse);
     let requested = if given.is_some() { RangeRef::parse(&rest) } else { used };
+    // (whole rows or columns are read within the used range, as sheet.read reads them: the part is labelled by what is read —
+    // item 26 blind review: "5:7" was answered as A5:B5 for the cells C6:D6)
+    let requested = requested.map(|r| match used {
+        Some(u) if r.is_full_cols() || r.is_full_rows() => r.intersection(&u).unwrap_or(RangeRef::cell(r.start)),
+        None if r.is_full_cols() || r.is_full_rows() => RangeRef::cell(r.start),
+        _ => r,
+    });
     let Some(mut r) = requested else {
         // Unparseable (the engine words the error) or an empty sheet.
         return b.call("sheet.read", p).map_err(|e| classify(b, "read_range", a, &e));

@@ -1310,3 +1310,30 @@ fn large_references_count_their_blanks_as_excel_does() {
         assert_eq!(t.num(&format!("D{}", i + 1)), *want, "{f}");
     }
 }
+
+/// WHIQ (item 26, blind review): ranges of different sizes answer #VALUE! as Excel does, and an approximate or binary search
+/// answers the same whether or not the sheet's used range reaches past its range.
+#[test]
+fn large_references_keep_shapes_and_searches_as_read_whole() {
+    let mut t = T::new();
+    for i in 1..=1000u32 {
+        let sh = t.wb.sheet_mut(0).unwrap();
+        sh.cells.set(CellRef::new(i - 1, 0), Cell::value(Value::number(f64::from((i * 37) % 1000))));
+        sh.cells.set(CellRef::new(i - 1, 1), Cell::value(Value::number(f64::from(i))));
+    }
+    for (at, f) in [("D1", "=SUMPRODUCT(A1:A50000,B1:B40000)"), ("D2", "=COUNTIFS(A1:A50000,\">0\",B1:B40000,\">0\")"), ("D3", "=SUMIFS(A1:A50000,B1:B40000,\">0\")")] {
+        t.set(at, f);
+        assert_eq!(t.get(at), Value::Error(CellError::Value), "{f}");
+    }
+    let searches = ["=MATCH(40,A1:A20000,-1)", "=MATCH(500,A1:A20000)", "=VLOOKUP(500,A1:B20000,2,TRUE)", "=XMATCH(50,A1:A20000,0,2)", "=XLOOKUP(50,A1:A20000,B1:B20000,\"nf\",0,2)"];
+    for (i, f) in searches.iter().enumerate() {
+        t.set(&format!("E{}", i + 1), f);
+    }
+    let trimmed: Vec<Value> = (1..=searches.len()).map(|i| t.get(&format!("E{i}"))).collect();
+    // a far cell: the used range now reaches past every range, so nothing is trimmed
+    t.set("Z30000", "far");
+    for (i, f) in searches.iter().enumerate() {
+        t.set(&format!("E{}", i + 1), f);
+        assert_eq!(t.get(&format!("E{}", i + 1)), trimmed[i], "{f}");
+    }
+}

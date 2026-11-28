@@ -184,7 +184,14 @@ struct SortKey {
 
 fn quick_sort(s: &mut Session, p: &Json, asc: bool) -> Result<Json> {
     let r = data_range(s, p)?;
-    let col = col_param(any_param(p, "column"), r.start.col).unwrap_or(s.doc()?.selection.active.col).clamp(r.start.col, r.end.col);
+    let col = col_param(any_param(p, "column"), r.start.col).unwrap_or(s.doc()?.selection.active.col);
+    // (item 26: a column outside the range is refused; it sorted by the range's edge column and answered ok)
+    if col < r.start.col || col > r.end.col {
+        return Err(bad(
+            if asc { "data.sortAscending" } else { "data.sortDescending" },
+            format!("column {} is outside the range {}: sort by one of its columns", CellRef::new(0, col).a1().trim_end_matches('1'), r.a1()),
+        ));
+    }
     let d = s.doc()?;
     let sh = d.wb.active().ok_or(EngineError::NoDocument)?;
     let header = guess_header(&d.wb, sh, r);
@@ -1171,7 +1178,13 @@ fn group(s: &mut Session, p: &Json, on: bool) -> Result<Json> {
 /// + button, saved to XLSX); showing keeps inner groups that were collapsed on their own collapsed.
 fn detail(s: &mut Session, p: &Json, hide: bool) -> Result<Json> {
     let (rows, a, b) = outline_lines(s, p)?;
-    let want = any_param(p, "level").and_then(Json::as_u64).map(|l| l.min(outline::MAX_LEVEL as u64) as u8);
+    // (item 26: a level outside the outline's 1 to 8 is refused; it was read as 8)
+    let want = match any_param(p, "level").and_then(Json::as_u64) {
+        Some(l) if l < 1 || l > outline::MAX_LEVEL as u64 => {
+            return Err(bad(if hide { "data.hideDetail" } else { "data.showDetail" }, format!("`level` is from 1 to {} (got {l})", outline::MAX_LEVEL)));
+        }
+        l => l.map(|l| l as u8),
+    };
     edit(s, |cx| {
         let si = cx.sheet_index();
         let sh = cx.sheet_mut(si)?;
@@ -1214,8 +1227,16 @@ fn detail(s: &mut Session, p: &Json, hide: bool) -> Result<Json> {
 /// The outline's level buttons: show rows / columns down to outline level `n` (1 = only the
 /// top-level summaries); deeper detail is hidden and its summary lines marked collapsed.
 fn show_levels(s: &mut Session, p: &Json) -> Result<Json> {
-    let level = |k: &str| any_param(p, k).and_then(Json::as_u64).map(|n| n.clamp(1, outline::MAX_LEVEL as u64 + 1) as u8);
-    let (rows, cols) = (level("rows"), level("cols"));
+    // (item 26: a level outside 1 to 9 — the outline's 8 and "all" — is refused; it was moved into range)
+    let level = |k: &str| -> Result<Option<u8>> {
+        match any_param(p, k).and_then(Json::as_u64) {
+            Some(n) if n < 1 || n > outline::MAX_LEVEL as u64 + 1 => {
+                Err(bad("data.showLevels", format!("`{k}` is an outline level from 1 to {} (got {n})", outline::MAX_LEVEL + 1)))
+            }
+            n => Ok(n.map(|n| n as u8)),
+        }
+    };
+    let (rows, cols) = (level("rows")?, level("cols")?);
     if rows.is_none() && cols.is_none() {
         return Err(EngineError::BadParams {
             cmd: "data.showLevels".into(),

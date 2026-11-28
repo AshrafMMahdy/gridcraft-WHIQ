@@ -578,7 +578,11 @@ fn indent(s: &mut Session, p: &Json, d: i32) -> Result<Json> {
 
 fn orientation(s: &mut Session, p: &Json) -> Result<Json> {
     let angle: i16 = match any_param(p, "angle") {
-        Some(Json::Number(n)) => n.as_f64().unwrap_or(0.0).clamp(-90.0, 90.0) as i16,
+        // (item 26: an angle outside Excel's -90 to 90 degrees is refused; it was moved into range)
+        Some(Json::Number(n)) => match n.as_f64() {
+            Some(a) if (-90.0..=90.0).contains(&a) => a as i16,
+            _ => return Err(bad("format.orientation", format!("`angle` is from -90 to 90 degrees, or \"vertical\" (got {n})"))),
+        },
         Some(Json::String(t)) => match t.as_str() {
             "vertical" => 255,
             "counterclockwise" => 45,

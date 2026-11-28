@@ -578,7 +578,9 @@ impl Session {
             (None, None) => false,
             _ => true,
         };
-        if r.is_ok()
+        // (a command that answers something — file.options' settings, the Solver's saved model — is not refused: item 26 blind
+        // review; only one that answers nothing at all)
+        if r.as_ref().is_ok_and(|v| v.is_null() || v.as_object().is_some_and(serde_json::Map::is_empty))
             && !changed
             && let Some(UiRequest::Dialog(name, _)) = requests.iter().find(|q| matches!(q, UiRequest::Dialog(..)))
         {

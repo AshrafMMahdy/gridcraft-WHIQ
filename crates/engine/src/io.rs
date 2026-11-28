@@ -120,6 +120,8 @@ fn decrypt_message(name: &str, e: gridcraft_xlsx::DecryptError) -> String {
 fn open_plain(name: &str, bytes: &[u8]) -> Result<(Workbook, Vec<String>)> {
     let kind = FileKind::from_path(name);
     let sniffed = gridcraft_xlsx::sniff(bytes);
+    // (an empty .csv / .tsv / .txt is empty text: a blank sheet, as Excel opens it — item 26 blind review: it was refused)
+    let sniffed = if bytes.is_empty() && matches!(kind, Some(FileKind::Csv | FileKind::Tsv)) { gridcraft_xlsx::Format::Csv } else { sniffed };
     if sniffed == gridcraft_xlsx::Format::Xls {
         let (wb, report) = gridcraft_xlsx::read_xls(bytes).map_err(|e| EngineError::Other(format!("We can't open '{name}': {e}")))?;
         return Ok((wb, report.warnings));

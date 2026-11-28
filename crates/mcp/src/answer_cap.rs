@@ -3,8 +3,8 @@
 //! runs without the platform (the desktop app, an outside agent on its MCP). An answer over the limit is cut BY STRUCTURE —
 //! lists to their first items with a count of the rest, long text clipped in the middle — and the whole answer is saved to a
 //! file whose path the answer names (`result_truncated.full_result_path`). It is never cut to an item offset to call again:
-//! calling a tool that changes the workbook again repeats its changes. Behind the platform an answer cut here already fits the
-//! platform's rule, so it is never cut twice.
+//! calling a tool that changes the workbook again repeats its changes. Behind the platform, the platform's own rule (its limit can
+//! be lower: a share of the model's context, divided between calls made together) still applies to what arrives.
 
 use serde_json::{Map, Value, json};
 use std::path::{Path, PathBuf};
@@ -14,6 +14,7 @@ pub const MAX_ANSWER_CHARS: usize = 128 * 1024;
 /// The platform's ladder: lists 50 → 20 → 8 → 3 → 1 items, text 4,000 → 1,500 → 500 → 200 → 80 characters; the first step
 /// that fits is taken. Nothing fits (one enormous text, a flat object with thousands of keys): a plain cut of the JSON, never
 /// under the platform's floor of 8,192 characters.
+// AGREED LIMIT (owner, 2026-11-28): the ladder (50 / 20 / 8 / 3 / 1 items, 4,000 / 1,500 / 500 / 200 / 80 characters) and the 8,192-character floor — how an answer over the rule is cut — why: item 26 rule 2, "Answer Size - Agreed, unify it" — the platform's own steps (resultCap.ts), arbitrary by agreement.
 const LADDER: [(usize, usize); 5] = [(50, 4000), (20, 1500), (8, 500), (3, 200), (1, 80)];
 const FLOOR_CHARS: usize = 8 * 1024;
 

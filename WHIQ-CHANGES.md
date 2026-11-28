@@ -1040,11 +1040,23 @@ marked `AGREED LIMIT (owner, 2026-11-28)` with its reason, or removed.
   outside what works (`within()` in `apps/gridcraft-cli/src/main.rs`).
 - **Thresholds visible** (rule 7) — the Solver's ±100 bound is said in its answer; Goal Seek that stops short says the
   Maximum Change and Maximum Iterations it ran with; the forecast answers the periods it made.
-- **The desktop** (rule 9 of the clone's list; the same rule here) — a failed AutoSave shows a message; the desktop's own caps
+- **The desktop** (rule 8) — a failed AutoSave shows a message; the desktop's own caps
   are marked.
 
-Tests: `tests/mcp-contract/contract.rs` `answer_size_rule_pages_reads_and_saves_the_rest`,
+- **Blind review** (11 findings fixed): whole rows / columns are read within the used range and a part is labelled by the cells
+  it holds; read_range reads no `continue_from` (it was applied while the answer said it was ignored); ranges of different
+  shapes answer #VALUE! as in Excel (trimmed to one extent they matched); an approximate or binary search is read at full size
+  (on unsorted data the trimmed window changed its answer); a command that answers data and would open a dialog is not refused;
+  an answer with no list to page, or a first item larger than the rule, is cut by structure and saved whole (it was replaced by
+  "too large", or paged at 0 for ever); a page that names its offset continues from it; an empty .csv / .txt opens as a blank
+  sheet; the blank-workbook warning is checked on the workbook itself; the text block is compact JSON (pretty, it was twice the
+  rule); export_markdown's page leaves 16 KiB for the rest of the answer; durations past what a duration holds are refused, not
+  a panic; a sort column, an outline level or an orientation angle outside its range is refused; the remaining numbers marked.
+  Still open, for the owner: Excel's 32,767-character cell limit (GridCraft accepts longer text).
+
+Tests: `tests/mcp-contract/contract.rs` `item26_review_findings_answer_as_they_should`, `answer_size_rule_pages_reads_and_saves_the_rest`,
 `a_size_cut_read_range_names_the_rows_it_holds_and_skips_none`, `a_cut_row_names_the_rows_after_it_and_a_cut_cell_is_said`,
 `item26_arguments_do_what_they_say_or_are_refused`, `a_failed_auto_save_says_the_work_is_lost_and_refuses_the_save`;
 `crates/mcp/src/answer_cap.rs` tests; `crates/engine/src/cmd/print.rs` `hostile_settings_never_panic_and_cap_pages`; the
-recalculation depth tests and `large_references_count_their_blanks_as_excel_does` in `crates/calc`.
+recalculation depth tests, `large_references_count_their_blanks_as_excel_does` and
+`large_references_keep_shapes_and_searches_as_read_whole` in `crates/calc`.

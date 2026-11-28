@@ -391,6 +391,9 @@ pub fn trim_result(v: Value, max: usize) -> Value {
         Value::Array(items) => {
             let total = items.len();
             let kept = fit_items(&items, max.saturating_sub(512));
+            if kept == 0 {
+                return Value::Array(items);
+            }
             json!({
                 "items": items.into_iter().take(kept).collect::<Vec<_>>(),
                 "truncated": true,
@@ -403,9 +406,9 @@ pub fn trim_result(v: Value, max: usize) -> Value {
         Value::Object(mut o) => {
             // The biggest array member is cut.
             let key = o.iter().filter(|(_, x)| x.is_array()).max_by_key(|(_, x)| size(x)).map(|(k, _)| k.clone());
-            let Some(key) = key else {
-                return json!({"truncated": true, "reason": "the result was too large to return", "next_step": "ask for a smaller part"});
-            };
+            // (item 26 blind review: with no list to page, or a first item larger than the rule, the answer is left whole here and
+            // the answer rule cuts it by structure, the whole in a file; it was replaced by "too large", or paged at 0 for ever)
+            let Some(key) = key else { return Value::Object(o) };
             let items = match o.remove(&key) {
                 Some(Value::Array(items)) => items,
                 _ => vec![],
@@ -413,20 +416,32 @@ pub fn trim_result(v: Value, max: usize) -> Value {
             let rest = size(&Value::Object(o.clone()));
             let total = items.len();
             let kept = fit_items(&items, max.saturating_sub(rest + 512));
+            if kept == 0 {
+                o.insert(key, Value::Array(items));
+                return Value::Object(o);
+            }
             o.insert(key.clone(), Value::Array(items.into_iter().take(kept).collect()));
             o.insert("truncated".into(), json!(true));
             o.insert("total".into(), json!(total));
             o.insert("returned".into(), json!(kept));
-            o.entry("continue_from").or_insert(json!(kept));
-            o.entry("next_step").or_insert(json!(format!(
-                "`{key}` holds the first {kept} of {total}; call the same tool again with continue_from: {kept} for the rest"
-            )));
+            // (a page that names its own offset continues from it: a page of offset 100 cut to 30 items continues at 130, not at
+            // the page's own next offset — item 26 blind review)
+            match o.get("offset").and_then(Value::as_u64).filter(|_| key == "items") {
+                Some(at) => {
+                    let next = at as usize + kept;
+                    o.insert("continue_from".into(), json!(next));
+                    o.insert("next_step".into(), json!(format!("`{key}` holds items {at} to {}; call the same tool again with continue_from: {next} for the rest", next - 1)));
+                }
+                None => {
+                    o.entry("continue_from").or_insert(json!(kept));
+                    o.entry("next_step").or_insert(json!(format!(
+                        "`{key}` holds the first {kept} of {total}; call the same tool again with continue_from: {kept} for the rest"
+                    )));
+                }
+            }
             Value::Object(o)
         }
-        Value::String(s) => {
-            let cut: String = s.chars().take(max / 2).collect();
-            json!({"text": cut, "truncated": true, "total_chars": s.chars().count(), "next_step": "ask for a smaller part"})
-        }
+        // (one text larger than the rule: left whole here, the answer rule clips it and saves it whole)
         other => other,
     }
 }

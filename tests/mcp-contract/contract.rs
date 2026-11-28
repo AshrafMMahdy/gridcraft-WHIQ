@@ -1008,3 +1008,41 @@ fn a_large_render_reports_its_progress() {
     let notes: Vec<&Value> = m.notifications.iter().filter(|n| n["params"]["progressToken"] == "r-1").collect();
     assert!(notes.iter().any(|n| n["params"]["message"].as_str().unwrap_or("").contains("drawing cells")), "{:?}", notes);
 }
+
+/// WHIQ (item 26, blind review): what the review found, each as it now answers.
+#[test]
+fn item26_review_findings_answer_as_they_should() {
+    let dir = folder("item26-review");
+    let mut m = start(&dir, &[]);
+    // 1. whole rows are read within the used range, and the part is labelled by the cells it holds
+    let long = |ch: char| ch.to_string().repeat(60_000);
+    m.ok("write_range", json!({"range": "C6", "values": [[long('a'), long('b'), long('c')], [long('d'), long('e'), long('f')]]}));
+    let r = m.ok("read_range", json!({"range": "5:7", "max_cells": 50_000}));
+    assert_eq!(r["range"], "C6:D6", "{}", r.to_string().chars().take(300).collect::<String>());
+    assert_eq!(r["values"][0][0].as_str().map(|s| &s[..1]), Some("a"));
+    assert_eq!((r["next_range"].as_str(), r["then_range"].as_str()), (Some("Sheet1!E6"), Some("Sheet1!C7:E7")));
+    // 2. read_range takes no continue_from: it is not read, and no rows are dropped
+    m.ok("write_range", json!({"range": "H1", "values": (1..=10).map(|i| json!([i])).collect::<Vec<_>>()}));
+    let r = m.call("read_range", json!({"range": "H1:H10", "continue_from": 3}));
+    let v = &r["structuredContent"];
+    assert!(r["isError"] == true || v["values"].as_array().map(Vec::len) == Some(10), "{v}");
+    // 6. an answer with no list to page, over the rule, is cut by structure and saved whole (it was replaced by "too large")
+    m.ok("set_cell", json!({"cell": "J1", "input": "\"".repeat(32_767)}));
+    let g = m.ok("get_cell", json!({"cell": "J1"}));
+    let t = &g["result_truncated"];
+    assert!(t["full_result_path"].as_str().is_some_and(|p| std::path::Path::new(p).exists()), "{}", g.to_string().chars().take(300).collect::<String>());
+    // 5. a command that answers data and would also open a dialog is not refused
+    let o = m.ok("execute_command", json!({"command": "file.options", "params": {}}));
+    assert!(o.as_object().is_some_and(|x| !x.is_empty()), "{o}");
+    // 10. the text block is the compact JSON
+    let c = m.call("get_cell", json!({"cell": "H1"}));
+    assert!(!c["content"][0]["text"].as_str().unwrap().contains("\n  "), "{c}");
+    // 7. an empty .csv opens as a blank sheet
+    std::fs::write(dir.join("empty.csv"), b"").unwrap();
+    m.ok("open_workbook", json!({"path": "empty.csv"}));
+    drop(m);
+    // 11. a number of seconds past what a duration holds is refused in words, not a panic
+    let out = std::process::Command::new(crate::harness::binary()).args(["mcp", "--idle-evict-secs", "1e20"]).output().unwrap();
+    assert_ne!(out.status.code(), Some(101), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--idle-evict-secs is too large"), "{}", String::from_utf8_lossy(&out.stderr));
+}
