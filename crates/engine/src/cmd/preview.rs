@@ -62,35 +62,43 @@ fn list_comments(s: &mut Session, p: &Json) -> Result<Json> {
     Ok(json!({"count": list.len(), "comments": list}))
 }
 
-/// A 1-based row number (`0` and `1` both mean the first row).
-fn row_param(p: &Json, key: &str) -> Option<u32> {
-    match any_param(p, key)? {
-        Json::Number(n) => n.as_u64().map(|v| (v.max(1) - 1).min(u64::from(gridcraft_core::MAX_ROWS - 1)) as u32),
-        Json::String(s) => s.trim().parse::<u64>().ok().map(|v| (v.max(1) - 1).min(u64::from(gridcraft_core::MAX_ROWS - 1)) as u32),
+// WHIQ (item 26, B43): rows and columns are 1-based and within the sheet, counts 1 or more; anything else is refused in words (0 and
+// 1 were both the first row, a negative number was read as absent, past the grid it was clamped).
+fn whole(cmd: &str, key: &str, v: &Json, least: u64, most: u64, what: &str) -> Result<u32> {
+    let n = match v {
+        Json::Number(n) => n.as_u64(),
+        Json::String(s) => s.trim().parse::<u64>().ok(),
         _ => None,
+    };
+    match n.filter(|n| (least..=most).contains(n)) {
+        Some(n) => Ok(n as u32),
+        None => Err(bad(cmd, format!("`{key}` is {what} from {least} to {most} (got {v})"))),
+    }
+}
+
+/// A 1-based row number.
+fn row_param(cmd: &str, p: &Json, key: &str) -> Result<Option<u32>> {
+    match any_param(p, key) {
+        None | Some(Json::Null) => Ok(None),
+        Some(v) => whole(cmd, key, v, 1, u64::from(gridcraft_core::MAX_ROWS), "a row number").map(|r| Some(r - 1)),
     }
 }
 
 /// A 1-based column number or letters (`"C"` = 3).
-fn col_param(p: &Json, key: &str) -> Option<u32> {
-    match any_param(p, key)? {
-        Json::Number(n) => n.as_u64().map(|v| (v.max(1) - 1).min(u64::from(gridcraft_core::MAX_COLS - 1)) as u32),
-        Json::String(s) => {
-            let t = s.trim();
-            match t.parse::<u64>() {
-                Ok(v) => Some((v.max(1) - 1).min(u64::from(gridcraft_core::MAX_COLS - 1)) as u32),
-                Err(_) => gridcraft_core::letters_to_col(&t.to_ascii_uppercase()),
-            }
-        }
-        _ => None,
+fn col_param(cmd: &str, p: &Json, key: &str) -> Result<Option<u32>> {
+    match any_param(p, key) {
+        None | Some(Json::Null) => Ok(None),
+        Some(Json::String(s)) if s.trim().parse::<u64>().is_err() => gridcraft_core::letters_to_col(&s.trim().to_ascii_uppercase())
+            .map(Some)
+            .ok_or_else(|| bad(cmd, format!("`{key}` is a column number or letters, e.g. 3 or \"C\" (got \"{s}\")"))),
+        Some(v) => whole(cmd, key, v, 1, u64::from(gridcraft_core::MAX_COLS), "a column number").map(|c| Some(c - 1)),
     }
 }
 
-fn count_param(p: &Json, key: &str) -> Option<u32> {
-    match any_param(p, key)? {
-        Json::Number(n) => n.as_u64().map(|v| v.clamp(1, u64::from(u32::MAX)) as u32),
-        Json::String(s) => s.trim().parse::<u64>().ok().map(|v| v.clamp(1, u64::from(u32::MAX)) as u32),
-        _ => None,
+fn count_param(cmd: &str, p: &Json, key: &str) -> Result<Option<u32>> {
+    match any_param(p, key) {
+        None | Some(Json::Null) => Ok(None),
+        Some(v) => whole(cmd, key, v, 1, u64::from(u32::MAX), "a count").map(Some),
     }
 }
 
@@ -104,8 +112,9 @@ fn sheet_param(s: &Session, p: &Json, cmd: &str) -> Result<Option<usize>> {
             if i < d.wb.sheets.len() { Ok(Some(i)) } else { Err(bad(cmd, format!("there is no sheet {i} (the workbook has {})", d.wb.sheets.len()))) }
         }
         Some(Json::String(name)) if name.trim().is_empty() => Ok(None),
+        // (item 26, B43: a name is a name — "2" was the third sheet unless a sheet had that name; an index is a number)
         Some(Json::String(name)) => {
-            d.wb.sheet_index(name.trim()).or_else(|| name.trim().parse::<usize>().ok().filter(|i| *i < d.wb.sheets.len())).map(Some).ok_or_else(
+            d.wb.sheet_index(name.trim()).map(Some).ok_or_else(
                 || {
                     let names: Vec<&str> = d.wb.sheets.iter().map(|s| s.name.as_str()).collect();
                     bad(cmd, format!("no sheet named `{name}` (sheets: {})", names.join(", ")))
@@ -126,14 +135,18 @@ fn preview_html(s: &mut Session, p: &Json) -> Result<Json> {
     };
     let o = Options {
         sheet,
-        row_start: row_param(p, "row_start").or_else(|| row_param(p, "rowStart")),
-        row_count: count_param(p, "row_count").or_else(|| count_param(p, "rowCount")),
-        col_start: col_param(p, "col_start").or_else(|| col_param(p, "colStart")),
-        col_count: count_param(p, "col_count").or_else(|| count_param(p, "colCount")),
+        row_start: row_param(CMD, p, "row_start")?.or(row_param(CMD, p, "rowStart")?),
+        row_count: count_param(CMD, p, "row_count")?.or(count_param(CMD, p, "rowCount")?),
+        col_start: col_param(CMD, p, "col_start")?.or(col_param(CMD, p, "colStart")?),
+        col_count: count_param(CMD, p, "col_count")?.or(count_param(CMD, p, "colCount")?),
         format,
         headings: bool_param(p, "headings").unwrap_or(true),
         other_sheets: bool_param(p, "other_sheets").unwrap_or(true),
-        max_cells: any_param(p, "max_cells").and_then(Json::as_u64).unwrap_or(crate::preview::DEFAULT_MAX_CELLS),
+        // (item 26, B39: 1 to 2,000,000, refused outside them; above it was lowered without a word)
+        max_cells: match any_param(p, "max_cells") {
+            None | Some(Json::Null) => crate::preview::DEFAULT_MAX_CELLS,
+            Some(v) => u64::from(whole(CMD, "max_cells", v, 1, crate::preview::MAX_WINDOW_CELLS, "a number of cells")?),
+        },
         title: str_param(p, "title").map(str::to_string).unwrap_or_else(|| d.display_title()),
     };
     let mut v = crate::preview::render(&d.wb, &o).map_err(|e| bad(CMD, e))?;
@@ -155,11 +168,17 @@ fn sheet_markdown(s: &mut Session, p: &Json) -> Result<Json> {
     let o = MarkdownOptions {
         sheet,
         continue_sheets: bool_param(p, "continue_sheets").unwrap_or(sheet.is_none()),
-        row_start: row_param(p, "row_start"),
-        row_count: count_param(p, "row_count"),
-        col_start: col_param(p, "col_start"),
-        col_count: count_param(p, "col_count"),
-        max_bytes: any_param(p, "max_bytes").and_then(Json::as_u64).map_or(262_144, |v| v.clamp(1024, 64 << 20) as usize),
+        row_start: row_param(CMD, p, "row_start")?,
+        row_count: count_param(CMD, p, "row_count")?,
+        col_start: col_param(CMD, p, "col_start")?,
+        col_count: count_param(CMD, p, "col_count")?,
+        // (item 26, A2: 1 KiB to 64 MiB, refused outside them; they were clamped)
+        // AGREED LIMIT (owner, 2026-11-28): 262,144 bytes — a Markdown part when `max_bytes` is not given, the rest reached with `next`
+        // — why: item 26 rule 4, "Defaults - agreed" — arbitrary by agreement.
+        max_bytes: match any_param(p, "max_bytes") {
+            None | Some(Json::Null) => 262_144,
+            Some(v) => whole(CMD, "max_bytes", v, 1024, 64 << 20, "a number of bytes")? as usize,
+        },
         formulas: bool_param(p, "formulas").unwrap_or(false),
         keep_empty_rows: bool_param(p, "keep_empty_rows").unwrap_or(false),
     };

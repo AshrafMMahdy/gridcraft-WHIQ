@@ -789,6 +789,8 @@ fn improduct(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
 // ---------------------------------------------------------------------------------------------
 // Bessel functions
 
+// AGREED LIMIT (owner, 2026-11-28): 4,000,000 integration points — past them the Bessel functions use the asymptotic (Hankel) formula
+// for |x| over 1e6, else #NUM! — why: item 26 rule 6, "Necessary limits - agreed" — necessary because the integral's work is bounded.
 const MAX_BESSEL_POINTS: f64 = 4_000_000.0;
 
 /// J_n(x) for integer n ≥ 0 via Bessel's integral, J_n(x) = (1/2π)∫₀^{2π} cos(nτ − x sin τ) dτ,

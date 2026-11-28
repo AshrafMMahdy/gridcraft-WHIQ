@@ -125,7 +125,16 @@ pub fn read_drawing(cx: &mut Ctx<'_>, part: &str, sheet: &mut Sheet) -> Result<(
     let Some(x) = cx.optional_xml(part)? else { return Ok(()) };
     let rels = cx.pkg.rels(part)?;
     // WHIQ: the anchors as written, so an untouched chart keeps its anchor on save.
-    let fragments = cx.pkg.read_limited(part, 16 << 20).ok().flatten().and_then(|b| crate::passthrough::top_level_fragments(&b)).unwrap_or_default();
+    // AGREED LIMIT (owner, 2026-11-28): 16 MB — a drawing part larger than this does not keep its anchors as written: they are written
+    // from the model on save, and the open says so — why: item 26 rule 5, "Timers, memory, and safety - agreed" — arbitrary by agreement (memory).
+    let fragments = match cx.pkg.read_limited(part, 16 << 20) {
+        Ok(b) => b.and_then(|b| crate::passthrough::top_level_fragments(&b)).unwrap_or_default(),
+        // (item 26, C16: it was dropped without a word)
+        Err(e) => {
+            cx.warn(format!("{part} is too large to keep its anchors as written ({e}): saving writes the charts' and pictures' places from what GridCraft read"));
+            Vec::new()
+        }
+    };
     let mut twins: Vec<gridcraft_model::PreservedXml> = vec![];
     for (ai, a) in x.children.iter().enumerate() {
         // WHIQ: an Excel 2010 form control's DrawingML twin (`a14:compatExt` naming its VML

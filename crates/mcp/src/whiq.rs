@@ -233,6 +233,10 @@ pub struct CallState {
     pub notices: Vec<String>,
     /// Warnings about this call found before it ran (a tool name read in another spelling).
     pub call_warnings: Vec<String>,
+    /// WHIQ (item 26, A32): a workbook was opened, created or built in this session (else the calls work on the blank workbook
+    /// the server starts with, and the first one says so).
+    pub opened: bool,
+    pub blank_said: bool,
 }
 
 // ---------------------------------------------------------------- definitions
@@ -468,7 +472,7 @@ fn preview_definitions() -> Vec<Value> {
              match_case and whole_cell as in Excel's Find. No match is an empty list, not an error.",
             obj(
                 json!({
-                    "what": string("The text or number to find"),
+                    "what": {"type": ["string", "number"], "description": "The text or number to find"},
                     "sheet": string("Only this sheet (default: every sheet)"),
                     "look_in": enumeration("values (default: what the cells show) or formulas (formula text, constants as typed)", &["values", "formulas"]),
                     "match_case": boolean("Match upper and lower case exactly (default false)"),
@@ -487,8 +491,8 @@ fn preview_definitions() -> Vec<Value> {
              cell}]}; one undo step.",
             obj(
                 json!({
-                    "what": string("The text to find"),
-                    "with": string("The replacement (\"\" removes it)"),
+                    "what": {"type": ["string", "number"], "description": "The text or number to find"},
+                    "with": {"type": ["string", "number"], "description": "The replacement (\"\" removes it)"},
                     "sheet": string("Only this sheet (default: every sheet)"),
                     "match_case": boolean("Match upper and lower case exactly (default false)"),
                     "whole_cell": boolean("Replace only cells whose whole content matches (default false)"),
@@ -554,7 +558,7 @@ fn preview_definitions() -> Vec<Value> {
             "delete_sheet",
             "Delete sheet",
             "Delete a worksheet with everything on it (a workbook keeps at least one visible sheet). Undo brings it back.",
-            obj(json!({"sheet": string("The sheet to delete (name or 0-based index)")}), &["sheet"]),
+            obj(json!({"sheet": {"type": ["string", "integer"], "minimum": 0, "description": "The sheet to delete: its name (text), or its 0-based index (a number)"}}), &["sheet"]),
             crate::tools::ANY,
         ),
         tool(
@@ -1197,7 +1201,11 @@ pub fn with_globals(mut tools: Vec<Value>) -> Vec<Value> {
             props.insert("limit".into(), int("Return at most this many items"));
         }
         if name == "read_range" {
-            props.insert("max_cells".into(), int("Most cells to return in one call (default 10000); the rest is reached with continue_from"));
+            // (item 26: 1 to 1,000,000, the engine's most for one read; outside it the call is refused, it was clamped)
+            props.insert(
+                "max_cells".into(),
+                json!({"type": "integer", "minimum": 1, "maximum": 1_000_000, "description": "Most cells to return in one call (default 10000, at most 1000000); the rest is reached with next_range"}),
+            );
         }
     }
     tools
@@ -1209,6 +1217,13 @@ pub fn with_globals(mut tools: Vec<Value>) -> Vec<Value> {
 /// [`contract::normalize_tool_name`] first).
 pub fn run_tool(b: &mut dyn Backend, st: &mut CallState, name: &str, args: &Value) -> ToolResult {
     let mut warnings = std::mem::take(&mut st.call_warnings);
+    // (item 26, A32: the first call that works on the blank workbook the server starts with says so)
+    if !st.opened && !st.blank_said && !NEEDS_NO_DOCUMENT.contains(&name) && !CONTROL_TOOLS.contains(&name) && args.get("document").is_none() {
+        st.blank_said = true;
+        warnings.push(
+            "no workbook was opened or created in this session: this call worked on the blank workbook the server starts with (Book1); open_workbook or new_workbook first, or save_workbook with a path to keep this one".into(),
+        );
+    }
     let defs = all_definitions();
     let Some(def) = defs.iter().find(|d| d["name"] == name) else {
         let names: Vec<&str> = defs.iter().filter_map(|d| d["name"].as_str()).collect();
@@ -1324,6 +1339,7 @@ pub fn run_tool(b: &mut dyn Backend, st: &mut CallState, name: &str, args: &Valu
         Ok(v) => {
             if matches!(name, "open_workbook" | "new_workbook" | "build_workbook") {
                 st.evicted = None;
+                st.opened = true;
             }
             let mut v = v;
             if let (Some(h), Some(o)) = (&handle, v.as_object_mut()) {
@@ -1494,18 +1510,31 @@ fn dispatch(b: &mut dyn Backend, st: &mut CallState, name: &str, a: &Args, warni
             exec(b, "formulas.defineName", p).map_err(|e| classify(b, name, a, &e))
         }
         "delete_name" => exec(b, "formulas.deleteName", pick(a, &["name", "scope"])).map_err(|e| classify(b, name, a, &e)),
+        // WHIQ (item 26, B52): a delete names what it deletes (with none it deleted the active sheet, or the sheet's last chart); a
+        // sheet named by text is the sheet of that name ("2" was the third sheet unless one was named "2"), by a number its index
         "delete_sheet" => {
             let p = match a.get("sheet") {
-                Some(Value::String(t)) => match t.trim().parse::<u64>() {
-                    Ok(i) if !sheet_names(b).iter().any(|n| n == t.trim()) => json!({"sheet": i}),
-                    _ => json!({"sheet": t}),
-                },
-                Some(v) => json!({"sheet": v}),
-                None => json!({}),
+                Some(v) if !v.is_null() => json!({"sheet": v}),
+                _ => {
+                    return Err(ToolError::new(
+                        "invalid_argument",
+                        "delete_sheet: say which sheet to delete with `sheet` (its name, or its index from 0)",
+                        format!("inspect_workbook lists the sheets: {}", sheet_names(b).join(", ")),
+                    ));
+                }
             };
             exec(b, "home.deleteSheet", p).map_err(|e| classify(b, name, a, &e))
         }
-        "delete_chart" => with_sheet(b, a, |b| exec(b, "chart.delete", pick(a, &["chart"]))).map_err(|e| classify(b, name, a, &e)),
+        "delete_chart" => {
+            if a.get("chart").is_none_or(Value::is_null) {
+                return Err(ToolError::new(
+                    "invalid_argument",
+                    "delete_chart: say which chart to delete with `chart` (its id)",
+                    "inspect_workbook lists each sheet's charts and their ids",
+                ));
+            }
+            with_sheet(b, a, |b| exec(b, "chart.delete", pick(a, &["chart"]))).map_err(|e| classify(b, name, a, &e))
+        }
         "delete_table" => {
             let table = a.get("table").and_then(Value::as_str).unwrap_or("").to_string();
             let info = b.call("document.inspect", json!({})).map_err(|e| classify(b, name, a, &e))?;
@@ -1777,8 +1806,18 @@ fn batch_op(
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
     };
-    if args.remove("document").is_some() {
-        warnings.push(format!("`{raw_name}`: a batch acts on one workbook; the operation's `document` was ignored"));
+    if let Some(d) = args.remove("document")
+        && !d.is_null()
+        && d.as_str().map(str::to_string) != b.active_document()
+    {
+        return Err((
+            raw_name.clone(),
+            ToolError::new(
+                "invalid_argument",
+                format!("`{raw_name}`: a batch acts on one workbook, and this operation names another with `document`"),
+                "give the batch's `document` for the whole batch, or run this operation in its own call",
+            ),
+        ));
     }
     let sq = contract::squash(&raw_name);
     // Merges are commands, not tools.
@@ -2019,7 +2058,8 @@ fn export_range(b: &mut dyn Backend, a: &Args) -> Result<Value, ToolError> {
     let used = found["usedRange"].as_str().map(str::to_string);
     let range = match rest.or(used) {
         Some(r) => r,
-        None => return Ok(json!({"path": path, "rows": 0, "note": "the sheet holds no data"})),
+        // (item 26, B37: nothing is written, so the answer names no file)
+        None => return Ok(json!({"written": false, "rows": 0, "note": format!("the sheet holds no data: nothing was written to {path}")})),
     };
     let mut p = json!({"path": path, "range": range});
     if let Some(n) = found["name"].as_str() {
@@ -2033,7 +2073,7 @@ fn export_range(b: &mut dyn Backend, a: &Args) -> Result<Value, ToolError> {
 /// read_range that never floods the caller: at most `max_cells` cells per call; the answer says
 /// `truncated`, `continue_from` (the first cell not returned) and `next_range` to ask for next.
 fn read_range(b: &mut dyn Backend, st: &CallState, a: &Args) -> Result<Value, ToolError> {
-    let cap = a.get("max_cells").and_then(Value::as_u64).map(|n| n.clamp(1, 1_000_000)).unwrap_or(st.settings.max_read_cells).max(1);
+    let cap = a.get("max_cells").and_then(Value::as_u64).unwrap_or(st.settings.max_read_cells).max(1);
     let mut p = pick(a, &["range", "sheet", "formulas", "formatted"]);
     let given = a.get("range").and_then(Value::as_str).map(str::to_string);
     let (prefix, rest) = match &given {
@@ -2067,13 +2107,19 @@ fn read_range(b: &mut dyn Backend, st: &CallState, a: &Args) -> Result<Value, To
         // Unparseable (the engine words the error) or an empty sheet.
         return b.call("sheet.read", p).map_err(|e| classify(b, "read_range", a, &e));
     };
+    // (item 26, A7: a range larger than one read is read within the sheet's used range, and the answer says so)
+    let mut narrowed = None;
     if r.count() > cap
         && let Some(u) = used
     {
+        let asked = r;
         r = match r.intersection(&u) {
             Some(x) => x,
-            None => return Ok(json!({"range": r.a1(), "sheet": sheet_name, "values": [], "note": "the range holds no data"})),
+            None => return Ok(json!({"range": r.a1(), "sheet": sheet_name, "values": [], "note": format!("the range holds no data: the sheet's data is in {}", u.a1())})),
         };
+        if r != asked {
+            narrowed = Some(format!("{} is larger than one read: it was read within the sheet's used range, {}", asked.a1(), r.a1()));
+        }
     }
     let q = quote_sheet(&sheet_name);
     if r.count() <= cap {
@@ -2087,6 +2133,9 @@ fn read_range(b: &mut dyn Backend, st: &CallState, a: &Args) -> Result<Value, To
                 v["then_range"] = json!(then);
                 v["next_step"] = json!(format!("call read_range with range \"{}\" for the rest of this row, then \"{then}\" for the rows after it", v["next_range"].as_str().unwrap_or_default()));
             }
+        }
+        if let Some(n) = narrowed {
+            v["note"] = json!(n);
         }
         return Ok(v);
     }
@@ -2112,6 +2161,9 @@ fn read_range(b: &mut dyn Backend, st: &CallState, a: &Args) -> Result<Value, To
     match fit_read(&mut v, if width > cap { RangeRef::new(part.start, CellRef::new(part.start.row, r.end.col)) } else { r }) {
         Some(fit) => said_part(&mut v, &q, r, fit.part, fit.next_start, fit.next_range),
         None => said_part(&mut v, &q, r, part, next_start, next_range),
+    }
+    if let Some(n) = narrowed {
+        v["note"] = json!(n);
     }
     Ok(v)
 }
@@ -2272,20 +2324,19 @@ pub fn classify(b: &mut dyn Backend, tool: &str, a: &Args, msg: &str) -> ToolErr
         )
         .with("closest", json!(near));
     }
-    if m.contains("os error 32")
-        || m.contains("os error 33")
-        || m.contains("being used by another process")
-        || m.contains("os error 5)")
-        || m.contains("permission denied")
-        || m.contains("access is denied")
-    {
-        let name = Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "the file".into());
+    // (item 26, A30: a file in use is retried; a permission refused is not, and says so)
+    let name = || Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "the file".into());
+    if m.contains("os error 32") || m.contains("os error 33") || m.contains("being used by another process") {
+        // AGREED LIMIT (owner, 2026-11-28): 5 s — the wait an agent is told before retrying a file another program holds — why: item 26 rule 5, "Timers, memory, and safety - agreed" — arbitrary by agreement.
+        return ToolError::new("locked", msg, format!("{} is open in another program: close it there and retry, or save under another name", name()))
+            .with("retry_after_ms", json!(5000));
+    }
+    if m.contains("os error 5)") || m.contains("permission denied") || m.contains("access is denied") {
         return ToolError::new(
             "locked",
             msg,
-            format!("{name} is open in another program or read-only: close it there and retry, or save under another name"),
-        )
-        .with("retry_after_ms", json!(5000));
+            format!("{} or its folder cannot be changed by this server (read-only, or no permission): save under another name or in another folder inside the write root", name()),
+        );
     }
     if m.contains("no space left") || m.contains("os error 28") || m.contains("os error 112") || m.contains("disk full") {
         return ToolError::new(
@@ -2309,6 +2360,14 @@ pub fn classify(b: &mut dyn Backend, tool: &str, a: &Args, msg: &str) -> ToolErr
         );
     }
     if m.contains("too large") || m.contains("too many") || m.contains("too tall") || m.contains("larger than") || m.contains("read it in parts") {
+        // (item 26, A30: a file too large to open has no smaller part to ask for)
+        if matches!(tool, "open_workbook" | "render_preview" | "export_markdown") && !path.is_empty() {
+            return ToolError::new(
+                "too_large",
+                msg,
+                "this file is too large for this engine process to open: save it as .xlsx if it is another kind (that one is read in parts), split it, or ask the administrator to raise the engine memory limit (WHIQ_ENGINE_PROC_MB)",
+            );
+        }
         return ToolError::new("too_large", msg, "ask for a smaller part: a range like A1:D500, fewer rows, or fewer pages");
     }
     if m.contains("out of range") || m.contains("beyond the last") || m.contains("no page ") {
@@ -2515,7 +2574,7 @@ pub fn status_value(snap: Option<&DocSnapshot>, roots: (Option<PathBuf>, Option<
         "version": env!("CARGO_PKG_VERSION"),
         "protocol": crate::server::PROTOCOL_VERSION,
         "pid": std::process::id(),
-        "memory": {"rss_bytes": rss, "committed_bytes": committed_bytes(), "limit_bytes": Value::Null, "measured": rss.is_some(), "source": memory_source()},
+        "memory": {"rss_bytes": rss, "committed_bytes": committed_bytes(), "limit_bytes": Value::Null, "measured": rss.is_some(), "source": memory_source(), "budget_bytes": gridcraft_engine::core::memory::budget(), "budget_source": gridcraft_engine::core::memory::budget_source()},
         "fonts": fonts_value(),
         "documents": doc,
         "roots": {"read": read.map(|p| p.display().to_string()), "write": write.map(|p| p.display().to_string())},

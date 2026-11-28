@@ -275,74 +275,18 @@ fn coerce(p: &Value, v: &Value) -> Option<Value> {
         }
         return None;
     }
+    // WHIQ (item 26, A27): a value of another type is refused in words by the schema check (check_arguments), never converted ("yes"
+    // was true, "15" a number, "A,B" a list, a scalar a list of one); only the same number written as a float is read as the integer.
     match v {
-        Value::String(s) => {
-            let t = s.trim();
-            if accepts("boolean") {
-                match t.to_ascii_lowercase().as_str() {
-                    "true" | "yes" | "on" | "1" => return Some(json!(true)),
-                    "false" | "no" | "off" | "0" => return Some(json!(false)),
-                    _ => {}
-                }
-            }
-            if accepts("integer")
-                && let Ok(i) = t.parse::<i64>()
-            {
-                return Some(json!(i));
-            }
-            if accepts("number")
-                && let Ok(f) = t.parse::<f64>()
-                && f.is_finite()
-            {
-                return Some(json!(f));
-            }
-            if accepts("array") {
-                // "A,B" for a list of names.
-                return Some(Value::Array(t.split(',').map(|x| json!(x.trim())).filter(|x| x != "").collect()));
-            }
-            None
-        }
-        Value::Number(n) => {
-            if accepts("string") {
-                return Some(json!(n.to_string()));
-            }
+        Value::Number(n)
             if accepts("integer")
                 && let Some(f) = n.as_f64()
                 && f.fract() == 0.0
-                && f.abs() < 9.0e15
-            {
-                return Some(json!(f as i64));
-            }
-            if accepts("boolean") {
-                return n.as_f64().map(|f| json!(f != 0.0));
-            }
-            if accepts("array") {
-                return Some(json!([v]));
-            }
-            None
+                && f.abs() < 9.0e15 =>
+        {
+            Some(json!(f as i64))
         }
-        Value::Bool(b) => {
-            if accepts("string") {
-                return Some(json!(if *b { "true" } else { "false" }));
-            }
-            if accepts("array") {
-                return Some(json!([v]));
-            }
-            None
-        }
-        Value::Object(_) if accepts("array") => Some(json!([v])),
         _ => None,
-    }
-}
-
-/// `values` for write_range-like tools: a 2-D array. A flat list is one row, a scalar one cell.
-fn as_rows(v: &Value) -> Option<Value> {
-    match v {
-        Value::Array(rows) if rows.iter().all(Value::is_array) => None,
-        Value::Array(cells) if cells.iter().all(|c| !c.is_array() && !c.is_object()) => Some(json!([cells])),
-        Value::Array(_) => None,
-        Value::Object(_) => None,
-        scalar => Some(json!([[scalar]])),
     }
 }
 
@@ -387,13 +331,6 @@ pub fn normalize_args(schema: &Value, args: &Map<String, Value>) -> (Map<String,
     }
     for (k, v) in out.iter_mut() {
         let Some(p) = props.get(k) else { continue };
-        if k == "values" && p["type"] == "array" && p["items"]["type"] == "array" {
-            if let Some(rows) = as_rows(v) {
-                warnings.push("`values` was read as rows of cells (a 2-D array)".to_string());
-                *v = rows;
-            }
-            continue;
-        }
         if let Some(c) = coerce(p, v) {
             warnings.push(format!("argument `{k}` was read as {c}"));
             *v = c;
@@ -548,9 +485,11 @@ mod tests {
             "kind": {"type": "string", "enum": ["bar", "line"]},
             "values": {"type": "array", "items": {"type": "array"}},
         }});
-        let args = json!({"Range": "A1", "formulas": "true", "steps": "3", "kind": "Bar", "bogus": 1, "values": [1, 2]});
+        // a name in another spelling and an enum value in another case are read (and said); a value of another type is left for the
+        // schema check to refuse (WHIQ item 26: "true" was true, "3" was 3, a flat list one row); 3.0 is the integer 3
+        let args = json!({"Range": "A1", "formulas": "true", "steps": 3.0, "kind": "Bar", "bogus": 1, "values": [1, 2]});
         let (out, w) = normalize_args(&schema, args.as_object().unwrap());
-        assert_eq!(Value::Object(out), json!({"range": "A1", "formulas": true, "steps": 3, "kind": "bar", "values": [[1, 2]]}));
+        assert_eq!(Value::Object(out), json!({"range": "A1", "formulas": "true", "steps": 3, "kind": "bar", "values": [1, 2]}));
         assert!(w.iter().any(|w| w.contains("unknown argument `bogus`")), "{w:?}");
         let (out, _) = normalize_args(&json!({"properties": {"path": {"type": "string"}}}), json!({"file": "a.xlsx"}).as_object().unwrap());
         assert_eq!(out["path"], "a.xlsx");

@@ -198,9 +198,7 @@ fn insert_pivot_slicer(s: &mut Session, p: &Json, sheet: usize, links: Vec<Strin
             CellRef::new(a.row, a.col.min(gridcraft_core::MAX_COLS - 1))
         }
     };
-    let columns = u32_param(p, "columns").unwrap_or(1).clamp(1, 10);
-    let width = f64_param(p, "width").unwrap_or(168.0).clamp(60.0, 10000.0) as f32;
-    let height = f64_param(p, "height").unwrap_or(200.0).clamp(60.0, 10000.0) as f32;
+    let (columns, width, height) = slicer_size(p)?;
     let id = d.wb.next_object_id();
     let slicer = Slicer {
         id,
@@ -272,9 +270,7 @@ fn insert_slicer(s: &mut Session, p: &Json) -> Result<Json> {
     let table = t.name.clone();
     let at = cell_param(s, p, "at")?
         .unwrap_or_else(|| CellRef::new(t.range.start.row, t.range.end.col.saturating_add(2).min(gridcraft_core::MAX_COLS - 1)));
-    let columns = u32_param(p, "columns").unwrap_or(1).clamp(1, 10);
-    let width = f64_param(p, "width").unwrap_or(168.0).clamp(60.0, 10000.0) as f32;
-    let height = f64_param(p, "height").unwrap_or(200.0).clamp(60.0, 10000.0) as f32;
+    let (columns, width, height) = slicer_size(p)?;
     let id = d.wb.next_object_id();
     let slicer = Slicer {
         id,
@@ -477,4 +473,23 @@ mod tests {
         assert!(s.execute("insert.slicer", json!({"pivot": "Nope"})).is_err());
         assert!(s.execute("insert.slicer", json!({"pivot": "PivotTable1", "column": "Nope"})).is_err());
     }
+}
+
+/// WHIQ (item 26, C32): a slicer's columns and size; outside their ranges refused (they were clamped).
+// AGREED LIMIT (owner, 2026-11-28): 1 column, 168 x 200 points when not given (Excel's own); 1 to 10 columns and 60 to 10,000 points —
+// outside them refused — why: item 26 rules 4 and 6 — necessary because a slicer must hold its buttons; the numbers are arbitrary by agreement.
+fn slicer_size(p: &Json) -> Result<(u32, f32, f32)> {
+    let columns = match u32_param(p, "columns") {
+        None => 1,
+        Some(c) if (1..=10).contains(&c) => c,
+        Some(c) => return Err(bad("slicer", format!("`columns` is from 1 to 10 (got {c})"))),
+    };
+    let size = |k: &str, d: f64| -> Result<f32> {
+        match f64_param(p, k) {
+            None => Ok(d as f32),
+            Some(v) if v.is_finite() && (60.0..=10000.0).contains(&v) => Ok(v as f32),
+            Some(v) => Err(bad("slicer", format!("`{k}` is a size in points from 60 to 10,000 (got {v})"))),
+        }
+    };
+    Ok((columns, size("width", 168.0)?, size("height", 200.0)?))
 }

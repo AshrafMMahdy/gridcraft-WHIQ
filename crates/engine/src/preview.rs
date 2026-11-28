@@ -28,8 +28,12 @@ pub const DEFAULT_ROWS: u32 = 100;
 /// Columns of the first screenful.
 pub const DEFAULT_COLS: u32 = 30;
 /// Cells one window draws at most unless the call asks for more (`max_cells`).
+// AGREED LIMIT (owner, 2026-11-28): 100,000 cells a preview window when `max_cells` is not given, the rest reached with `next_rows`
+// (said in `window.truncated`) — why: item 26 rule 4, "Defaults - agreed" — arbitrary by agreement.
 pub const DEFAULT_MAX_CELLS: u64 = 100_000;
 /// The most `max_cells` may be.
+// AGREED LIMIT (owner, 2026-11-28): 2,000,000 cells — the most one preview window draws; more is refused — why: item 26 rule 5, "Timers,
+// memory, and safety - agreed" — necessary because a window is one HTML page held in memory and sent whole.
 pub const MAX_WINDOW_CELLS: u64 = 2_000_000;
 /// Cells drawn for the first screenful of the other sheets of a page, all together.
 const OTHER_SHEETS_CELLS: u64 = 60_000;

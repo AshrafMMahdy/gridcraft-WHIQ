@@ -152,25 +152,38 @@ fn open_plain(name: &str, bytes: &[u8]) -> Result<(Workbook, Vec<String>)> {
         Some(FileKind::Json) => {
             let mut wb: Workbook = serde_json::from_slice(bytes).map_err(|e| EngineError::Other(format!("not a GridCraft JSON workbook: {e}")))?;
             wb.styles.rebuild_index();
+            // (item 26, B23: a JSON workbook with no sheets is refused; it opened as a new blank workbook)
             if wb.sheets.is_empty() {
-                wb = Workbook::new();
+                return Err(EngineError::Other(format!("'{name}' is a GridCraft JSON workbook with no sheets: there is nothing to open")));
             }
             Ok((wb, vec![]))
         }
+        Some(FileKind::Tsv) if sniffed != gridcraft_xlsx::Format::Csv => {
+            Err(EngineError::Other(format!("GridCraft can't open '{name}': it is named as tab-separated text but does not hold text")))
+        }
         Some(FileKind::Tsv) => {
             let opts = gridcraft_xlsx::CsvOptions { delimiter: b'\t', ..Default::default() };
-            let mut wb = gridcraft_xlsx::read_csv(bytes, &opts).map_err(|e| EngineError::Other(e.to_string()))?;
+            let (mut wb, notes) = gridcraft_xlsx::read_csv_noted(bytes, &opts).map_err(|e| EngineError::Other(e.to_string()))?;
             // Tab is what makes it a .tsv/.txt; saved as .csv it gets the CSV default.
             wb.csv_delimiter = None;
             rename_first_sheet(&mut wb, name);
-            Ok((wb, vec![]))
+            Ok((wb, notes))
         }
-        _ => {
+        // (item 26, B19: text is read as delimited text, and one that is not named .csv says so; anything else that is not a kind
+        // GridCraft reads is refused — it was read as CSV, its bytes parsed as values)
+        Some(FileKind::Html) => Err(EngineError::Other(format!("GridCraft saves HTML but does not open it: '{name}' can't be opened"))),
+        _ if sniffed == gridcraft_xlsx::Format::Csv => {
             let opts = gridcraft_xlsx::CsvOptions { delimiter: 0, ..Default::default() };
-            let mut wb = gridcraft_xlsx::read_csv(bytes, &opts).map_err(|e| EngineError::Other(e.to_string()))?;
+            let (mut wb, mut notes) = gridcraft_xlsx::read_csv_noted(bytes, &opts).map_err(|e| EngineError::Other(e.to_string()))?;
+            if kind != Some(FileKind::Csv) {
+                notes.insert(0, format!("'{name}' holds text, not a workbook: it was read as delimited text"));
+            }
             rename_first_sheet(&mut wb, name);
-            Ok((wb, vec![]))
+            Ok((wb, notes))
         }
+        _ => Err(EngineError::Other(format!(
+            "GridCraft can't open '{name}': it is not text nor a kind of file it reads (.xlsx, .xlsm, .xls, .xlsb, .ods, .csv, .tsv, .txt, .json)"
+        ))),
     }
 }
 
@@ -768,7 +781,8 @@ pub mod save_policy {
         if !first.exists() {
             return first;
         }
-        (2..10_000u32).map(|n| dir.join(format!("OLD_{n}_{name}"))).find(|p| !p.exists()).unwrap_or(first)
+        // (item 26, A33: no count — past 9,999 the first OLD_ copy was overwritten, against "an OLD_ file is never replaced")
+        (2..=u64::MAX).map(|n| dir.join(format!("OLD_{n}_{name}"))).find(|p| !p.exists()).unwrap_or(first)
     }
 
     pub(crate) fn wrote(target: &Path, previous: Option<PathBuf>) {

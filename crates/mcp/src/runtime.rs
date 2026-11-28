@@ -281,7 +281,8 @@ impl Shared {
             let base = format!("{}.recovered-{}", stem.trim(), stamp());
             let mut p = dir.join(format!("{base}.xlsx"));
             let mut n = 2;
-            while p.exists() && n < 1000 {
+            // (item 26, A20: no count — after 999 clashes the last name was overwritten)
+            while p.exists() {
                 p = dir.join(format!("{base}-{n}.xlsx"));
                 n += 1;
             }

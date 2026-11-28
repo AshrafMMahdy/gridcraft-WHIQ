@@ -2187,10 +2187,12 @@ fn page_setup(s: &mut Session, p: &Json) -> Result<Json> {
     let mut margins: [Option<f32>; 6] = [None; 6];
     for (i, key) in ["left", "right", "top", "bottom", "header", "footer"].iter().enumerate() {
         if let Some(v) = f64_param(margin_src, key).or_else(|| f64_param(p, key)) {
-            if !v.is_finite() || v < 0.0 {
-                return Err(bad(CMD, format!("margin `{key}` must be a non-negative number of inches")));
+            // AGREED LIMIT (owner, 2026-11-28): 20 inches — the largest margin; a larger one is refused (it was cut to 20) — why: item 26
+            // rule 6, "Necessary limits - agreed" — necessary because no paper GridCraft prints on is that large (Tabloid is 17 in).
+            if !v.is_finite() || !(0.0..=20.0).contains(&v) {
+                return Err(bad(CMD, format!("margin `{key}` must be a number of inches from 0 to 20 (got {v})")));
             }
-            margins[i] = Some(v.min(20.0) as f32);
+            margins[i] = Some(v as f32);
         }
     }
     let parse_rows = |key: &str| -> Result<Option<Option<(u32, u32)>>> {
@@ -2226,39 +2228,57 @@ fn page_setup(s: &mut Session, p: &Json) -> Result<Json> {
         Some(Json::String(t)) => Some(Some(RangeRef::parse(split_sheet(t).1).ok_or_else(|| bad(CMD, format!("`printArea` is not a range: `{t}`")))?)),
         Some(_) => return Err(bad(CMD, "`printArea` must be a range like \"A1:F50\"")),
     };
-    let row_breaks: Option<Vec<u32>> = any_param(p, "rowBreaks").and_then(Json::as_array).map(|a| {
-        let mut v: Vec<u32> = a
-            .iter()
-            .filter_map(|x| x.as_u64().or_else(|| x.as_str().and_then(|t| t.trim().parse().ok())))
-            .filter(|r| *r >= 2 && *r <= MAX_ROWS as u64)
-            .map(|r| r as u32 - 1)
-            .take(1026)
-            .collect();
+    // WHIQ (item 26, B34): Excel's own bounds, refused in words outside them (they were clamped, cut or skipped without a word):
+    // page breaks after row 1 / column A, at most 1,026 of each; scale 10-400 %; fit to 0-32,767 pages; header / footer 255 characters.
+    let breaks = |key: &str, a: &[Json], one: &dyn Fn(&Json) -> Option<u32>| -> Result<Vec<u32>> {
+        if a.len() > 1026 {
+            return Err(bad(CMD, format!("`{key}` lists {} breaks: a sheet holds at most 1026", a.len())));
+        }
+        let mut v = Vec::with_capacity(a.len());
+        for x in a {
+            v.push(one(x).ok_or_else(|| bad(CMD, format!("`{key}`: {x} is not a place for a page break")))?);
+        }
         v.sort_unstable();
         v.dedup();
-        v
-    });
-    let col_breaks: Option<Vec<u32>> = any_param(p, "colBreaks").and_then(Json::as_array).map(|a| {
-        let mut v: Vec<u32> = a
-            .iter()
-            .filter_map(|x| match x {
-                Json::String(t) => gridcraft_core::letters_to_col(t.trim().trim_start_matches('$')),
-                Json::Number(n) => n.as_u64().filter(|c| *c >= 2 && *c <= MAX_COLS as u64).map(|c| c as u32 - 1),
-                _ => None,
-            })
-            .filter(|c| *c >= 1)
-            .take(1026)
-            .collect();
-        v.sort_unstable();
-        v.dedup();
-        v
-    });
-    let scale = f64_param(p, "scale").filter(|v| v.is_finite()).map(|v| v.clamp(10.0, 400.0).round() as u16);
-    let fit_w = any_param(p, "fitWidth").map(|v| v.as_u64().unwrap_or(0).min(32767) as u16);
-    let fit_h = any_param(p, "fitHeight").map(|v| v.as_u64().unwrap_or(0).min(32767) as u16);
+        Ok(v)
+    };
+    let row_breaks: Option<Vec<u32>> = match any_param(p, "rowBreaks").and_then(Json::as_array) {
+        None => None,
+        Some(a) => Some(breaks("rowBreaks", a, &|x| {
+            x.as_u64().or_else(|| x.as_str().and_then(|t| t.trim().parse().ok())).filter(|r| *r >= 2 && *r <= MAX_ROWS as u64).map(|r| r as u32 - 1)
+        })?),
+    };
+    let col_breaks: Option<Vec<u32>> = match any_param(p, "colBreaks").and_then(Json::as_array) {
+        None => None,
+        Some(a) => Some(breaks("colBreaks", a, &|x| match x {
+            Json::String(t) => gridcraft_core::letters_to_col(t.trim().trim_start_matches('$')).filter(|c| *c >= 1),
+            Json::Number(n) => n.as_u64().filter(|c| *c >= 2 && *c <= MAX_COLS as u64).map(|c| c as u32 - 1),
+            _ => None,
+        })?),
+    };
+    let scale = match f64_param(p, "scale") {
+        None => None,
+        Some(v) if v.is_finite() && (10.0..=400.0).contains(&v) => Some(v.round() as u16),
+        Some(v) => return Err(bad(CMD, format!("`scale` is a percent from 10 to 400 (got {v})"))),
+    };
+    let fit = |key: &str| -> Result<Option<u16>> {
+        match any_param(p, key) {
+            None | Some(Json::Null) => Ok(None),
+            Some(v) => match v.as_u64().filter(|n| *n <= 32767) {
+                Some(n) => Ok(Some(n as u16)),
+                None => Err(bad(CMD, format!("`{key}` is a whole number of pages from 0 (automatic) to 32767 (got {v})"))),
+            },
+        }
+    };
+    let (fit_w, fit_h) = (fit("fitWidth")?, fit("fitHeight")?);
     let fit_page = bool_param(p, "fitToPage");
-    let header = str_param(p, "header").map(|t| t.chars().take(255).collect::<String>());
-    let footer = str_param(p, "footer").map(|t| t.chars().take(255).collect::<String>());
+    let text255 = |key: &str| -> Result<Option<String>> {
+        match str_param(p, key) {
+            Some(t) if t.chars().count() > 255 => Err(bad(CMD, format!("`{key}` is {} characters: Excel's most is 255", t.chars().count()))),
+            t => Ok(t.map(str::to_string)),
+        }
+    };
+    let (header, footer) = (text255("header")?, text255("footer")?);
     let flags = [("centerH", 0usize), ("centerV", 1), ("gridlines", 2), ("headings", 3)].map(|(k, i)| (i, bool_param(p, k)));
     edit(s, |cx| {
         let pr = &mut cx.sheet_mut(si)?.print;

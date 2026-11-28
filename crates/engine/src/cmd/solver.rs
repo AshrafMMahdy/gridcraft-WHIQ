@@ -34,16 +34,22 @@ use super::*;
 const CMD: &str = "data.solver";
 const REPORT_CMD: &str = "data.solverReport";
 /// Excel's limit on decision variables.
+// AGREED LIMIT (owner, 2026-11-28): 200 decision variables — more is refused — why: item 26 rule 6, "Necessary limits - agreed" — necessary because it is Excel Solver's own limit.
 const MAX_VARS: usize = 200;
 /// Most scalar constraints (after expanding ranges).
+// AGREED LIMIT (owner, 2026-11-28): 1,000 constraints (after ranges are expanded) — more is refused — why: item 26 rule 5, "Timers, memory, and safety - agreed" — arbitrary by agreement (bounds one solve's work).
 const MAX_CONSTRAINTS: usize = 1000;
+// AGREED LIMIT (owner, 2026-11-28): 20,000 evaluations when `maxEvaluations` is not given, at most 200,000 (more is refused) — why: item 26 rules 4 and 5 — arbitrary by agreement (a solve's time); the answer's `evaluations` says how many ran.
 const DEFAULT_EVALS: u64 = 20_000;
 const MAX_EVALS: u64 = 200_000;
 /// Most simplex pivots × tableau cells per solve.
+// AGREED LIMIT (owner, 2026-11-28): 2e9 pivot-cells for the simplex, 10,000 branch-and-bound nodes (200 for a nonlinear model) — a solve
+// that needs more stops and says so in its message — why: item 26 rule 5, "Timers, memory, and safety - agreed" — arbitrary by agreement.
 const LP_WORK: u64 = 2_000_000_000;
 const MAX_NODES_LP: usize = 10_000;
 const MAX_NODES_NLP: usize = 200;
 /// Evolutionary population sizes.
+// AGREED LIMIT (owner, 2026-11-28): a population of 10 to 1,000 — outside it refused — why: item 26 rule 6, "Necessary limits - agreed" — arbitrary by agreement (fewer cannot evolve, more is a solve's time).
 const MIN_POPULATION: usize = 10;
 const MAX_POPULATION: usize = 1000;
 /// Constraint precision (Excel's default 0.000001).
@@ -174,17 +180,25 @@ impl Default for EvoOptions {
     }
 }
 
-fn evo_options(p: &Json) -> EvoOptions {
+// WHIQ (item 26, C30): an option outside its range, or that is not a number, is refused in words (they were clamped, or read as the
+// default).
+fn evo_options(p: &Json) -> Result<EvoOptions> {
     let d = EvoOptions::default();
-    let num = |k: &str| any_param(p, k).and_then(Json::as_f64).or_else(|| str_param(p, k).and_then(num_text)).filter(|v| v.is_finite());
-    EvoOptions {
-        population: num("populationSize").map_or(d.population, |v| v.clamp(MIN_POPULATION as f64, MAX_POPULATION as f64) as usize),
-        mutation: num("mutationRate").map_or(d.mutation, |v| v.clamp(0.0, 1.0)),
-        seed: num("randomSeed").map_or(d.seed, |v| v.clamp(0.0, f64::from(u32::MAX)) as u64),
-        convergence: num("convergence").map_or(d.convergence, |v| v.clamp(0.0, 1.0)),
-        stall: num("generationsWithoutImprovement").map_or(d.stall, |v| v.clamp(1.0, 100_000.0) as u64),
+    let num = |k: &str, lo: f64, hi: f64| -> Result<Option<f64>> {
+        let Some(v) = any_param(p, k).filter(|v| !v.is_null()) else { return Ok(None) };
+        match v.as_f64().or_else(|| v.as_str().and_then(num_text)).filter(|x| x.is_finite() && (lo..=hi).contains(x)) {
+            Some(x) => Ok(Some(x)),
+            None => Err(bad(CMD, format!("`{k}` is a number from {lo} to {hi} (got {v})"))),
+        }
+    };
+    Ok(EvoOptions {
+        population: num("populationSize", MIN_POPULATION as f64, MAX_POPULATION as f64)?.map_or(d.population, |v| v as usize),
+        mutation: num("mutationRate", 0.0, 1.0)?.unwrap_or(d.mutation),
+        seed: num("randomSeed", 0.0, f64::from(u32::MAX))?.map_or(d.seed, |v| v as u64),
+        convergence: num("convergence", 0.0, 1.0)?.unwrap_or(d.convergence),
+        stall: num("generationsWithoutImprovement", 1.0, 100_000.0)?.map_or(d.stall, |v| v as u64),
         require_bounds: bool_param(p, "requireBounds").unwrap_or(d.require_bounds),
-    }
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -358,7 +372,7 @@ fn parse_model(s: &Session, p: &Json) -> Result<Model> {
         "evolutionary" | "evo" | "genetic" => Method::Evolutionary,
         m => return Err(bad(CMD, format!("unknown method `{m}` (grg, simplex or evolutionary)"))),
     };
-    Ok(Model { sheet, objective, goal, vars, vars_text, cons, non_negative, method, evo: evo_options(p) })
+    Ok(Model { sheet, objective, goal, vars, vars_text, cons, non_negative, method, evo: evo_options(p)? })
 }
 
 // ---------------------------------------------------------------- saved model
@@ -1417,6 +1431,8 @@ fn evolutionary(ev: &mut Evaluator, x0: &[f64], lo: &[f64], hi: &[f64], integer:
     let mut start = x0.to_vec();
     project(&mut start, lo, hi);
     // Without a bound, search within 100 of the start.
+    // AGREED LIMIT (owner, 2026-11-28): 100 either side of the start — the Evolutionary method's search for a variable with no bound when
+    // bounds are not required; the answer's `note` says so — why: item 26 rule 4, "Defaults - agreed" — arbitrary by agreement.
     let blo: Vec<f64> = lo.iter().zip(&start).map(|(l, s)| if l.is_finite() { *l } else { s - 100.0 }).collect();
     let bhi: Vec<f64> = hi.iter().zip(&start).map(|(h, s)| if h.is_finite() { *h } else { s + 100.0 }).collect();
     let no_integer = blo.iter().zip(&bhi).zip(integer).any(|((l, h), int)| *int && l.ceil() > h.floor());
@@ -2000,12 +2016,21 @@ fn run(s: &mut Session, p: &Json) -> Result<Json> {
         return Ok(json!({"model": model}));
     }
     let model = parse_model(s, &params)?;
-    let budget = params
-        .get("maxEvaluations")
-        .and_then(Json::as_f64)
-        .filter(|v| v.is_finite() && *v >= 1.0)
-        .map_or(DEFAULT_EVALS, |v| (v as u64).min(MAX_EVALS));
-    let gap = params.get("integerOptimality").and_then(Json::as_f64).filter(|v| v.is_finite()).map_or(0.0, |v| v.clamp(0.0, 100.0) / 100.0);
+    // (item 26, C30: 1 to 200,000 evaluations and an integer optimality of 0-100 %, refused outside them; they were clamped)
+    let budget = match params.get("maxEvaluations").filter(|v| !v.is_null()) {
+        None => DEFAULT_EVALS,
+        Some(v) => match v.as_f64().filter(|x| x.is_finite() && (1.0..=MAX_EVALS as f64).contains(x)) {
+            Some(x) => x as u64,
+            None => return Err(bad(CMD, format!("`maxEvaluations` is a number from 1 to {MAX_EVALS} (got {v})"))),
+        },
+    };
+    let gap = match params.get("integerOptimality").filter(|v| !v.is_null()) {
+        None => 0.0,
+        Some(v) => match v.as_f64().filter(|x| x.is_finite() && (0.0..=100.0).contains(x)) {
+            Some(x) => x / 100.0,
+            None => return Err(bad(CMD, format!("`integerOptimality` is a percent from 0 to 100 (got {v})"))),
+        },
+    };
     let keep = bool_param(&params, "keep").unwrap_or(true);
     let save = bool_param(&params, "saveModel").unwrap_or(true);
     let reports = report_kinds(CMD, &params)?;
@@ -2099,6 +2124,10 @@ fn run(s: &mut Session, p: &Json) -> Result<Json> {
         "evaluations": evaluations,
         "changed": changed,
     });
+    // (item 26, C30: the Evolutionary method with bounds not required searches a variable that has none within 100 of its start: said)
+    if model.method == Method::Evolutionary && !model.evo.require_bounds && prob.lo.iter().chain(&prob.hi).any(|b| !b.is_finite()) {
+        out["note"] = json!("Some variables have no bounds: the Evolutionary method searched each of them within 100 of its starting value. Add bounds (constraints on the variables) for a wider or narrower search.");
+    }
     // Reports describe a solution; they are part of the solve's undo step.
     if let (Some(kinds), Some(x)) = (reports, solution) {
         let inp = ReportInput { model: &model, prob: &prob, original: x0, solution: x, message: message.to_string(), budget };
@@ -2455,9 +2484,10 @@ mod tests {
         ] {
             assert!(s.execute("data.solver", p.clone()).is_err(), "{p}");
         }
-        // Huge evaluation requests are capped, and a model erroring everywhere doesn't panic.
+        // Huge evaluation requests are refused (WHIQ item 26: they were capped), and a model erroring everywhere doesn't panic.
         set(&mut s, &[("D1", "=1/0+A1")]);
-        let r = s.execute("data.solver", json!({"objective": "D1", "variables": "A1", "maxEvaluations": 1e300})).unwrap();
+        assert!(s.execute("data.solver", json!({"objective": "D1", "variables": "A1", "maxEvaluations": 1e300})).is_err());
+        let r = s.execute("data.solver", json!({"objective": "D1", "variables": "A1", "maxEvaluations": 200000})).unwrap();
         assert_ne!(r["status"], "converged");
     }
 }

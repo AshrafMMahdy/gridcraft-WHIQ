@@ -173,10 +173,17 @@ fn read_package(pkg: Package<'_>) -> Result<(Workbook, ReadReport), IoError> {
         wb.theme = crate::theme::read_theme(&x);
         // WHIQ: the theme part as written (effect styles, the per-script font table…), written back
         // verbatim while the model's theme is the one read from it.
-        if let Ok(Some(raw)) = cx.pkg.read_limited(&r.target, 8 << 20)
-            && let Ok(text) = String::from_utf8(raw)
-        {
-            cx.kept_xml.push(gridcraft_model::PreservedXml { slot: "theme".into(), xml: text });
+        // AGREED LIMIT (owner, 2026-11-28): 8 MB — a theme part larger than this is not kept as written: it is written from the model on
+        // save, and the open says so — why: item 26 rule 5, "Timers, memory, and safety - agreed" — arbitrary by agreement (memory).
+        match cx.pkg.read_limited(&r.target, 8 << 20) {
+            Ok(Some(raw)) => {
+                if let Ok(text) = String::from_utf8(raw) {
+                    cx.kept_xml.push(gridcraft_model::PreservedXml { slot: "theme".into(), xml: text });
+                }
+            }
+            Ok(None) => {}
+            // (item 26, C16: it was dropped without a word)
+            Err(e) => cx.warn(format!("the theme is too large to keep as it was written ({e}): saving writes it from what GridCraft read, so some of its effects may be lost")),
         }
     }
     // Shared strings, streamed item by item. WHIQ: a workbook whose sheets stay on disk does not

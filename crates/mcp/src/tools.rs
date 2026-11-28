@@ -511,7 +511,21 @@ pub(crate) fn check_arguments(name: &str, args: &Value) -> Result<(), String> {
             _ => true,
         };
         if !ok {
-            return Err(format!("{name}: argument `{k}` must be of type {}", p["type"]));
+            // (item 26, A27: what was sent is said, and a number or true / false sent as text is told to drop the quotes)
+            let want = match &p["type"] {
+                Value::String(t) => t.clone(),
+                Value::Array(ts) => ts.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(" or "),
+                other => other.to_string(),
+            };
+            let got = match v {
+                Value::String(t) => format!("the text {v}{}", if t.trim().parse::<f64>().is_ok() || matches!(t.trim(), "true" | "false") { ": send it without quotes" } else { "" }),
+                Value::Number(_) => format!("the number {v}"),
+                Value::Bool(_) => format!("{v}"),
+                Value::Array(_) => "a list".to_string(),
+                Value::Object(_) => "an object".to_string(),
+                Value::Null => "null".to_string(),
+            };
+            return Err(format!("{name}: argument `{k}` must be of type {want} (got {got})"));
         }
         if let Some(allowed) = p["enum"].as_array()
             && !allowed.contains(v)

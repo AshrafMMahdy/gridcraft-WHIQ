@@ -15,10 +15,24 @@ static BUDGET: AtomicU64 = AtomicU64::new(0);
 static PROBE: OnceLock<fn() -> Option<u64>> = OnceLock::new();
 
 /// The memory budget in bytes.
+// AGREED LIMIT (owner, 2026-11-28): with no --max-memory-mb, half the machine's memory (at least 256 MB), or 4 GiB where the machine's
+// memory cannot be read (not Linux); every in-memory share is of this budget, and server_status says which it is (`memory.budget_source`)
+// — why: item 26 rule 5, "Timers, memory, and safety - agreed" — necessary because memory is finite; the half and the 4 GiB are arbitrary by agreement.
 pub fn budget() -> u64 {
     match BUDGET.load(Ordering::Relaxed) {
         0 => machine_memory().map(|m| m / 2).unwrap_or(4 << 30).max(256 << 20),
         b => b,
+    }
+}
+
+/// WHIQ (item 26, A17): where the budget comes from, in words.
+pub fn budget_source() -> &'static str {
+    if budget_given() {
+        "--max-memory-mb"
+    } else if machine_memory().is_some() {
+        "half the machine's memory (no --max-memory-mb given)"
+    } else {
+        "assumed 4 GiB: the machine's memory could not be read and no --max-memory-mb was given"
     }
 }
 

@@ -547,33 +547,55 @@ fn table_convert(s: &mut Session, p: &Json) -> Result<Json> {
 
 // ---------------------------------------------------------------- charts
 
-pub fn chart_kind(t: &str, sub: &str) -> ChartKind {
-    match (t, sub) {
+/// WHIQ (item 26, B13): a chart type and subtype by name; one that is none of them is refused, naming the ones there are (an
+/// unknown type or subtype was a clustered column chart, or the type's first kind, without a word).
+pub fn chart_kind(t: &str, sub: &str) -> Result<ChartKind> {
+    Ok(match (t, sub) {
+        ("column", "" | "clustered") => ChartKind::ColumnClustered,
         ("column", "stacked") => ChartKind::ColumnStacked,
         ("column", "stacked100") => ChartKind::ColumnStacked100,
         ("bar", "stacked") => ChartKind::BarStacked,
         ("bar", "stacked100") => ChartKind::BarStacked100,
-        ("bar", _) => ChartKind::BarClustered,
+        ("bar", "" | "clustered") => ChartKind::BarClustered,
         ("line", "markers") => ChartKind::LineMarkers,
         ("line", "stacked") => ChartKind::LineStacked,
-        ("line", _) => ChartKind::Line,
-        ("pie", _) => ChartKind::Pie,
-        ("doughnut", _) => ChartKind::Doughnut,
+        ("line", "") => ChartKind::Line,
+        ("pie", "") => ChartKind::Pie,
+        ("doughnut", "") => ChartKind::Doughnut,
         ("area", "stacked") => ChartKind::AreaStacked,
-        ("area", _) => ChartKind::Area,
+        ("area", "") => ChartKind::Area,
         ("scatter", "lines") => ChartKind::ScatterLines,
-        ("scatter", _) => ChartKind::Scatter,
-        ("bubble", _) => ChartKind::Bubble,
-        ("radar", _) => ChartKind::Radar,
-        ("histogram", _) => ChartKind::Histogram,
-        ("waterfall", _) => ChartKind::Waterfall,
-        ("funnel", _) => ChartKind::Funnel,
-        ("treemap", _) => ChartKind::Treemap,
-        ("sunburst", _) => ChartKind::Sunburst,
-        ("boxWhisker", _) => ChartKind::BoxWhisker,
-        ("stock", _) => ChartKind::Stock,
-        ("combo", _) => ChartKind::Combo,
-        _ => ChartKind::ColumnClustered,
+        ("scatter", "" | "markers") => ChartKind::Scatter,
+        ("bubble", "") => ChartKind::Bubble,
+        ("radar", "") => ChartKind::Radar,
+        ("histogram", "") => ChartKind::Histogram,
+        ("waterfall", "") => ChartKind::Waterfall,
+        ("funnel", "") => ChartKind::Funnel,
+        ("treemap", "") => ChartKind::Treemap,
+        ("sunburst", "") => ChartKind::Sunburst,
+        ("boxWhisker", "") => ChartKind::BoxWhisker,
+        ("stock", "") => ChartKind::Stock,
+        ("combo", "") => ChartKind::Combo,
+        _ => {
+            return Err(bad(
+                "chart",
+                format!(
+                    "unknown chart `{t}`{}: the types are column, bar, line, pie, doughnut, area, scatter, bubble, radar, histogram, waterfall, funnel, treemap, sunburst, boxWhisker, stock, combo; the subtypes column / bar: clustered, stacked, stacked100; line: markers, stacked; area: stacked; scatter: markers, lines",
+                    if sub.is_empty() { String::new() } else { format!(" with subtype `{sub}`") }
+                ),
+            ));
+        }
+    })
+}
+
+// AGREED LIMIT (owner, 2026-11-28): 20 to 10,000 points — a chart's width and height; outside them refused — why: item 26 rule 6,
+// "Necessary limits - agreed" — necessary because a chart must be drawable (a smaller one has no room for its plot, a larger one
+// outgrows the sheet's drawing layer); it was clamped without a word (B12).
+pub(crate) fn chart_size(cmd: &str, what: &str, v: f64) -> Result<f32> {
+    if v.is_finite() && (20.0..=10_000.0).contains(&v) {
+        Ok(v as f32)
+    } else {
+        Err(bad(cmd, format!("`{what}` is a size in points from 20 to 10,000 (got {v})")))
     }
 }
 
@@ -739,7 +761,7 @@ pub fn build_chart(s: &Session, p: &Json) -> Result<(usize, Chart)> {
     let data_h = r.height();
     let data_w = r.width();
     let by_rows = data_w > data_h + 1;
-    let kind = chart_kind(&t, &sub);
+    let kind = chart_kind(&t, &sub)?;
     let mut series = series_from_range(sh, r, by_rows);
     if series.is_empty() {
         return Err(EngineError::Other("Select data for the chart first.".into()));
@@ -795,8 +817,9 @@ pub fn apply_scatter_lines(chart: &mut Chart, c: &Json, per_series: &[Json], lin
     let width = |p: &Json| -> Result<Option<f32>> {
         match f64_param(p, "line_width").or_else(|| f64_param(p, "lineWidth")) {
             None => Ok(None),
-            Some(w) if w.is_finite() && w > 0.0 => Ok(Some(w.clamp(0.25, 20.0) as f32)),
-            Some(w) => Err(bad("chart", format!("`line_width` is a width in points above 0 (got {w}), e.g. 2.25"))),
+            // (item 26, B11: 0.25 to 20 points, Excel's line widths; outside them refused, they were clamped)
+            Some(w) if w.is_finite() && (0.25..=20.0).contains(&w) => Ok(Some(w as f32)),
+            Some(w) => Err(bad("chart", format!("`line_width` is a width in points from 0.25 to 20 (got {w}), e.g. 2.25"))),
         }
     };
     let color = |p: &Json| -> Result<Option<Color>> {
@@ -867,9 +890,12 @@ fn insert_chart(s: &mut Session, p: &Json) -> Result<Json> {
     }
     apply_scatter_lines(&mut chart, p, &[], None, &theme)?;
     let id = chart.id;
+    // WHIQ (item 26, B10): the answer says where the chart went and its size (two columns right of the data and 480 x 288 points
+    // when `at` and a size are not given: Excel's defaults)
+    let placed = json!({"chart": id, "at": chart.anchor.cell.a1(), "width": chart.anchor.width, "height": chart.anchor.height, "title": chart.title});
     edit(s, |cx| {
         cx.sheet_mut(sheet)?.charts.push(chart);
-        Ok(json!({"chart": id}))
+        Ok(placed)
     })
 }
 
@@ -883,7 +909,7 @@ fn apply_series_spec(se: &mut Series, sp: &Json, cmd: &str) -> Result<()> {
         if !TYPES.contains(&t) {
             return Err(bad(cmd, format!("a series `type` is one of {} (got `{t}`)", TYPES.join(", "))));
         }
-        se.kind = Some(chart_kind(t, str_param(sp, "subtype").unwrap_or("")));
+        se.kind = Some(chart_kind(t, str_param(sp, "subtype").unwrap_or(""))?);
     }
     if let Some(v) = bool_param(sp, "secondary") {
         se.secondary = v;
@@ -962,7 +988,7 @@ fn chart_set(s: &mut Session, p: &Json) -> Result<Json> {
         let sh = cx.sheet_mut(si)?;
         let Some(c) = sh.charts.get_mut(ci) else { return Ok(Json::Null) };
         if let Some(t) = str_param(p, "type") {
-            c.kind = chart_kind(t, str_param(p, "subtype").unwrap_or(""));
+            c.kind = chart_kind(t, str_param(p, "subtype").unwrap_or(""))?;
         }
         if let Some(t) = any_param(p, "title") {
             c.title = t.as_str().map(str::to_string);
@@ -973,7 +999,9 @@ fn chart_set(s: &mut Session, p: &Json) -> Result<Json> {
                 "top" => LegendPos::Top,
                 "left" => LegendPos::Left,
                 "right" => LegendPos::Right,
-                _ => LegendPos::Bottom,
+                "bottom" => LegendPos::Bottom,
+                // (item 26: an unknown position was the bottom)
+                other => return Err(bad("chart.set", format!("`legend` is none, top, left, right or bottom (got `{other}`)"))),
             };
         }
         if let Some(v) = bool_param(p, "dataLabels") {
@@ -982,8 +1010,12 @@ fn chart_set(s: &mut Session, p: &Json) -> Result<Json> {
         if let Some(v) = bool_param(p, "gridlines") {
             c.gridlines = v;
         }
+        // (item 26, B12: outside Excel's styles 1-16 and sizes of 20 to 10,000 points refused, they were clamped)
         if let Some(v) = u32_param(p, "style") {
-            c.style = v.clamp(1, 16);
+            if !(1..=16).contains(&v) {
+                return Err(bad("chart.set", format!("`style` is a chart style from 1 to 16 (got {v})")));
+            }
+            c.style = v;
         }
         if let Some(t) = any_param(p, "xTitle") {
             c.x_title = t.as_str().map(str::to_string);
@@ -998,10 +1030,10 @@ fn chart_set(s: &mut Session, p: &Json) -> Result<Json> {
             c.anchor.cell = at;
         }
         if let Some(w) = f64_param(p, "width") {
-            c.anchor.width = w.clamp(20.0, 10000.0) as f32;
+            c.anchor.width = chart_size("chart.set", "width", w)?;
         }
         if let Some(h) = f64_param(p, "height") {
-            c.anchor.height = h.clamp(20.0, 10000.0) as f32;
+            c.anchor.height = chart_size("chart.set", "height", h)?;
         }
         if let Some(v) = f64_param(p, "dx") {
             c.anchor.dx = v as f32;
@@ -1252,6 +1284,7 @@ fn insert_shape(s: &mut Session, p: &Json) -> Result<Json> {
             cell: at,
             dx: 0.0,
             dy: 0.0,
+            // AGREED LIMIT (owner, 2026-11-28): 144 x 96 points when a shape's size is not given (a line: 0 high) — why: item 26 rule 4, "Defaults - agreed" — arbitrary by agreement.
             width: f64_param(p, "width").unwrap_or(144.0) as f32,
             height: f64_param(p, "height").unwrap_or(if kind == ShapeKind::Line { 0.0 } else { 96.0 }) as f32,
             mode: anchor_mode_param(p).unwrap_or_default(),
@@ -1339,13 +1372,26 @@ fn move_object(s: &mut Session, p: &Json) -> Result<Json> {
         if let Some(v) = f64_param(p, "dy") {
             a.dy = v as f32;
         }
-        let (w, h) = (f64_param(p, "width").map(|v| v.clamp(1.0, 10000.0) as f32), f64_param(p, "height").map(|v| v.clamp(0.0, 10000.0) as f32));
+        // WHIQ (item 26, C33): a width of 1 to 10,000 points and a height of 0 to 10,000, refused outside them, the size a kept ratio
+        // makes included (they were clamped, and the ratio with them)
+        let dim = |k: &str, lo: f64, v: f64| -> Result<f32> {
+            if v.is_finite() && (lo..=10000.0).contains(&v) {
+                Ok(v as f32)
+            } else {
+                Err(bad("object", format!("`{k}` is a size in points from {lo} to 10,000 (got {v})")))
+            }
+        };
+        let w = f64_param(p, "width").map(|v| dim("width", 1.0, v)).transpose()?;
+        let h = f64_param(p, "height").map(|v| dim("height", 0.0, v)).transpose()?;
         if kind == "image" && (w.is_some() || h.is_some()) {
             // WHIQ (owner, 2026-11-02): a picture keeps its current ratio unless `lockAspect: false` (see picture_size).
             let ratio = if a.height > 0.0 { a.width / a.height } else { 1.0 };
             let (nw, nh, note) = picture_size(w, h, (a.width, a.height), ratio, bool_param(p, "lockAspect").unwrap_or(true));
-            a.width = nw.clamp(1.0, 10000.0);
-            a.height = nh.clamp(0.0, 10000.0);
+            if !(1.0..=10000.0).contains(&nw) || !(0.0..=10000.0).contains(&nh) {
+                return Err(bad("object", format!("keeping the picture's ratio makes it {nw:.0} x {nh:.0} points: a size runs from 1 to 10,000; give both sizes, or lockAspect: false")));
+            }
+            a.width = nw;
+            a.height = nh;
             let mut out = json!({"width": a.width, "height": a.height});
             if let Some(n) = note {
                 out["note"] = json!(n);
@@ -1736,8 +1782,14 @@ fn manage_cf(s: &mut Session, p: &Json) -> Result<Json> {
 }
 
 fn insert_icon(s: &mut Session, p: &Json) -> Result<Json> {
-    let name = str_param(p, "name").unwrap_or("check").to_string();
-    let size = f64_param(p, "size").unwrap_or(48.0).clamp(8.0, 1000.0) as f32;
+    // WHIQ (item 26, C33): the icon is named (a missing name was a check mark) and its size is 8 to 1,000 points (it was clamped).
+    // AGREED LIMIT (owner, 2026-11-28): 48 points when `size` is not given; 8 to 1,000 — why: item 26 rules 4 and 6 — arbitrary by agreement.
+    let name = str_param(p, "name").ok_or_else(|| bad("insert.icon", "`name` names the icon to insert"))?.to_string();
+    let size = match f64_param(p, "size") {
+        None => 48.0,
+        Some(v) if v.is_finite() && (8.0..=1000.0).contains(&v) => v as f32,
+        Some(v) => return Err(bad("insert.icon", format!("`size` is a size in points from 8 to 1,000 (got {v})"))),
+    };
     let d = s.doc()?;
     let id = d.wb.next_object_id();
     let at = cell_param(s, p, "at")?.unwrap_or(d.selection.active);

@@ -1153,7 +1153,8 @@ fn coverage_delete_cells_rows_columns_sheets_charts_tables_comments_names() {
     structured(&mut s, "execute_command", json!({"command": "edit.clearContents", "params": {"range": "Sales!C3"}}));
     structured(&mut s, "delete_rows", json!({"rows": "5", "sheet": "Sales"}));
     structured(&mut s, "delete_columns", json!({"cols": "E", "sheet": "Sales"}));
-    structured(&mut s, "delete_chart", json!({"sheet": "Sales"}));
+    let chart = sheet_info(&mut s, "Sales")["charts"][0]["id"].clone();
+    structured(&mut s, "delete_chart", json!({"sheet": "Sales", "chart": chart}));
     structured(&mut s, "delete_table", json!({"table": table}));
     structured(&mut s, "delete_comment", json!({"cell": "Sales!A2"}));
     structured(&mut s, "delete_name", json!({"name": "Units"}));

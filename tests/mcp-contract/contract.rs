@@ -370,6 +370,13 @@ fn item26_arguments_do_what_they_say_or_are_refused() {
     assert!(e["reason"].as_str().unwrap().contains("`colour` is not read by `cell.set`"), "{e}");
     assert_eq!(m.ok("read_range", json!({"range": "Main!B1"}))["values"], json!([[null]]));
     m.ok("execute_command", json!({"command": "cell.set", "params": {"cell": "Main!B1", "input": "x"}}));
+    // B52: a delete names what it deletes (it deleted the active sheet, or the last chart)
+    assert!(m.err("delete_sheet", json!({}))["reason"].as_str().unwrap().contains("`sheet`"));
+    // B10: the chart's place and size are in the answer (Excel's defaults when not given)
+    m.ok("write_range", json!({"range": "Main!F1", "values": [["a", 1], ["b", 2]]}));
+    let c = m.ok("insert_chart", json!({"range": "Main!F1:G2", "type": "column"}));
+    assert!(c["at"].is_string() && c["width"].as_f64() == Some(480.0) && c["height"].as_f64() == Some(288.0), "{c}");
+    assert!(m.err("delete_chart", json!({"sheet": "Main"}))["reason"].as_str().unwrap().contains("say which chart"));
 }
 
 /// WHIQ (item 26, fault A8): a read_range part larger than the answer-size rule is cut to whole rows, and the next range starts
@@ -718,11 +725,17 @@ fn annotations() {
 fn forgiving_inputs() {
     let dir = folder("forgiving");
     let mut m = start(&dir, &[]);
-    let v = m.ok("WriteRange", json!({"Range": "a1", "data": [1, 2, 3], "colour": "red"}));
+    // names in other spellings are read and said; a value of the wrong type or shape is refused in words (WHIQ item 26: a flat
+    // list was one row, "false" was false)
+    let e = m.err("write_range", json!({"range": "a1", "values": [1, 2, 3]}));
+    assert!(e["reason"].as_str().unwrap().contains("is not a list of cells"), "{e}");
+    let v = m.ok("WriteRange", json!({"Range": "a1", "data": [[1, 2, 3]], "colour": "red"}));
     let w: Vec<String> = v["warnings"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect();
     assert!(w.iter().any(|w| w.contains("WriteRange")), "{w:?}");
     assert!(w.iter().any(|w| w.contains("colour")), "{w:?}");
-    assert_eq!(m.ok("read-range", json!({"range": "A1:C1", "formulas": "false"}))["values"], json!([[1.0, 2.0, 3.0]]));
+    let e = m.err("read-range", json!({"range": "A1:C1", "formulas": "false"}));
+    assert!(e["reason"].as_str().unwrap().contains("send it without quotes"), "{e}");
+    assert_eq!(m.ok("read-range", json!({"range": "A1:C1", "formulas": false}))["values"], json!([[1.0, 2.0, 3.0]]));
     m.ok("execute_command", json!({"command": "sheet.rename", "params": {"name": "Data"}}));
     // Sheet names and command ids in any case.
     assert_eq!(m.ok("read_range", json!({"range": "data!A1"}))["values"], json!([[1.0]]));

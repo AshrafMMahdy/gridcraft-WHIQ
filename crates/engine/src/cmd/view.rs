@@ -153,7 +153,12 @@ fn sheet_flag(s: &mut Session, p: &Json, which: &str) -> Result<Json> {
 }
 
 fn zoom(s: &mut Session, p: &Json) -> Result<Json> {
-    let z = f64_param(p, "percent").ok_or_else(|| bad("view.zoom", "missing `percent`"))?.clamp(10.0, 400.0) as u16;
+    let z = f64_param(p, "percent").ok_or_else(|| bad("view.zoom", "missing `percent`"))?;
+    // (item 26, B34: Excel's 10-400 %, refused outside it; it was clamped)
+    if !(z.is_finite() && (10.0..=400.0).contains(&z)) {
+        return Err(bad("view.zoom", format!("`percent` is a zoom from 10 to 400 (got {z})")));
+    }
+    let z = z as u16;
     let d = s.doc_mut()?;
     let dirty = d.is_dirty();
     let wb = std::sync::Arc::make_mut(&mut d.wb);
@@ -247,12 +252,23 @@ fn scale_fit(s: &mut Session, p: &Json) -> Result<Json> {
     edit(s, |cx| {
         let si = cx.sheet_index();
         let pr = &mut cx.sheet_mut(si)?.print;
+        // (item 26, B34: Excel's 10-400 % and 0-32,767 pages, refused outside them; they were clamped)
         if let Some(sc) = f64_param(p, "scale") {
-            pr.scale = sc.clamp(10.0, 400.0) as u16;
+            if !(sc.is_finite() && (10.0..=400.0).contains(&sc)) {
+                return Err(bad("pageLayout.scaleToFit", format!("`scale` is a percent from 10 to 400 (got {sc})")));
+            }
+            pr.scale = sc as u16;
             pr.fit_to = None;
         }
         if any_param(p, "width").is_some() || any_param(p, "height").is_some() {
-            pr.fit_to = Some((u32_param(p, "width").unwrap_or(0).min(32767) as u16, u32_param(p, "height").unwrap_or(0).min(32767) as u16));
+            let pages = |k: &str| -> Result<u16> {
+                match u32_param(p, k) {
+                    None => Ok(0),
+                    Some(n) if n <= 32767 => Ok(n as u16),
+                    Some(n) => Err(bad("pageLayout.scaleToFit", format!("`{k}` is a number of pages from 0 (automatic) to 32767 (got {n})"))),
+                }
+            };
+            pr.fit_to = Some((pages("width")?, pages("height")?));
         }
         Ok(Json::Null)
     })

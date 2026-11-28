@@ -352,8 +352,10 @@ fn fill_color(s: &mut Session, p: &Json) -> Result<Json> {
     apply_style(s, p, |st| st.fill = if c == Color::Auto { Fill::default() } else { Fill::solid(c) })
 }
 
-pub(crate) fn border_style(name: &str) -> BorderStyle {
-    match name {
+/// WHIQ (item 26, B7): a border style by its name; a name that is none of them is refused by the callers (it was thin).
+pub(crate) fn border_style_named(name: &str) -> Option<BorderStyle> {
+    Some(match name {
+        "thin" => BorderStyle::Thin,
         "medium" => BorderStyle::Medium,
         "thick" => BorderStyle::Thick,
         "dashed" => BorderStyle::Dashed,
@@ -366,14 +368,28 @@ pub(crate) fn border_style(name: &str) -> BorderStyle {
         "dashDotDot" => BorderStyle::DashDotDot,
         "slantDashDot" => BorderStyle::SlantDashDot,
         "none" => BorderStyle::None,
-        _ => BorderStyle::Thin,
-    }
+        _ => return None,
+    })
 }
+const BORDER_STYLES: &str = "thin, medium, thick, dashed, dotted, double, hair, mediumDashed, dashDot, mediumDashDot, dashDotDot, slantDashDot, none";
+const BORDER_PRESETS: &[&str] = &[
+    "none", "all", "outside", "thickOutside", "inside", "insideHorizontal", "insideVertical", "top", "bottom", "left", "right", "thickBottom",
+    "doubleBottom", "topBottom", "topThickBottom", "topDoubleBottom", "diagonalDown", "diagonalUp",
+];
 
 fn borders(s: &mut Session, p: &Json) -> Result<Json> {
+    // AGREED LIMIT (owner, 2026-11-28): a bottom border, thin, automatic colour, when `preset` / `style` / `color` are left out — the
+    // Borders button's own default (Excel's) — why: item 26 rule 4, "Defaults - agreed" — arbitrary by agreement.
     let preset = str_param(p, "preset").unwrap_or("bottom").to_string();
-    let color = color_param(any_param(p, "color")).unwrap_or(Color::Auto);
-    let base = border_style(str_param(p, "style").unwrap_or("thin"));
+    if !BORDER_PRESETS.contains(&preset.as_str()) {
+        return Err(bad("home.borders", format!("unknown border preset `{preset}` (presets: {})", BORDER_PRESETS.join(", "))));
+    }
+    let color = match any_param(p, "color") {
+        None | Some(Json::Null) => Color::Auto,
+        Some(v) => color_param(Some(v)).ok_or_else(|| bad("home.borders", format!("`color` is a colour \"#RRGGBB\" or \"auto\" (got {v})")))?,
+    };
+    let style_name = str_param(p, "style").unwrap_or("thin");
+    let base = border_style_named(style_name).ok_or_else(|| bad("home.borders", format!("unknown border style `{style_name}` (styles: {BORDER_STYLES})")))?;
     let sheet = target_sheet(s, p)?;
     let ranges = target_ranges(s, p)?;
     if s.doc()?.wb.sheet(sheet).is_some_and(|sh| sh.protection.as_ref().is_some_and(|pr| !pr.format_cells)) {
@@ -668,14 +684,32 @@ pub fn format_code_for(name: &str) -> &str {
 }
 
 fn number_format(s: &mut Session, p: &Json) -> Result<Json> {
+    let named = if any_param(p, "code").is_none() { str_param(p, "format") } else { None };
     let code = str_param(p, "code")
         .map(str::to_string)
-        .or_else(|| str_param(p, "format").map(|f| format_code_for(f).to_string()))
+        .or_else(|| named.map(|f| format_code_for(f).to_string()))
         .ok_or_else(|| bad("home.numberFormat", "missing `format` or `code`"))?;
-    set_fmt(s, p, &code)
+    let r = set_fmt(s, p, &code)?;
+    // WHIQ (item 26, B8): the ribbon's named formats are Excel's US ones: the answer names the code applied and says so
+    let us = match named {
+        Some("Currency") => Some("Currency is the US one, in dollars: pass `code` for another currency, e.g. \"#,##0.00 [$€-x-euro2]\""),
+        Some("Short Date") => Some("Short Date is the US order, month / day / year: pass `code` for another, e.g. \"dd/mm/yyyy\""),
+        _ => None,
+    };
+    Ok(match (named, us) {
+        (Some(_), Some(note)) => json!({"format_code": code, "note": note}),
+        _ => r,
+    })
 }
 
 fn set_fmt(s: &mut Session, p: &Json, code: &str) -> Result<Json> {
+    // WHIQ (item 26, B8): a code longer than Excel's 255 characters is refused (it showed as General without a word)
+    if code.chars().count() > gridcraft_numfmt::MAX_FORMAT_CODE_CHARS {
+        return Err(bad(
+            "home.numberFormat",
+            format!("the number format code is {} characters: Excel's most is {}", code.chars().count(), gridcraft_numfmt::MAX_FORMAT_CODE_CHARS),
+        ));
+    }
     let nf = NumFmt::new(code);
     apply_style(s, p, |st| st.num_fmt = nf.clone())
 }

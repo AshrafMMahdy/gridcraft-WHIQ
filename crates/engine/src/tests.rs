@@ -2183,10 +2183,11 @@ fn calculation_options_enable_iterative_calculation() {
     // Empty params change nothing and report the settings.
     let r = s.execute("formulas.calculationOptions", json!({})).unwrap();
     assert_eq!(r["iterative"], true);
-    // Limits are kept within Excel's: 1–32767 iterations, a non-negative change.
-    let r = s.execute("formulas.calculationOptions", json!({"maxIterations": 0, "maxChange": -0.5})).unwrap();
-    assert_eq!((r["maxIterations"].as_u64(), r["maxChange"].as_f64()), (Some(1), Some(0.5)));
-    let r = s.execute("formulas.calculationOptions", json!({"maxIterations": 100000, "maxChange": 0.0001})).unwrap();
+    // Excel's bounds: 1–32767 iterations, a change of 0 or more; outside them refused (WHIQ item 26: they were clamped)
+    assert!(s.execute("formulas.calculationOptions", json!({"maxIterations": 0})).is_err());
+    assert!(s.execute("formulas.calculationOptions", json!({"maxChange": -0.5})).is_err());
+    assert!(s.execute("formulas.calculationOptions", json!({"maxIterations": 100000})).is_err());
+    let r = s.execute("formulas.calculationOptions", json!({"maxIterations": 32767, "maxChange": 0.0001})).unwrap();
     assert_eq!((r["maxIterations"].as_u64(), r["maxChange"].as_f64()), (Some(32767), Some(0.0001)));
     // Saved with the workbook.
     reopen(&mut s);

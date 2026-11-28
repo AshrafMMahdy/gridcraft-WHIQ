@@ -102,6 +102,9 @@ impl Default for NumberFormat {
 /// A longer code is invalid: [`NumberFormat::parse`] returns a General format (the cell shows
 /// its value unformatted; the stored code is kept as is) and `TEXT` returns `#VALUE!`. The cap
 /// also bounds every allocation that scales with the number of placeholders in a code.
+// AGREED LIMIT (owner, 2026-11-28): 255 characters — the longest number format code (Excel's own); a longer one entered is refused
+// (home.numberFormat), one read from a file shows as General — why: item 26 rule 6, "Necessary limits - agreed" — necessary because it is
+// Excel's limit.
 pub const MAX_FORMAT_CODE_CHARS: usize = 255;
 
 /// True when `code` is longer than [`MAX_FORMAT_CODE_CHARS`] characters.

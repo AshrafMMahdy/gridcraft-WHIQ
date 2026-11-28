@@ -102,7 +102,11 @@ fn edge(k: &str, v: &Json) -> std::result::Result<Edge, String> {
         }
     };
     let color = c.map(|c| color(k, c)).transpose()?.unwrap_or(Color::Auto);
-    let style = if style.eq_ignore_ascii_case("none") { gridcraft_model::BorderStyle::None } else { super::format::border_style(style) };
+    let style = if style.eq_ignore_ascii_case("none") {
+        gridcraft_model::BorderStyle::None
+    } else {
+        super::format::border_style_named(style).ok_or_else(|| format!("border `{k}`: unknown style `{style}` (thin, medium, thick, dashed, dotted, double, hair, mediumDashed, dashDot, mediumDashDot, dashDotDot, slantDashDot, none)"))?
+    };
     Ok(Edge(BorderLine { style, color }))
 }
 

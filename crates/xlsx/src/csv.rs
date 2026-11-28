@@ -50,6 +50,8 @@ pub fn sniff_delimiter(text: &str, quote: char) -> u8 {
         let mut n = 0usize;
         let mut in_q = false;
         let mut blank = true;
+        // AGREED LIMIT (owner, 2026-11-28): the first 64K characters and 20 non-blank lines — what the separator is found from — why:
+        // item 26 rule 5, "Timers, memory, and safety - agreed" — arbitrary by agreement (the separator found is said when the file opens).
         for ch in text.chars().take(64 * 1024) {
             if !in_q && ch == '\n' {
                 // Blank lines carry no delimiter evidence.
@@ -131,12 +133,35 @@ fn parse_records(text: &str, delim: char, quote: char, mut on_record: impl FnMut
 }
 
 pub fn read_csv(bytes: &[u8], opts: &CsvOptions) -> Result<Workbook, IoError> {
+    read_csv_noted(bytes, opts).map(|(wb, _)| wb)
+}
+
+/// WHIQ (item 26, B20 / B21 / B22): [`read_csv`] with what the reader decided or could not keep, in words: a text that is not
+/// UTF-8 read as Windows-1252, the separator it found, rows or columns past the sheet's edge not loaded (Excel warns too).
+pub fn read_csv_noted(bytes: &[u8], opts: &CsvOptions) -> Result<(Workbook, Vec<String>), IoError> {
+    let mut notes = Vec::new();
+    let bom = bytes.starts_with(&[0xEF, 0xBB, 0xBF]) || bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]);
+    if !bom && std::str::from_utf8(bytes).is_err() {
+        notes.push(
+            "the file is not UTF-8 text: it was read as Windows-1252 (Western European); text in another code page, such as Arabic (1256), shows wrongly: save the file as UTF-8 and open it again".to_string(),
+        );
+    }
     let text = decode_text(bytes);
     let quote = if opts.quote == 0 { '"' } else { opts.quote as char };
     let delim = if opts.delimiter == 0 { sniff_delimiter(&text, quote) } else { opts.delimiter } as char;
     if delim == quote {
         return Err(IoError::Format("the delimiter and quote character must differ".into()));
     }
+    if opts.delimiter == 0 {
+        let name = match delim {
+            ',' => "commas",
+            ';' => "semicolons",
+            '\t' => "tabs",
+            _ => "another character",
+        };
+        notes.push(format!("the fields were read as separated by {name}, the separator found in the file's first lines"));
+    }
+    let (mut rows_cut, mut cols_cut) = (false, false);
     let mut wb = Workbook::new();
     wb.date_system = opts.date_system;
     wb.csv_delimiter = u8::try_from(delim).ok();
@@ -146,11 +171,13 @@ pub fn read_csv(bytes: &[u8], opts: &CsvOptions) -> Result<Workbook, IoError> {
     let mut row: u32 = 0;
     parse_records(&text, delim, quote, |rec| {
         if row >= MAX_ROWS {
+            rows_cut = true;
             return false;
         }
         // A blank line is an empty row.
         for (col, f) in rec.into_iter().enumerate() {
             if col as u32 >= MAX_COLS {
+                cols_cut = true;
                 break;
             }
             if f.is_empty() {
@@ -181,7 +208,13 @@ pub fn read_csv(bytes: &[u8], opts: &CsvOptions) -> Result<Workbook, IoError> {
     });
     wb.styles = styles;
     wb.sheets = vec![Arc::new(sheet)];
-    Ok(wb)
+    if rows_cut {
+        notes.push(format!("the file has more rows than a sheet holds ({MAX_ROWS}): the rows after it were not loaded"));
+    }
+    if cols_cut {
+        notes.push(format!("some lines have more fields than a sheet has columns ({MAX_COLS}): the fields after it were not loaded"));
+    }
+    Ok((wb, notes))
 }
 
 /// Writes the sheet's used range as CSV (CRLF line ends, UTF-8 without BOM). `cell_text` gives

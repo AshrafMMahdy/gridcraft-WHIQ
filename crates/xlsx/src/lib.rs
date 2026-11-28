@@ -50,7 +50,7 @@ use gridcraft_model::Workbook;
 
 pub use array_formula::set_function_oracle;
 pub use crypto::{DecryptError, check_encryption, decrypt};
-pub use csv::{read_csv, write_csv, write_csv_range_into};
+pub use csv::{read_csv, read_csv_noted, write_csv, write_csv_range_into};
 pub use ods::read_ods;
 pub use passthrough::rebase_links;
 pub use xls::read_xls;

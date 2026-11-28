@@ -1110,6 +1110,7 @@ fn mduration(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
 // period, A the accrued days of it before settlement and DSC the days of it from settlement on.
 
 /// Most quasi-coupon periods an odd period may span (the date range allows ~32,400 quarters).
+// AGREED LIMIT (owner, 2026-11-28): 40,000 quasi-coupon periods — an odd period spanning more is #NUM! — why: item 26 rule 6, "Necessary limits - agreed" — necessary because the loop over them is bounded; the date range allows about 32,400.
 const MAX_QUASI: i64 = 40_000;
 
 /// Normal length of the coupon period `[start, end]` under a basis (COUPDAYS semantics).

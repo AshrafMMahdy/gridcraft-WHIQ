@@ -445,12 +445,24 @@ fn range_set_values(s: &mut Session, p: &Json) -> Result<Json> {
             // WHIQ: a safe point for `cancel` (the runner restores the workbook).
             gridcraft_core::cancel::checkpoint();
             gridcraft_core::progress::step_in("writing cells", ri as u64, rows.len() as u64);
-            let cols: Vec<&Json> = match row.as_array() {
-                Some(a) => a.iter().collect(),
-                None => vec![row],
+            // WHIQ (item 26, B2 / B3): a row that is not a list, a cell that is an object or a list, and cells past the sheet's edge
+            // are refused (they were one cell, the text of the JSON, and dropped)
+            let Some(cols) = row.as_array() else {
+                return Err(bad("range.setValues", format!("row {} of `values` is not a list of cells: each row is an array, e.g. [[1, 2], [3, 4]]", ri + 1)));
             };
             for (ci, v) in cols.iter().enumerate() {
-                let Some(at) = start.offset(ri as i64, ci as i64) else { continue };
+                let Some(at) = start.offset(ri as i64, ci as i64) else {
+                    return Err(bad(
+                        "range.setValues",
+                        format!("the values run past the sheet's last column (XFD) or row (1,048,576): row {}, cell {} from {}", ri + 1, ci + 1, start.a1()),
+                    ));
+                };
+                if v.is_object() || v.is_array() {
+                    return Err(bad(
+                        "range.setValues",
+                        format!("the value for {} is {}: a cell takes text, a number, true / false or null", at.a1(), if v.is_object() { "an object" } else { "a list" }),
+                    ));
+                }
                 let input = json_to_input(v);
                 let cell = match v {
                     Json::Number(n) => Some(Cell {
@@ -1708,7 +1720,10 @@ fn replace(s: &mut Session, p: &Json) -> Result<Json> {
                 } else {
                     replace_ci(&text, &what, &with)
                 };
-                let cell = input_to_cell(&new, si, c, &mut cx.wb).unwrap_or_else(|_| Some(Cell::value(Value::text(new.as_str()))));
+                // WHIQ (item 26, B48): a replacement that makes a formula invalid is refused, as Excel refuses it (it was stored as text)
+                let cell = input_to_cell(&new, si, c, &mut cx.wb).map_err(|e| {
+                    bad("edit.replace", format!("replacing in {} makes `{new}`, which is not a valid formula ({e}); nothing was replaced", c.a1()))
+                })?;
                 let sh = cx.sheet_mut(si)?;
                 match cell {
                     Some(cell) => sh.set_cell(c, cell),

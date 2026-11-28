@@ -135,7 +135,12 @@ fn fill(s: &mut Session, p: &Json, sheets: &[Json], names: &[String]) -> Result<
     }
     // Charts listed at the top level name their sheet (the platform's chart specs).
     for (k, c) in any_param(p, "charts").and_then(Json::as_array).into_iter().flatten().enumerate() {
-        let sheet = str_param(c, "sheet").map(str::to_string).or_else(|| names.first().cloned()).unwrap_or_default();
+        // (item 26, B59: with more than one sheet a chart names its sheet; it went to the first one without a word)
+        let sheet = match str_param(c, "sheet") {
+            Some(n) => n.to_string(),
+            None if names.len() == 1 => names[0].clone(),
+            None => return Err(bad(CMD, format!("chart {}: say which sheet it goes on with `sheet` (sheets: {})", k + 1, names.join(", ")))),
+        };
         let Some(i) = names.iter().position(|n| n.eq_ignore_ascii_case(&sheet)) else {
             return Err(bad(CMD, format!("chart {}: there is no sheet `{sheet}` (sheets: {})", k + 1, names.join(", "))));
         };
@@ -393,9 +398,18 @@ fn fill_sheet(s: &mut Session, spec: &Json, top: &Json, name: &str, charts: &mut
         // WHIQ: freeze the rows above and the columns left of a cell ("C2"), or {rows, columns}.
         let at = match f {
             Json::String(c) => CellRef::parse(c.trim()).ok_or_else(|| bad(CMD, step(&format!("`freeze` is a cell like \"C2\" (got `{c}`)"))))?,
+            // (item 26, B59: counts past the sheet, or not whole numbers, are refused; they were clamped or read as 0)
             Json::Object(o) => {
-                let n = |k: &str| o.get(k).and_then(Json::as_u64).unwrap_or(0).min(u64::from(gridcraft_core::MAX_ROWS - 1)) as u32;
-                CellRef::new(n("rows"), n("columns").max(n("cols")).min(gridcraft_core::MAX_COLS - 1))
+                let n = |k: &str, most: u32| -> Result<u32> {
+                    match o.get(k) {
+                        None | Some(Json::Null) => Ok(0),
+                        Some(v) => v.as_u64().filter(|x| *x < u64::from(most)).map(|x| x as u32).ok_or_else(|| {
+                            bad(CMD, step(&format!("`freeze.{k}` is a whole number of {k} from 0 to {} (got {v})", most - 1)))
+                        }),
+                    }
+                };
+                let cols = if o.contains_key("cols") { n("cols", gridcraft_core::MAX_COLS)? } else { n("columns", gridcraft_core::MAX_COLS)? };
+                CellRef::new(n("rows", gridcraft_core::MAX_ROWS)?, cols)
             }
             _ => return Err(bad(CMD, step("`freeze` is a cell like \"C2\" or {rows, columns}"))),
         };
@@ -864,11 +878,11 @@ fn add_chart(s: &mut Session, c: &Json, sheet: &str, block: Option<RangeRef>, ha
         chart.legend = LegendPos::Right;
     }
     chart.data_labels = bool_param(c, "data_labels").or(bool_param(c, "dataLabels")).unwrap_or(chart.data_labels);
-    if let Some(w) = f64_param(c, "width").filter(|w| w.is_finite()) {
-        chart.anchor.width = w.clamp(20.0, 10_000.0) as f32;
+    if let Some(w) = f64_param(c, "width") {
+        chart.anchor.width = super::insert::chart_size("build.workbook", "width", w)?;
     }
-    if let Some(h) = f64_param(c, "height").filter(|h| h.is_finite()) {
-        chart.anchor.height = h.clamp(20.0, 10_000.0) as f32;
+    if let Some(h) = f64_param(c, "height") {
+        chart.anchor.height = super::insert::chart_size("build.workbook", "height", h)?;
     }
     if let Some(colors) = c.get("colors").and_then(Json::as_array) {
         for (se, col) in chart.series.iter_mut().zip(colors.iter().filter_map(Json::as_str)) {

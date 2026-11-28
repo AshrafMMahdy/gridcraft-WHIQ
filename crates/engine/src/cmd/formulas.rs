@@ -589,10 +589,17 @@ fn calc_options(s: &mut Session, p: &Json) -> Result<Json> {
         if let Some(v) = bool_param(p, "iterative") {
             cx.wb.calc.iterative = v;
         }
+        // (item 26: Excel's dialog refuses these outside 1-32,767 and below 0; they were clamped, a negative change made positive)
         if let Some(v) = u32_param(p, "maxIterations") {
+            if !(1..=32767).contains(&v) {
+                return Err(bad("formulas.calculationOptions", format!("`maxIterations` is from 1 to 32767 (got {v})")));
+            }
             cx.wb.calc.set_max_iterations(v);
         }
         if let Some(v) = f64_param(p, "maxChange") {
+            if !(v.is_finite() && v >= 0.0) {
+                return Err(bad("formulas.calculationOptions", format!("`maxChange` is a number of 0 or more (got {v})")));
+            }
             cx.wb.calc.set_max_change(v);
         }
         let c = &cx.wb.calc;
