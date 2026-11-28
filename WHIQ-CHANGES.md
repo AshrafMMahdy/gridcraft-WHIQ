@@ -1022,6 +1022,15 @@ marked `AGREED LIMIT (owner, 2026-11-28)` with its reason, or removed.
 - **Defaults said** (rule 4) — insert_chart answers where it put the chart and its size; an empty export answers
   `written: false`; a narrowed read, a lazily opened file, a blank workbook, a CSV's encoding, separator and cut, a recalculation
   cut at the nesting limit, a PDF cut at 2,000 pages, a script's skipped steps: each said in the answer.
+- **References count their blanks as Excel does** (fault C3) — a reference over 16,384 cells was read only to the sheet's used
+  range, so formulas that count or compare blanks answered other than Excel (`COUNTBLANK(A1:A50000)` over 3,000 numbers: 0, not
+  47,000; `SUMPRODUCT(--(A:A=""))`, `MATCH(TRUE,A1:A50000="",0)`, `FILTER(…,A1:A50000="")`, `ROW(A:A)`, `=A1:A50000` likewise).
+  Every reference is now read at its full size, except an argument whose empty cells cannot change the result — the statistics
+  that leave out empty cells, SUMPRODUCT and the criteria functions (their ranges to one extent, and only when no criterion
+  matches an empty cell), and lookups of a value that cannot match an empty cell — which is read to the used range, as fast as
+  before (`crates/calc/src/eval.rs` `used_read`, `used_ranges`; `gridcraft_functions::criterion_matches_blank`). SUM, COUNT and
+  AVERAGE walk the stored cells as before. Measured on the release build: an exact whole-column array costs about 75 ns a cell
+  (`SUMPRODUCT(--(A:A=""))` about 80 ms), as it does in Excel; `A:.A` still trims.
 - **Faults fixed** — work lost to an eviction is said (`unsaved_work_lost`, `evicted`), never "saved"; open_workbook takes the
   file's `password`; sheet-prefixed ranges honoured; formula chains deeper than 256 calculated bottom-first in both calculation
   modes (an existing stack overflow at 2,000 levels); a request is never sent twice to a running app after it was sent; closing
@@ -1038,4 +1047,4 @@ Tests: `tests/mcp-contract/contract.rs` `answer_size_rule_pages_reads_and_saves_
 `a_size_cut_read_range_names_the_rows_it_holds_and_skips_none`, `a_cut_row_names_the_rows_after_it_and_a_cut_cell_is_said`,
 `item26_arguments_do_what_they_say_or_are_refused`, `a_failed_auto_save_says_the_work_is_lost_and_refuses_the_save`;
 `crates/mcp/src/answer_cap.rs` tests; `crates/engine/src/cmd/print.rs` `hostile_settings_never_panic_and_cap_pages`; the
-recalculation depth tests in `crates/calc`.
+recalculation depth tests and `large_references_count_their_blanks_as_excel_does` in `crates/calc`.

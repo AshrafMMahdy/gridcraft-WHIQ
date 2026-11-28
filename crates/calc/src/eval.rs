@@ -20,10 +20,82 @@ pub const MAX_CELLS: u64 = 16_000_000;
 pub fn max_cells() -> u64 {
     MAX_CELLS.max(gridcraft_core::memory::budget() / 32)
 }
-/// References up to this many cells are read at their full size; larger ones (`A:A`, ranges
-/// reserved for data to come such as `$A$2:$A$50000`) stop at the sheet's used range, so that
-/// formulas over them stay fast.
+/// WHIQ (item 26, fault C3): every reference is read at its full size, its blanks counted as Excel counts them
+/// (`COUNTBLANK(A1:A50000)`, `SUMPRODUCT(--(A1:A50000=""))`, `=A1:A50000`). A reference argument larger than this, of a
+/// function whose result cannot depend on the empty cells beyond the sheet's used range ([`used_read`]), is read to the used
+/// range: the same result, faster. The number changes no result, only which references are worth trimming. (Every reference
+/// over it was read to the used range: 6 of 10 formulas that count or compare blanks answered other than Excel.)
 const FULL_SIZE_CELLS: u64 = 16_384;
+
+/// How the reference arguments of a function may be read to the used range (see [`used_read`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UsedRead {
+    /// each argument listed on its own (a function that leaves out empty cells)
+    Each,
+    /// every reference argument to one extent, so that their shapes still match (pairs, criteria ranges)
+    Joint,
+    /// the rows of a table only (VLOOKUP), or its columns only (HLOOKUP): its other side is read whole
+    Rows,
+    Cols,
+}
+
+/// Functions whose arguments leave out empty cells: every argument is read to the used range.
+const LEAVE_OUT_BLANKS: &[&str] = &[
+    "SUMSQ", "PRODUCT", "MIN", "MAX", "MINA", "MAXA", "COUNTA", "MEDIAN", "MODE", "MODE.SNGL", "MODE.MULT", "STDEV", "STDEV.S",
+    "STDEV.P", "STDEVP", "STDEVA", "STDEVPA", "VAR", "VAR.S", "VAR.P", "VARP", "VARA", "VARPA", "GEOMEAN", "HARMEAN", "AVEDEV",
+    "DEVSQ", "KURT", "SKEW", "SKEW.P", "AVERAGEA", "CONCAT",
+];
+
+/// A lookup value that cannot match an empty cell: a number, a logical, or text that is not empty and has no wildcard.
+fn finds_no_blank(key: &Value) -> bool {
+    match key {
+        Value::Number(_) | Value::Bool(_) => true,
+        Value::Text(t) => !t.is_empty() && !t.contains(['*', '?', '~']),
+        _ => false,
+    }
+}
+
+/// WHIQ (item 26, C3): which arguments of `name` may be read to the sheet's used range, and how — only where Excel's result
+/// cannot depend on the empty cells beyond it. `scalar(i)`: argument `i` as one value (None when it is a range or an array).
+/// None: every argument is read at its full size.
+fn used_read(name: &str, n: usize, scalar: &mut dyn FnMut(usize) -> Option<Value>) -> Option<(UsedRead, Vec<usize>)> {
+    let mode_is = |v: Option<Value>, ok: &[f64]| match v {
+        None => false,
+        Some(Value::Empty) => true,
+        Some(Value::Number(m)) => ok.contains(&m),
+        Some(_) => false,
+    };
+    if LEAVE_OUT_BLANKS.contains(&name) {
+        return Some((UsedRead::Each, (0..n).collect()));
+    }
+    match name {
+        "LARGE" | "SMALL" | "PERCENTILE" | "PERCENTILE.INC" | "PERCENTILE.EXC" | "QUARTILE" | "QUARTILE.INC" | "QUARTILE.EXC" => {
+            Some((UsedRead::Each, vec![0]))
+        }
+        "RANK" | "RANK.EQ" | "RANK.AVG" => Some((UsedRead::Each, vec![1])),
+        "SUMPRODUCT" => Some((UsedRead::Joint, (0..n).collect())),
+        // the criteria functions: their ranges, when no criterion matches an empty cell
+        "COUNTIF" | "SUMIF" | "AVERAGEIF" | "COUNTIFS" | "SUMIFS" | "AVERAGEIFS" | "MAXIFS" | "MINIFS" => {
+            let (ranges, criteria): (Vec<usize>, Vec<usize>) = match name {
+                "COUNTIF" => (vec![0], vec![1]),
+                "SUMIF" | "AVERAGEIF" => ((0..n).filter(|i| *i != 1).collect(), vec![1]),
+                "COUNTIFS" => ((0..n).step_by(2).collect(), (1..n).step_by(2).collect()),
+                _ => ((0..n).filter(|i| *i == 0 || i % 2 == 1).collect(), (2..n).step_by(2).collect()),
+            };
+            criteria
+                .iter()
+                .all(|i| scalar(*i).is_some_and(|c| !matches!(c, Value::Array(_)) && !gridcraft_functions::criterion_matches_blank(&c)))
+                .then_some((UsedRead::Joint, ranges))
+        }
+        // lookups of a value that cannot match an empty cell (an approximate match passes over empty cells)
+        "VLOOKUP" => scalar(0).is_some_and(|k| finds_no_blank(&k)).then(|| (UsedRead::Rows, vec![1])),
+        "HLOOKUP" => scalar(0).is_some_and(|k| finds_no_blank(&k)).then(|| (UsedRead::Cols, vec![1])),
+        "MATCH" => scalar(0).is_some_and(|k| finds_no_blank(&k)).then(|| (UsedRead::Each, vec![1])),
+        "XMATCH" => (scalar(0).is_some_and(|k| finds_no_blank(&k)) && (n < 3 || mode_is(scalar(2), &[0.0, 1.0, -1.0])))
+            .then(|| (UsedRead::Each, vec![1])),
+        _ => None,
+    }
+}
 // AGREED LIMIT (owner, 2026-11-28): 400 — an expression nested deeper evaluates to #CALC! — why: item 26 rule 6, "Necessary limits - agreed" — necessary because each level is a frame on the stack (Excel allows 64).
 const MAX_DEPTH: usize = 400;
 
@@ -180,15 +252,76 @@ impl<'h> Evaluator<'h> {
             return self.host.cell_value(a.sheet, a.range.start);
         }
         // A reference keeps its size, so the array has its shape and its blanks count
-        // (`=A1:A10`, `SUMPRODUCT(--(A1:A10=""))`).
-        let cells = u64::from(a.range.height()) * u64::from(a.range.width());
-        let range = if cells > FULL_SIZE_CELLS { self.trim(a) } else { a.range };
+        // (`=A1:A10`, `SUMPRODUCT(--(A1:A10=""))`), whatever its size (item 26, C3).
+        self.range_value(a.sheet, a.range)
+    }
+
+    /// The values of `range` as an array of its shape.
+    fn range_value(&mut self, sheet: usize, range: RangeRef) -> Value {
+        if range.is_single() {
+            return self.host.cell_value(sheet, range.start);
+        }
         let (h, w) = (range.height() as usize, range.width() as usize);
         if (h as u64) * (w as u64) > max_cells() {
             return Value::Error(CellError::Num);
         }
-        let data = self.host.range_values(a.sheet, range);
+        let data = self.host.range_values(sheet, range);
         Array::new(h, w, data).map(Value::from).unwrap_or(Value::Error(CellError::Value))
+    }
+
+    /// The ranges `args` are read in under [`used_read`]: an argument listed is read to the sheet's used range when it is a
+    /// reference larger than [`FULL_SIZE_CELLS`]; with `Joint`, every listed argument to one extent, and only when each is a
+    /// one-area reference (an array among them keeps its full shape, so none is trimmed).
+    fn used_ranges(&mut self, how: UsedRead, listed: &[usize], evs: &[Ev]) -> Vec<Option<Vec<RangeRef>>> {
+        let mut out: Vec<Option<Vec<RangeRef>>> = vec![None; evs.len()];
+        let big = |r: &RangeRef| u64::from(r.height()) * u64::from(r.width()) > FULL_SIZE_CELLS;
+        let listed: Vec<usize> = listed.iter().copied().filter(|i| *i < evs.len()).collect();
+        if how == UsedRead::Joint {
+            let mut areas = Vec::new();
+            for i in &listed {
+                match &evs[*i] {
+                    Ev::R(a) if a.len() == 1 => areas.push((*i, a[0])),
+                    _ => return out,
+                }
+            }
+            if !areas.iter().any(|(_, a)| big(&a.range)) {
+                return out;
+            }
+            let (mut rows, mut cols) = (1u32, 1u32);
+            for (_, a) in &areas {
+                let t = self.trim(a);
+                rows = rows.max(t.end.row - a.range.start.row + 1);
+                cols = cols.max(t.end.col - a.range.start.col + 1);
+            }
+            for (i, a) in areas {
+                let s = a.range.start;
+                let end = CellRef::new(s.row + rows.min(a.range.height()) - 1, s.col + cols.min(a.range.width()) - 1);
+                out[i] = Some(vec![RangeRef::new(s, end)]);
+            }
+            return out;
+        }
+        for i in listed {
+            let Ev::R(areas) = &evs[i] else { continue };
+            if !areas.iter().any(|a| big(&a.range)) {
+                continue;
+            }
+            let ranges = areas
+                .iter()
+                .map(|a| {
+                    if !big(&a.range) {
+                        return a.range;
+                    }
+                    let t = self.trim(a);
+                    match how {
+                        UsedRead::Rows => RangeRef::new(a.range.start, CellRef::new(t.end.row, a.range.end.col)),
+                        UsedRead::Cols => RangeRef::new(a.range.start, CellRef::new(a.range.end.row, t.end.col)),
+                        _ => t,
+                    }
+                })
+                .collect();
+            out[i] = Some(ranges);
+        }
+        out
     }
 
     /// Trims the bottom/right of an area to the sheet's used range (keeps the top-left so
@@ -665,7 +798,8 @@ impl<'h> Evaluator<'h> {
                 match self.eval(&args[0]) {
                     Ev::R(a) => {
                         let Some(a) = a.first() else { return err(CellError::Ref) };
-                        let r = self.trim_lines(a);
+                        // (item 26, C3: ROW(A:A) is every row of it, as in Excel; ROW(A:.A) trims)
+                        let r = a.range;
                         if is_row {
                             let rows: Vec<Value> = (r.start.row..=r.end.row).map(|x| Value::number(x as f64 + 1.0)).collect();
                             if rows.len() == 1 { Ev::V(rows.into_iter().next().unwrap_or_default()) } else { Ev::V(Array::column(rows).into()) }
@@ -820,7 +954,7 @@ impl<'h> Evaluator<'h> {
         if let Some(kind) = Agg::of(spec.name) {
             return self.aggregate(kind, args);
         }
-        let mut evaluated = Vec::with_capacity(args.len());
+        let mut evs = Vec::with_capacity(args.len());
         // SUMIF/AVERAGEIF: the size of the criteria range (argument 1), which the sum range takes.
         let mut criteria_shape = None;
         // Database functions: the criteria range (argument 2), whose formulas are computed criteria.
@@ -844,20 +978,39 @@ impl<'h> Evaluator<'h> {
                     ev = Ev::R(vec![Area { sheet: area.sheet, range: resized_sum_range(area.range, h, w) }]);
                 }
             }
+            evs.push(ev);
+        }
+        // (item 26, C3: an argument whose empty cells cannot change the result is read to the used range)
+        let used = {
+            let mut scalar = |i: usize| match evs.get(i) {
+                Some(Ev::V(v)) if !matches!(v, Value::Array(_)) => Some(v.clone()),
+                Some(Ev::R(a)) if a.len() == 1 && a[0].range.is_single() => Some(self.host.cell_value(a[0].sheet, a[0].range.start)),
+                None => Some(Value::Empty),
+                _ => None,
+            };
+            match used_read(spec.name, args.len(), &mut scalar) {
+                Some((how, listed)) => self.used_ranges(how, &listed, &evs),
+                None => vec![None; evs.len()],
+            }
+        };
+        let mut evaluated = Vec::with_capacity(evs.len());
+        for (ev, used) in evs.into_iter().zip(used) {
             let from_ref = matches!(ev, Ev::R(_));
-            let value = match ev {
-                Ev::R(areas) if areas.len() > 1 => {
+            let value = match (ev, used) {
+                (Ev::R(areas), Some(ranges)) if areas.len() == 1 => self.range_value(areas[0].sheet, ranges[0]),
+                (Ev::R(areas), used) if areas.len() > 1 => {
                     // Multi-area references (unions): flatten into one row for aggregates.
                     let mut vals = Vec::new();
-                    for ar in &areas {
-                        match self.area_value(ar) {
+                    for (k, ar) in areas.iter().enumerate() {
+                        let range = used.as_ref().and_then(|r| r.get(k)).copied().unwrap_or(ar.range);
+                        match self.range_value(ar.sheet, range) {
                             Value::Array(a) => vals.extend(a.data.iter().cloned()),
                             v => vals.push(v),
                         }
                     }
                     Value::from(Array::row(vals))
                 }
-                ev => self.deref(ev),
+                (ev, _) => self.deref(ev),
             };
             evaluated.push(Arg { value, from_ref });
         }
@@ -1114,11 +1267,6 @@ impl<'h> Evaluator<'h> {
         }
     }
 
-    /// Whole rows/columns trimmed for ROW()/COLUMN() arrays.
-    fn trim_lines(&mut self, a: &Area) -> RangeRef {
-        if a.range.is_full_cols() || a.range.is_full_rows() { self.trim(a) } else { a.range }
-    }
-
     fn offset(&mut self, args: &[Expr]) -> Ev {
         self.host.note_volatile();
         if args.len() < 3 || args.len() > 5 {
@@ -1307,7 +1455,17 @@ impl<'h> Evaluator<'h> {
             let horizontal = l.range.height() == 1 && l.range.width() > 1;
             let same_len = if vertical { r.range.height() == l.range.height() } else { r.range.width() == l.range.width() };
             if !matches!(key, Value::Array(_)) && (vertical || horizontal) && same_len {
-                let mut xargs = vec![Arg { value: key, from_ref: false }, Arg { value: self.area_value(&l), from_ref: true }];
+                // (item 26, C3: the lookup array is read to the used range only when the value looked up cannot match an empty
+                // cell and the match mode is exact or next smaller / larger; the result is a position in the return range)
+                let mode = match args.get(4) {
+                    None | Some(Expr::Missing) => Some(0.0),
+                    Some(e) => self.value(e).as_f64(),
+                };
+                let trim = finds_no_blank(&key)
+                    && mode.is_some_and(|m| [0.0, 1.0, -1.0].contains(&m))
+                    && u64::from(l.range.height()) * u64::from(l.range.width()) > FULL_SIZE_CELLS;
+                let looked = if trim { self.trim(&l) } else { l.range };
+                let mut xargs = vec![Arg { value: key, from_ref: false }, Arg { value: self.range_value(l.sheet, looked), from_ref: true }];
                 // An empty match_mode before a given search_mode is the default (0), not the end.
                 let given = |i: usize| args.get(i).is_some_and(|e| !matches!(e, Expr::Missing));
                 let last = if given(5) {

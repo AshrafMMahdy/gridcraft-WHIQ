@@ -1266,3 +1266,44 @@ fn offset_extreme_arguments_return_ref() {
         assert_eq!(crate::evaluate(&wb, 0, c("D1"), formula), Value::Number(expected), "{formula}");
     }
 }
+
+/// WHIQ (item 26, fault C3): a reference larger than 16,384 cells is read at its full size, its blanks counted as Excel counts
+/// them; a function whose result cannot depend on the empty cells beyond the used range reads it to the used range, with the
+/// same result. (Every such reference was read to the used range: COUNTBLANK(A1:A50000) over 3,000 numbers answered 0.)
+#[test]
+fn large_references_count_their_blanks_as_excel_does() {
+    let mut t = T::new();
+    for i in 1..=3000u32 {
+        let sh = t.wb.sheet_mut(0).unwrap();
+        sh.cells.set(CellRef::new(i - 1, 0), Cell::value(Value::number(f64::from(i))));
+        sh.cells.set(CellRef::new(i - 1, 1), Cell::value(Value::number(f64::from(i) * 2.0)));
+    }
+    let cases: &[(&str, f64)] = &[
+        // blanks count: read at full size
+        ("=COUNTBLANK(A1:A50000)", 47_000.0),
+        ("=COUNTIF(A1:A50000,\"\")", 47_000.0),
+        ("=COUNTIF(A:A,\"<>3\")", 1_048_575.0),
+        ("=SUMPRODUCT(--(A1:A50000=\"\"))", 47_000.0),
+        ("=MATCH(TRUE,A1:A50000=\"\",0)", 3001.0),
+        ("=ROWS(FILTER(A1:A50000,A1:A50000=\"\"))", 47_000.0),
+        ("=ROWS(ROW(A:A))", 1_048_576.0),
+        ("=ROWS(A1:A50000*1)", 50_000.0),
+        // the result cannot depend on the empty cells: read to the used range, the same answer
+        ("=COUNTIF(A:A,\">2\")", 2998.0),
+        ("=SUMIFS(B:B,A:A,\">2990\")", 2.0 * (2991..=3000).sum::<u32>() as f64),
+        ("=SUMIF(A:A,\"<=2\",B:B)", 6.0),
+        ("=SUMPRODUCT(A1:A50000,B1:B50000)", (1..=3000u64).map(|i| (i * i * 2) as f64).sum()),
+        ("=VLOOKUP(2999,A:B,2,FALSE)", 5998.0),
+        ("=MATCH(3000,A:A,0)", 3000.0),
+        ("=XLOOKUP(3000,A:A,B:B)", 6000.0),
+        ("=MAX(A:A)+MIN(A:A)", 3001.0),
+        ("=LARGE(A1:A50000,2)", 2999.0),
+        ("=COUNTA(A:A)", 3000.0),
+    ];
+    for (i, (f, _)) in cases.iter().enumerate() {
+        t.set(&format!("D{}", i + 1), f);
+    }
+    for (i, (f, want)) in cases.iter().enumerate() {
+        assert_eq!(t.num(&format!("D{}", i + 1)), *want, "{f}");
+    }
+}

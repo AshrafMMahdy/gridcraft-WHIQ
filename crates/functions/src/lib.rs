@@ -77,6 +77,12 @@ pub(crate) mod text;
 pub(crate) mod util;
 
 pub use ets::Timeline;
+
+/// Whether a criterion of COUNTIF and the *IFS functions matches an empty cell (`""`, `"="`, `"<>x"` do; `"x"`, `">3"`, `"<>"`
+/// do not). WHIQ (item 26, C3): a criteria range is read to the sheet's used range only when its criteria match no empty cell.
+pub fn criterion_matches_blank(criterion: &Value) -> bool {
+    criteria::Criterion::parse_arg_truncated(criterion).matches(&Value::Empty)
+}
 pub use stat::{aggregate_values, aggregate_values_k};
 
 /// An evaluated argument. Ranges arrive as `Value::Array` (blank cells = `Value::Empty`) with
