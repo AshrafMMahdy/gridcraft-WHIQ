@@ -73,6 +73,8 @@ fn used_read(name: &str, n: usize, scalar: &mut dyn FnMut(usize) -> Option<Value
             Some((UsedRead::Each, vec![0]))
         }
         "RANK" | "RANK.EQ" | "RANK.AVG" => Some((UsedRead::Each, vec![1])),
+        // TEXTJOIN that leaves out empty values: its texts
+        "TEXTJOIN" => matches!(scalar(1), Some(Value::Bool(true))).then(|| (UsedRead::Each, (2..n).collect())),
         "SUMPRODUCT" => Some((UsedRead::Joint, (0..n).collect())),
         // the criteria functions: their ranges, when no criterion matches an empty cell
         "COUNTIF" | "SUMIF" | "AVERAGEIF" | "COUNTIFS" | "SUMIFS" | "AVERAGEIFS" | "MAXIFS" | "MINIFS" => {

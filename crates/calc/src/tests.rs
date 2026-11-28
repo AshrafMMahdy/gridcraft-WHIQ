@@ -1299,6 +1299,9 @@ fn large_references_count_their_blanks_as_excel_does() {
         ("=MAX(A:A)+MIN(A:A)", 3001.0),
         ("=LARGE(A1:A50000,2)", 2999.0),
         ("=COUNTA(A:A)", 3000.0),
+        ("=LEN(TEXTJOIN(\",\",TRUE,A:A))", (1..=3000u32).map(|i| i.to_string().len() as f64 + 1.0).sum::<f64>() - 1.0),
+        // (18,000 cells, 1,000 numbers: the empty ones are joined too; a longer text than 32,767 characters is #VALUE!, as in Excel)
+        ("=LEN(TEXTJOIN(\",\",FALSE,A2001:A20000))", 4000.0 + 17_999.0),
     ];
     for (i, (f, _)) in cases.iter().enumerate() {
         t.set(&format!("D{}", i + 1), f);

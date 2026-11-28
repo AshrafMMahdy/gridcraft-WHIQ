@@ -1026,7 +1026,7 @@ marked `AGREED LIMIT (owner, 2026-11-28)` with its reason, or removed.
   range, so formulas that count or compare blanks answered other than Excel (`COUNTBLANK(A1:A50000)` over 3,000 numbers: 0, not
   47,000; `SUMPRODUCT(--(A:A=""))`, `MATCH(TRUE,A1:A50000="",0)`, `FILTER(…,A1:A50000="")`, `ROW(A:A)`, `=A1:A50000` likewise).
   Every reference is now read at its full size, except an argument whose empty cells cannot change the result — the statistics
-  that leave out empty cells, SUMPRODUCT and the criteria functions (their ranges to one extent, and only when no criterion
+  that leave out empty cells, TEXTJOIN that leaves them out, SUMPRODUCT and the criteria functions (their ranges to one extent, and only when no criterion
   matches an empty cell), and lookups of a value that cannot match an empty cell — which is read to the used range, as fast as
   before (`crates/calc/src/eval.rs` `used_read`, `used_ranges`; `gridcraft_functions::criterion_matches_blank`). SUM, COUNT and
   AVERAGE walk the stored cells as before. Measured on the release build: an exact whole-column array costs about 75 ns a cell
