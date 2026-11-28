@@ -120,6 +120,7 @@ impl Look {
             let Some(key) = look_key(k) else {
                 return Err(format!("unknown style key `{k}` (style keys: {accepted})", accepted = accepted()));
             };
+            super::read_ok(k);
             if v.is_null() {
                 continue;
             }

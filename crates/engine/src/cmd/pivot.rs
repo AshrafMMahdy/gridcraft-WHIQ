@@ -207,7 +207,7 @@ fn other(msg: impl Into<String>) -> EngineError {
 fn find_pivot(s: &Session, p: &Json) -> Result<(usize, usize)> {
     let d = s.doc()?;
     let active = d.wb.active_sheet;
-    if let Some(v) = p.get("pivot").filter(|v| !v.is_null()) {
+    if let Some(v) = any_param(p, "pivot").filter(|v| !v.is_null()) {
         let mut order: Vec<usize> = vec![active];
         order.extend((0..d.wb.sheets.len()).filter(|i| *i != active));
         for si in order {
@@ -644,10 +644,10 @@ fn insert_pivot(s: &mut Session, p: &Json) -> Result<Json> {
         Some((si, at))
     };
     let replace = bool_param(p, "replace").unwrap_or(false);
-    let rows = field_list(p.get("rows"));
-    let columns = field_list(p.get("columns"));
-    let values = field_list(p.get("values"));
-    let filters = field_list(p.get("filters"));
+    let rows = field_list(any_param(p, "rows"));
+    let columns = field_list(any_param(p, "columns"));
+    let values = field_list(any_param(p, "values"));
+    let filters = field_list(any_param(p, "filters"));
     let mut new_sheet_at: Option<usize> = None;
     let res = edit(s, |cx| {
         let id = next_pivot_id(&cx.wb);
@@ -1022,7 +1022,7 @@ fn value_settings(s: &mut Session, p: &Json) -> Result<Json> {
         None => None,
     };
     let name = str_param(p, "name").map(str::to_string);
-    let fmt = p.get("numberFormat").cloned();
+    let fmt = any_param(p, "numberFormat").cloned();
     update(s, p, |pt, src, _| {
         let i = match (index, &field) {
             (Some(i), _) => i,
@@ -1084,7 +1084,7 @@ fn value_settings(s: &mut Session, p: &Json) -> Result<Json> {
 fn filter(s: &mut Session, p: &Json) -> Result<Json> {
     const C: &str = "pivot.filter";
     let field = str_param(p, "field").ok_or_else(|| bad(C, "missing `field`"))?.to_string();
-    let selected: Option<Vec<String>> = match p.get("selected") {
+    let selected: Option<Vec<String>> = match any_param(p, "selected") {
         None | Some(Json::Null) => None,
         Some(Json::Array(a)) => {
             if a.len() > 100_000 {
@@ -1187,7 +1187,7 @@ fn collapse(s: &mut Session, p: &Json) -> Result<Json> {
     let field = str_param(p, "field").ok_or_else(|| bad(C, "missing `field`"))?.to_string();
     let on = bool_param(p, "collapse").unwrap_or(true);
     let items: Option<Vec<String>> =
-        p.get("items").and_then(Json::as_array).map(|a| a.iter().take(100_000).filter_map(|x| x.as_str().map(str::to_string)).collect());
+        any_param(p, "items").and_then(Json::as_array).map(|a| a.iter().take(100_000).filter_map(|x| x.as_str().map(str::to_string)).collect());
     update(s, p, |pt, src, wb| {
         let all = match &items {
             Some(v) => v.clone(),
@@ -1225,7 +1225,7 @@ fn layout(s: &mut Session, p: &Json) -> Result<Json> {
         Some(l) => return Err(bad(C, format!("unknown layout `{l}` (compact|outline|tabular)"))),
         None => None,
     };
-    let subtotals: Option<(bool, Option<bool>)> = match p.get("subtotals") {
+    let subtotals: Option<(bool, Option<bool>)> = match any_param(p, "subtotals") {
         Some(Json::Bool(b)) => Some((*b, None)),
         Some(Json::String(m)) => match m.to_ascii_lowercase().as_str() {
             "top" => Some((true, Some(true))),
@@ -1427,7 +1427,7 @@ fn insert_pivot_chart(s: &mut Session, p: &Json) -> Result<Json> {
     let kind = super::insert::chart_kind(t, str_param(p, "subtype").unwrap_or(""));
     let at =
         cell_param(s, p, "at")?.unwrap_or_else(|| CellRef::new(area.start.row, area.end.col.saturating_add(2).min(gridcraft_core::MAX_COLS - 1)));
-    let title = match p.get("title") {
+    let title = match any_param(p, "title") {
         Some(Json::String(t)) => Some(t.clone()),
         Some(Json::Null) => None,
         _ => Some(if series.len() == 1 { "Total".to_string() } else { "Chart Title".to_string() }),
@@ -1540,7 +1540,7 @@ fn recommended(s: &mut Session, p: &Json) -> Result<Json> {
     let active = s.doc()?.wb.active_sheet;
     let src = pv::read_source(&s.doc()?.wb, &source, active).map_err(other)?;
     let list = suggestions(&s.doc()?.wb, &src);
-    let Some(apply) = p.get("apply").and_then(Json::as_u64) else {
+    let Some(apply) = any_param(p, "apply").and_then(Json::as_u64) else {
         return Ok(json!({"source": source, "suggestions": list}));
     };
     let pick = list.get(apply as usize).cloned().ok_or_else(|| bad("insert.recommendedPivotTables", "no suggestion with that index"))?;
@@ -1550,10 +1550,10 @@ fn recommended(s: &mut Session, p: &Json) -> Result<Json> {
         "columns": pick.get("columns").cloned().unwrap_or(json!([])),
         "values": pick.get("values").cloned().unwrap_or(json!([])),
     });
-    if let (Some(m), Some(d)) = (q.as_object_mut(), p.get("destination")) {
+    if let (Some(m), Some(d)) = (q.as_object_mut(), any_param(p, "destination")) {
         m.insert("destination".into(), d.clone());
     }
-    if let (Some(m), Some(r)) = (q.as_object_mut(), p.get("replace")) {
+    if let (Some(m), Some(r)) = (q.as_object_mut(), any_param(p, "replace")) {
         m.insert("replace".into(), r.clone());
     }
     let mut res = insert_pivot(s, &q)?;

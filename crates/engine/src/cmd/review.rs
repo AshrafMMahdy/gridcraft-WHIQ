@@ -266,7 +266,7 @@ fn allow_edit_ranges(s: &mut Session, p: &Json) -> Result<Json> {
             if let Some(pw) = str_param(p, "password") {
                 r.password = (!pw.is_empty()).then(|| hash(pw, &r.title));
             }
-            if p.get("range").is_some() {
+            if any_param(p, "range").is_some() {
                 r.ranges = target_ranges(s, p)?;
             }
             edit(s, |cx| {

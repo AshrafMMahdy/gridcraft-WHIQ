@@ -85,12 +85,26 @@ pub struct Eviction {
 pub struct EvictedDoc {
     pub handle: String,
     pub recovered: Option<PathBuf>,
+    /// WHIQ (item 26): it had unsaved work and the auto-save failed: why. Its changes since the last save are lost.
+    pub lost: Option<String>,
     pub original: Option<String>,
 }
 
 impl Eviction {
     fn error(&self) -> ToolError {
+        let lost = self.docs.first().and_then(|d| d.lost.clone());
         let (reason, next) = match (&self.recovered, &self.original) {
+            (None, o) if lost.is_some() => (
+                format!(
+                    "{}; its unsaved work could NOT be auto-saved ({}): the changes since it was last saved are lost",
+                    self.reason,
+                    lost.as_deref().unwrap_or_default()
+                ),
+                match o {
+                    Some(o) => format!("tell the user; call open_workbook with path \"{o}\" (the last saved state) and make those changes again"),
+                    None => "tell the user; the workbook was never saved: call new_workbook and build it again".to_string(),
+                },
+            ),
             (Some(r), _) => (
                 format!("{}; your work is auto-saved at {}", self.reason, r.display()),
                 format!("call open_workbook with path \"{}\" and carry on", r.display()),
@@ -98,6 +112,8 @@ impl Eviction {
             (None, Some(o)) => (format!("{}; it had no unsaved changes", self.reason), format!("call open_workbook with path \"{o}\" and carry on")),
             (None, None) => (format!("{}; it had no unsaved changes", self.reason), "call new_workbook or open_workbook to carry on".to_string()),
         };
+        let lost_others: Vec<String> = self.docs.iter().skip(1).filter_map(|d| d.lost.as_ref().map(|w| format!("{} ({w})", d.handle))).collect();
+        let reason = if lost_others.is_empty() { reason } else { format!("{reason}; the unsaved work of {} could NOT be auto-saved and is lost", lost_others.join(", ")) };
         let reason = if self.others.is_empty() {
             reason
         } else {
@@ -125,7 +141,8 @@ impl Eviction {
 /// server closed: its auto-saved copy (or its unchanged original) is copied to the path asked,
 /// which is the save. `None` when the call is no such save, or when the format asked is not the
 /// copy's (that needs the workbook open again; the `evicted` answer says so).
-fn save_evicted(name: &str, a: &Value, ev: &Eviction, overwrite: bool) -> Option<Result<Value, String>> {
+fn save_evicted(name: &str, a: &Value, ev: &Eviction, overwrite: bool) -> Option<Result<Value, ToolError>> {
+    let failed = |e: String| ToolError::new("failed", e, "check the path and the write root, or open the workbook again and save it");
     let params = match name {
         "save_workbook" => a.clone(),
         "execute_command" if matches!(a.get("command").and_then(Value::as_str), Some("file.save" | "file.saveAs")) => {
@@ -141,11 +158,25 @@ fn save_evicted(name: &str, a: &Value, ev: &Eviction, overwrite: bool) -> Option
             Some(d) => (d.recovered.clone(), d.original.clone()),
             None => {
                 let open: Vec<&str> = ev.docs.iter().map(|d| d.handle.as_str()).collect();
-                return Some(Err(format!("no workbook closed by the eviction has the handle `{h}` (they were: {})", open.join(", "))));
+                return Some(Err(failed(format!("no workbook closed by the eviction has the handle `{h}` (they were: {})", open.join(", ")))));
             }
         },
         (None, false) => ev.docs.first().map_or((None, None), |d| (d.recovered.clone(), d.original.clone())),
     };
+    // WHIQ (item 26): unsaved work whose auto-save failed is lost: a "save" of the unchanged original would say it was saved
+    let doc = match &want {
+        Some(h) => ev.docs.iter().find(|d| &d.handle == h),
+        None => ev.docs.first(),
+    };
+    if let Some(why) = doc.and_then(|d| d.lost.as_ref()) {
+        return Some(Err(ToolError::new(
+            "evicted",
+            format!("not saved: the server closed this workbook ({}) and could not auto-save its unsaved work ({why}), so the changes since it was last saved are lost", ev.reason),
+            original.as_ref().map_or("tell the user; call new_workbook and build it again, then save".to_string(), |o| {
+                format!("tell the user; call open_workbook with path \"{o}\" (the last saved state), make those changes again, then save")
+            }),
+        )));
+    }
     let source = recovered.as_ref().map(|p| p.display().to_string()).or_else(|| original.clone())?;
     let target = params.get("path").and_then(Value::as_str).map(String::from).or_else(|| original.clone())?;
     let kind = |p: &str| gridcraft_engine::io::FileKind::from_path(p);
@@ -172,7 +203,7 @@ fn save_evicted(name: &str, a: &Value, ev: &Eviction, overwrite: bool) -> Option
     let _ = gridcraft_engine::io::save_policy::take_reports();
     let r = gridcraft_engine::io::save_policy::allow_overwrite(overwrite, copy);
     let reports = gridcraft_engine::io::save_policy::take_reports();
-    Some(r.map(|bytes| {
+    Some(r.map_err(failed).map(|bytes| {
         let abs = |p: &str| std::path::absolute(p).map(|x| x.display().to_string()).unwrap_or_else(|_| p.to_string());
         let mut v = json!({
             "path": abs(&target),
@@ -853,14 +884,27 @@ pub(crate) fn dispatch_extra(b: &mut dyn Backend, name: &str, a: &Args) -> Resul
             Ok(v)
         }
         // WHIQ (2026-11-01): these commands answer null — the tool says what it did and where, so an agent need not read back.
-        "insert_rows" => with_sheet(b, a, |b| exec(b, "home.insertRows", json!({"rows": span(a, "rows")})))
-            .and_then(|v| confirmed(b, a, v, json!({"inserted_rows": span(a, "rows")}))),
-        "insert_columns" => with_sheet(b, a, |b| exec(b, "home.insertColumns", json!({"cols": span(a, "cols")})))
-            .and_then(|v| confirmed(b, a, v, json!({"inserted_columns": span(a, "cols")}))),
-        "delete_rows" => with_sheet(b, a, |b| exec(b, "home.deleteRows", json!({"rows": span(a, "rows")})))
-            .and_then(|v| confirmed(b, a, v, json!({"deleted_rows": span(a, "rows")}))),
-        "delete_columns" => with_sheet(b, a, |b| exec(b, "home.deleteColumns", json!({"cols": span(a, "cols")})))
-            .and_then(|v| confirmed(b, a, v, json!({"deleted_columns": span(a, "cols")}))),
+        // (a sheet prefix in rows / cols names the sheet, as `sheet` does: item 26, it was dropped and the active sheet changed)
+        "insert_rows" => {
+            let a = &span_sheet(a, "rows")?;
+            with_sheet(b, a, |b| exec(b, "home.insertRows", json!({"rows": span(a, "rows")})))
+                .and_then(|v| confirmed(b, a, v, json!({"inserted_rows": span(a, "rows")})))
+        }
+        "insert_columns" => {
+            let a = &span_sheet(a, "cols")?;
+            with_sheet(b, a, |b| exec(b, "home.insertColumns", json!({"cols": span(a, "cols")})))
+                .and_then(|v| confirmed(b, a, v, json!({"inserted_columns": span(a, "cols")})))
+        }
+        "delete_rows" => {
+            let a = &span_sheet(a, "rows")?;
+            with_sheet(b, a, |b| exec(b, "home.deleteRows", json!({"rows": span(a, "rows")})))
+                .and_then(|v| confirmed(b, a, v, json!({"deleted_rows": span(a, "rows")})))
+        }
+        "delete_columns" => {
+            let a = &span_sheet(a, "cols")?;
+            with_sheet(b, a, |b| exec(b, "home.deleteColumns", json!({"cols": span(a, "cols")})))
+                .and_then(|v| confirmed(b, a, v, json!({"deleted_columns": span(a, "cols")})))
+        }
         "rename_sheet" => exec(b, "sheet.rename", pick(a, &["sheet", "name"]))
             .map(|v| if v.is_null() { json!({"ok": true, "renamed": {"from": a.get("sheet").cloned().unwrap_or(Value::Null), "to": a.get("name").cloned().unwrap_or(Value::Null)}}) } else { v }),
         // WHIQ: no position given → after the LAST sheet, as the tool says (the engine's own default is Excel's "+":
@@ -899,8 +943,21 @@ pub(crate) fn dispatch_extra(b: &mut dyn Backend, name: &str, a: &Args) -> Resul
     }
 }
 
-/// `"7"` → `"7:7"`, `"C"` → `"C:C"`, `"5-7"` → `"5:7"`; a sheet prefix is dropped (the
-/// `sheet` argument says which sheet).
+/// WHIQ (item 26, fault B50): the arguments with `sheet` set from a sheet prefix of `key` ("Data!5:7"); a prefix and a `sheet`
+/// that name two sheets are refused.
+fn span_sheet(a: &Args, key: &str) -> Result<Args, String> {
+    let Some((Some(prefix), _)) = a.get(key).and_then(Value::as_str).map(|r| split_sheet(r.trim())) else { return Ok(a.clone()) };
+    match a.get("sheet").and_then(Value::as_str) {
+        Some(s) if !s.eq_ignore_ascii_case(&prefix) => Err(format!("`{key}` names the sheet \"{prefix}\" and `sheet` names \"{s}\": give one sheet")),
+        _ => {
+            let mut out = a.clone();
+            out.insert("sheet".into(), json!(prefix));
+            Ok(out)
+        }
+    }
+}
+
+/// `"7"` → `"7:7"`, `"C"` → `"C:C"`, `"5-7"` → `"5:7"`; a sheet prefix is taken off (span_sheet made it the `sheet`).
 fn span(a: &Args, key: &str) -> String {
     let raw = match a.get(key) {
         Some(Value::String(t)) => t.clone(),
@@ -1198,9 +1255,7 @@ pub fn run_tool(b: &mut dyn Backend, st: &mut CallState, name: &str, args: &Valu
         if let Some(r) = save_evicted(name, &Value::Object(a.clone()), ev, overwrite) {
             return match r {
                 Ok(v) => ToolResult::json(&v),
-                Err(e) => {
-                    ToolResult::failure(&ToolError::new("failed", e, "check the path and the write root, or open the workbook again and save it"))
-                }
+                Err(e) => ToolResult::failure(&e),
             };
         }
         return ToolResult::failure(&ev.error());
@@ -1879,7 +1934,9 @@ fn execute_command(b: &mut dyn Backend, a: &Args, warnings: &mut Vec<String>) ->
         Some(v @ Value::Object(_)) => v.clone(),
         Some(_) => return Err(ToolError::new("invalid_argument", "`params` must be an object", "pass params as {\"key\": value}")),
     };
-    match exec(b, &cmd, p.clone()) {
+    // (item 26, B54: a parameter of the wrong type, or one the command never reads, is refused and nothing is changed)
+    let run = |b: &mut dyn Backend, id: &str, p: Value| b.call("engine.execute", json!({"command": id, "params": p, "unread_refused": true}));
+    match run(b, &cmd, p.clone()) {
         Ok(v) => Ok(v),
         Err(e) if e.contains("unknown command") => {
             let ids = command_ids(b);
@@ -1887,7 +1944,7 @@ fn execute_command(b: &mut dyn Backend, a: &Args, warnings: &mut Vec<String>) ->
             if let Some(id) = ids.iter().find(|i| contract::squash(i) == sq) {
                 warnings.push(format!("command `{cmd}` was read as `{id}`"));
                 let id = id.clone();
-                return exec(b, &id, p).map_err(|e| classify(b, "execute_command", a, &e));
+                return run(b, &id, p).map_err(|e| classify(b, "execute_command", a, &e));
             }
             Err(classify(b, "execute_command", a, &e))
         }
@@ -2018,8 +2075,20 @@ fn read_range(b: &mut dyn Backend, st: &CallState, a: &Args) -> Result<Value, To
             None => return Ok(json!({"range": r.a1(), "sheet": sheet_name, "values": [], "note": "the range holds no data"})),
         };
     }
+    let q = quote_sheet(&sheet_name);
     if r.count() <= cap {
-        return b.call("sheet.read", p).map_err(|e| classify(b, "read_range", a, &e));
+        let mut v = b.call("sheet.read", p).map_err(|e| classify(b, "read_range", a, &e))?;
+        let whole = v["range"].as_str().and_then(RangeRef::parse).unwrap_or(r);
+        if let Some(fit) = fit_read(&mut v, whole) {
+            said_part(&mut v, &q, whole, fit.part, fit.next_start, fit.next_range);
+            // (one row cut: the rows below it come after the rest of it)
+            if fit.part.end.row < whole.end.row && fit.next_range.end.row == fit.part.end.row {
+                let then = format!("{q}!{}", RangeRef::new(CellRef::new(fit.part.end.row + 1, whole.start.col), whole.end).a1());
+                v["then_range"] = json!(then);
+                v["next_step"] = json!(format!("call read_range with range \"{}\" for the rest of this row, then \"{then}\" for the rows after it", v["next_range"].as_str().unwrap_or_default()));
+            }
+        }
+        return Ok(v);
     }
     let width = u64::from(r.width());
     let part = if width > cap {
@@ -2035,20 +2104,84 @@ fn read_range(b: &mut dyn Backend, st: &CallState, a: &Args) -> Result<Value, To
         let c = CellRef::new(part.end.row + 1, r.start.col);
         (c, RangeRef::new(c, r.end))
     };
-    let q = quote_sheet(&sheet_name);
     p["range"] = json!(format!("{q}!{}", part.a1()));
     if let Some(o) = p.as_object_mut() {
         o.remove("sheet");
     }
     let mut v = b.call("sheet.read", p).map_err(|e| classify(b, "read_range", a, &e))?;
+    match fit_read(&mut v, if width > cap { RangeRef::new(part.start, CellRef::new(part.start.row, r.end.col)) } else { r }) {
+        Some(fit) => said_part(&mut v, &q, r, fit.part, fit.next_start, fit.next_range),
+        None => said_part(&mut v, &q, r, part, next_start, next_range),
+    }
+    Ok(v)
+}
+
+/// The answer says the part it holds of `whole` and the range that comes next.
+fn said_part(v: &mut Value, q: &str, whole: RangeRef, part: RangeRef, next_start: CellRef, next_range: RangeRef) {
     let next = format!("{q}!{}", next_range.a1());
+    v["range"] = json!(part.a1());
     v["truncated"] = json!(true);
-    v["total_cells"] = json!(r.count());
+    v["total_cells"] = json!(whole.count());
     v["returned_cells"] = json!(part.count());
     v["continue_from"] = json!(format!("{q}!{}", next_start.a1()));
     v["next_range"] = json!(next);
     v["next_step"] = json!(format!("call read_range with range \"{next}\" for the next part"));
-    Ok(v)
+}
+
+struct Fit {
+    part: RangeRef,
+    next_start: CellRef,
+    next_range: RangeRef,
+}
+
+/// WHIQ (item 26, fault A8): an answer of read_range larger than the answer-size rule is cut HERE to the whole rows that fit (one
+/// row too large: the cells of it that fit), so that the answer names exactly the part it holds and the next range starts right
+/// after it. (The size trim after it cut the rows and kept the next range of the whole part: an agent that followed it skipped
+/// rows.) `whole`: the range the rest is in — the rows below, or for one row the rest of that row. None: the answer fits.
+fn fit_read(v: &mut Value, whole: RangeRef) -> Option<Fit> {
+    let budget = crate::answer_cap::MAX_ANSWER_CHARS - 4096;
+    let size = |x: &Value| serde_json::to_string(x).map_or(0, |t| t.len());
+    if size(v) <= budget {
+        return None;
+    }
+    let part = v["range"].as_str().and_then(RangeRef::parse)?;
+    let rows = v["values"].as_array()?.clone();
+    let mut room = budget.saturating_sub(size(&{
+        let mut o = v.clone();
+        o["values"] = json!([]);
+        o
+    }) + 1024);
+    let mut k = 0;
+    for row in &rows {
+        let n = size(row) + 1;
+        if n > room {
+            break;
+        }
+        room -= n;
+        k += 1;
+    }
+    if k > 0 {
+        let kept = RangeRef::new(part.start, CellRef::new(part.start.row + k as u32 - 1, part.end.col));
+        v["values"] = Value::Array(rows[..k].to_vec());
+        let next_start = CellRef::new(kept.end.row + 1, whole.start.col);
+        return Some(Fit { part: kept, next_start, next_range: RangeRef::new(next_start, whole.end) });
+    }
+    // one row larger than the answer can hold: the cells of it that fit (at least one: a cell larger than the answer is cut by the
+    // size trim after this, and said there)
+    let cells = rows.first()?.as_array()?.clone();
+    let mut m = 0;
+    for c in &cells {
+        let n = size(c) + 1;
+        if n > room && m > 0 {
+            break;
+        }
+        room = room.saturating_sub(n);
+        m += 1;
+    }
+    let kept = RangeRef::new(part.start, CellRef::new(part.start.row, part.start.col + m as u32 - 1));
+    v["values"] = json!([cells[..m].to_vec()]);
+    let next_start = CellRef::new(part.start.row, kept.end.col + 1);
+    Some(Fit { part: kept, next_start, next_range: RangeRef::new(next_start, CellRef::new(part.start.row, whole.end.col)) })
 }
 
 // ---------------------------------------------------------------- errors

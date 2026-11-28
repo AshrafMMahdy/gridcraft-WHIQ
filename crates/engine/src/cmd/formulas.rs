@@ -132,7 +132,7 @@ fn auto_sum(s: &mut Session, p: &Json) -> Result<Json> {
             return ok();
         }
     };
-    if p.get("enter").and_then(Json::as_bool) == Some(false) {
+    if any_param(p, "enter").and_then(Json::as_bool) == Some(false) {
         s.ui_requests.push(crate::UiRequest::EditCell(Some(text.clone())));
         return Ok(json!({"formula": text}));
     }

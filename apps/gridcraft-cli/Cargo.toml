@@ -25,6 +25,8 @@ quick-xml = { workspace = true }
 [dev-dependencies]
 # WHIQ: the contract suite looks at rendered PNGs.
 image = { workspace = true }
+# WHIQ (item 26): the contract suite encrypts a workbook to open it with its password.
+gridcraft-xlsx = { workspace = true, features = ["test-support"] }
 
 # WHIQ: the MCP contract suite lives at the repository root, tests/mcp-contract/; it drives this
 # package's binary over stdio.

@@ -352,7 +352,7 @@ fn cell_set(s: &mut Session, p: &Json) -> Result<Json> {
         None => s.doc()?.selection.active,
     };
     // Both spellings take a string, number or boolean, as typed (#697).
-    let input = p.get("input").or_else(|| p.get("value")).map(json_to_input).ok_or_else(|| bad("cell.set", "missing `input` (or `value`)"))?;
+    let input = any_param(p, "input").or_else(|| any_param(p, "value")).map(json_to_input).ok_or_else(|| bad("cell.set", "missing `input` (or `value`)"))?;
     let array = bool_param(p, "array").unwrap_or(false);
     let d = s.doc()?;
     if let Some(sh) = d.wb.sheet(sheet)
@@ -432,7 +432,7 @@ pub(crate) fn json_to_input(v: &Json) -> String {
 fn range_set_values(s: &mut Session, p: &Json) -> Result<Json> {
     let sheet = target_sheet(s, p)?;
     let start = target_range(s, p)?.start;
-    let Some(rows) = p.get("values").and_then(Json::as_array) else { return Err(bad("range.setValues", "missing `values` (array of rows)")) };
+    let Some(rows) = any_param(p, "values").and_then(Json::as_array) else { return Err(bad("range.setValues", "missing `values` (array of rows)")) };
     if rows.len() > MAX_ROWS as usize {
         return Err(bad("range.setValues", "too many rows"));
     }
@@ -542,7 +542,7 @@ fn range_fill(s: &mut Session, p: &Json) -> Result<Json> {
 // ---------------------------------------------------------------- selection
 
 fn selection_set(s: &mut Session, p: &Json) -> Result<Json> {
-    if p.get("sheet").is_some() {
+    if any_param(p, "sheet").is_some() {
         let i = target_sheet(s, p)?;
         s.doc_mut()?.wb_switch_sheet(i);
     } else if let Some(r) = str_param(p, "range").or_else(|| str_param(p, "cell"))
@@ -588,8 +588,8 @@ impl crate::DocState {
 }
 
 fn selection_move(s: &mut Session, p: &Json) -> Result<Json> {
-    let dr = p.get("dr").and_then(Json::as_i64).unwrap_or(0);
-    let dc = p.get("dc").and_then(Json::as_i64).unwrap_or(0);
+    let dr = any_param(p, "dr").and_then(Json::as_i64).unwrap_or(0);
+    let dc = any_param(p, "dc").and_then(Json::as_i64).unwrap_or(0);
     let extend = bool_param(p, "extend").unwrap_or(false);
     let jmp = bool_param(p, "jump").unwrap_or(false);
     let d = s.doc_mut()?;
@@ -842,7 +842,7 @@ fn copy_impl(s: &mut Session, p: &Json, cut: bool) -> Result<Json> {
     let text = crate::display::range_text(&wb, sheet, range);
     // The HTML rendering is for the host clipboard (UI); it can reach 4 MB, so agents and
     // scripts get it only when they ask for it.
-    let html = if p.get("html").and_then(Json::as_bool) == Some(true) { crate::io::range_html(&wb, sheet, range, &text) } else { None };
+    let html = if any_param(p, "html").and_then(Json::as_bool) == Some(true) { crate::io::range_html(&wb, sheet, range, &text) } else { None };
     let clip = Clipboard { wb, sheet, range, cut, doc_uid: d.uid, text: text.clone(), areas, selected };
     s.clipboard = Some(clip);
     let mut result = json!({"range": range.a1(), "text": text});
@@ -965,7 +965,7 @@ fn paste(s: &mut Session, p: &Json) -> Result<Json> {
     if s.clipboard.is_none() {
         return Err(EngineError::Other("Nothing to paste.".into()));
     }
-    paste_special(s, &json!({"what": "all", "at": p.get("at").cloned().unwrap_or(Json::Null)}))
+    paste_special(s, &json!({"what": "all", "at": any_param(p, "at").cloned().unwrap_or(Json::Null)}))
 }
 
 fn paste_text(s: &mut Session, p: &Json, text: &str) -> Result<Json> {

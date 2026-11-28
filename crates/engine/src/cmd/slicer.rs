@@ -138,7 +138,7 @@ fn reapply_slicer(wb: &mut Workbook, sheet: usize, id: u32) {
 /// up on `sheet`, then anywhere).
 fn pivot_links(s: &Session, p: &Json, sheet: usize, cmd: &str) -> Result<Vec<String>> {
     let d = s.doc()?;
-    let names: Vec<String> = match p.get("pivot").or(p.get("pivots")) {
+    let names: Vec<String> = match any_param(p, "pivot").or(any_param(p, "pivots")) {
         Some(Json::String(t)) => vec![t.clone()],
         Some(Json::Array(v)) => v.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
         _ => vec![],
@@ -225,7 +225,7 @@ fn slicer_connections(s: &mut Session, p: &Json) -> Result<Json> {
     if !is_pivot {
         return Err(bad("slicer.connections", "this is a table slicer: it filters its table"));
     }
-    let links = pivot_links(s, &json!({"pivot": p.get("pivots").cloned().unwrap_or(Json::Null)}), sheet, "slicer.connections")?;
+    let links = pivot_links(s, &json!({"pivot": any_param(p, "pivots").cloned().unwrap_or(Json::Null)}), sheet, "slicer.connections")?;
     if links.is_empty() {
         return Err(bad("slicer.connections", "give at least one PivotTable in `pivots`"));
     }

@@ -482,6 +482,12 @@ impl PassExprs {
     }
 }
 
+// AGREED LIMIT (owner, 2026-11-28): 256 — formulas evaluated on demand one inside another before the chain is given up and computed
+// from its bottom up (`compute_whole`) — why: item 26 rule 6, "Necessary limits - agreed" — necessary because each level is frames
+// on the calculating thread's stack (upstream's 2,000 overflowed a 2 MB thread and ended the process; past it a chain with no loop
+// read as #CIRC!, or with iteration on as a previous value); the results do not depend on it (item 26, C2).
+const MAX_NESTED: usize = 256;
+
 struct PassHost<'a> {
     wb: &'a Workbook,
     exprs: &'a PassExprs,
@@ -498,6 +504,14 @@ struct PassHost<'a> {
     cycle: bool,
     cycles: Vec<Key>,
     depth: usize,
+    /// WHIQ (item 26, fault C2): a chain of formulas evaluated on demand nested deeper than [`MAX_NESTED`]: the formula at the
+    /// bottom. The chain is given up (nothing of it is kept) and the pass computes that formula first, then the chain again.
+    abort: Option<Key>,
+    /// The formulas of the chains given up and waiting for a formula below them (`compute_whole`), with how many chains hold
+    /// each: reaching one of them again from below is a loop through the chain, and is read as one.
+    blocked: HashMap<Key, u32>,
+    /// The formulas in progress when the chain was given up.
+    gave_up: Vec<Key>,
     /// Iterative calculation: a circular reference reads the cell's previous value instead of
     /// giving `#CIRC!`.
     iterate: bool,
@@ -528,6 +542,9 @@ impl<'a> PassHost<'a> {
             cycle: false,
             cycles: vec![],
             depth: 0,
+            abort: None,
+            blocked: HashMap::default(),
+            gave_up: Vec::new(),
             iterate: false,
             prev: HashMap::default(),
             stack: Vec::new(),
@@ -560,6 +577,52 @@ fn spill_blocked(host: &PassHost<'_>, (sheet, anchor): Key, a: &Array) -> bool {
 }
 
 impl PassHost<'_> {
+    /// `k` computed whatever the depth of the chain it reads: a chain given up at [`MAX_NESTED`] has its bottom formula computed
+    /// first (from there it nests afresh), then the chain again, until it completes. The loops it met in a chain given up are
+    /// found again when that part is computed, so they are not kept twice.
+    fn compute_whole(&mut self, k: Key) {
+        // each chain waiting, with the formulas it held when it was given up
+        let mut todo: Vec<(Key, Vec<Key>)> = vec![(k, Vec::new())];
+        while let Some(top) = todo.last().map(|t| t.0) {
+            let loops = self.cycles.len();
+            self.compute(top);
+            match self.abort.take() {
+                Some(bottom) => {
+                    self.cycles.truncate(loops);
+                    // what this chain held waits for the bottom: reaching it from there is a loop
+                    let held: Vec<Key> = self.gave_up.drain(..).collect();
+                    for h in &held {
+                        *self.blocked.entry(*h).or_insert(0) += 1;
+                    }
+                    if let Some(t) = todo.last_mut() {
+                        self.release(&std::mem::take(&mut t.1));
+                        t.1 = held;
+                    }
+                    todo.push((bottom, Vec::new()));
+                }
+                None => {
+                    todo.pop();
+                    // the chain below retries: its own formulas are its own again
+                    if let Some(t) = todo.last_mut() {
+                        let held = std::mem::take(&mut t.1);
+                        self.release(&held);
+                    }
+                }
+            }
+        }
+    }
+
+    fn release(&mut self, held: &[Key]) {
+        for h in held {
+            if let Some(n) = self.blocked.get_mut(h) {
+                *n -= 1;
+                if *n == 0 {
+                    self.blocked.remove(h);
+                }
+            }
+        }
+    }
+
     fn compute(&mut self, k: Key) -> Value {
         // WHIQ: a safe point for cancelling a long recalculation (the runner restores the workbook).
         gridcraft_core::cancel::checkpoint();
@@ -574,7 +637,19 @@ impl PassHost<'_> {
         let Some(expr) = self.exprs.get(self.wb, &k) else {
             return self.wb.sheet(k.0).map(|s| s.value(k.1)).unwrap_or_default();
         };
-        if self.in_progress.contains(&k) || self.depth > 2000 {
+        // (a chain being given up: nothing more of it is evaluated)
+        if self.abort.is_some() {
+            return Value::Empty;
+        }
+        // A chain deeper than the stack can follow is no loop: it is computed from its bottom up (the pass does that, `compute_whole`;
+        // it was #CIRC!, or with iteration on a previous value, and deep enough it overflowed the stack: item 26, C2).
+        let looped = self.in_progress.contains(&k) || self.blocked.contains_key(&k);
+        if !looped && self.depth > MAX_NESTED {
+            self.abort = Some(k);
+            self.gave_up = self.in_progress.iter().copied().collect();
+            return Value::Empty;
+        }
+        if looped {
             self.cycle = true;
             if self.iterate {
                 return self.circular_read(k);
@@ -600,6 +675,14 @@ impl PassHost<'_> {
         };
         self.depth -= 1;
         self.in_progress.remove(&k);
+        if self.abort.is_some() {
+            // given up: it stays to be computed, nothing of it is kept
+            if self.iterate {
+                self.stack.pop();
+            }
+            self.taint |= outer_taint;
+            return Value::Empty;
+        }
         self.pending.remove(&k);
         if self.iterate {
             self.stack.pop();
@@ -682,7 +765,7 @@ impl PassHost<'_> {
             self.pending = set.clone();
             self.spills.retain(|a, _| !set.contains(a));
             for k in &again {
-                self.compute(*k);
+                self.compute_whole(*k);
             }
             passes += 1;
         }
@@ -1162,7 +1245,7 @@ impl Calc {
                 let mut host = PassHost::new(wb, &exprs, &mut rng, now);
                 host.iterate = wb.calc.iterative;
                 for k in &dirty {
-                    host.compute(*k);
+                    host.compute_whole(*k);
                 }
                 if host.iterate && !host.members.is_empty() {
                     let passes = host.iterate_loops(&dirty, wb.calc.max_iterations, wb.calc.max_change);

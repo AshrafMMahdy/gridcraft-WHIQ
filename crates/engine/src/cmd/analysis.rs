@@ -73,7 +73,7 @@ pub fn specs() -> Vec<CommandSpec> {
 // ---------------------------------------------------------------- parameters
 
 fn num(p: &Json, key: &str) -> Option<f64> {
-    match p.get(key)? {
+    match any_param(p, key)? {
         Json::Number(n) => n.as_f64(),
         Json::String(s) => s.trim().trim_end_matches('%').trim().parse::<f64>().ok(),
         _ => None,
@@ -82,7 +82,7 @@ fn num(p: &Json, key: &str) -> Option<f64> {
 }
 
 fn flag(p: &Json, key: &str) -> bool {
-    match p.get(key) {
+    match any_param(p, key) {
         Some(Json::Bool(b)) => *b,
         Some(Json::String(s)) => s.eq_ignore_ascii_case("true") || s == "1",
         Some(Json::Number(n)) => n.as_f64().is_some_and(|v| v != 0.0),
@@ -313,7 +313,7 @@ fn idx(i: usize) -> u32 {
 fn descriptive(s: &Session, p: &Json) -> Result<Grid> {
     let (si, r) = input_range(s, p, &["range", "input"])?;
     let vars = variables(s, si, r, by_rows(p), flag(p, "labels"), &|i| format!("Column{}", i + 1))?;
-    let summary = p.get("summary").map(|_| flag(p, "summary")).unwrap_or(true);
+    let summary = any_param(p, "summary").map(|_| flag(p, "summary")).unwrap_or(true);
     let conf = confidence(p, "confidence")?;
     let kl = num(p, "kthLargest").filter(|k| *k >= 1.0).map(|k| k as usize);
     let ks = num(p, "kthSmallest").filter(|k| *k >= 1.0).map(|k| k as usize);
@@ -1088,7 +1088,7 @@ fn write_report(s: &mut Session, p: &Json, tool: &str, g: Grid) -> Result<Json> 
             if d.wb.protected_structure {
                 return Err(EngineError::Other(super::STRUCTURE_LOCKED.into()));
             }
-            let name = match p.get("newSheet") {
+            let name = match any_param(p, "newSheet") {
                 Some(Json::String(n)) if !n.trim().is_empty() => n.trim().to_string(),
                 _ => d.wb.next_sheet_name(),
             };

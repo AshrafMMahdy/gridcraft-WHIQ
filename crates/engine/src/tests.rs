@@ -2137,6 +2137,32 @@ fn reopen(s: &mut Session) {
     s.execute("file.open", json!({"name": "x.xlsx", "base64": b64})).unwrap();
 }
 
+/// WHIQ (item 26, fault C2): a chain deeper than one evaluation nests (each cell reads the one below it, so row-major order nests
+/// the whole chain) is calculated, not read as a loop; a real loop that long is still a loop.
+#[test]
+fn a_chain_deeper_than_one_evaluation_nests_is_calculated_not_circular() {
+    let mut s = s();
+    let n = 7000;
+    let mut rows: Vec<serde_json::Value> = (1..n).map(|i| json!([format!("=A{}+1", i + 1)])).collect();
+    rows.push(json!([1]));
+    s.execute("range.setValues", json!({"range": format!("A1:A{n}"), "values": rows})).unwrap();
+    assert_eq!(v(&s, "A1"), Value::Number(n as f64));
+    assert_eq!(v(&s, "A3500"), Value::Number((n - 3499) as f64));
+    assert!(s.doc().unwrap().calc.circular.is_empty());
+    // the bottom made to read the top: a loop of 7,000, still #CIRC!, and the pass ends
+    s.execute("cell.set", json!({"cell": format!("A{n}"), "input": "=A1"})).unwrap();
+    assert_eq!(v(&s, "A1"), Value::Error(gridcraft_core::CellError::Circ));
+    assert!(!s.doc().unwrap().calc.circular.is_empty());
+    // with iterative calculation on: the chain (no loop) is calculated exactly, and nothing overflows (upstream's 2,000 levels did)
+    s.execute("cell.set", json!({"cell": format!("A{n}"), "input": "1"})).unwrap();
+    s.execute("formulas.calculationOptions", json!({"iterative": true})).unwrap();
+    assert_eq!(v(&s, "A1"), Value::Number(n as f64));
+    // and a loop of 7,000 with iteration on settles without overflowing: A1 = A2 + 1 … A7000 = A1 / 2
+    s.execute("cell.set", json!({"cell": format!("A{n}"), "input": "=A1/2"})).unwrap();
+    let a1 = v(&s, "A1").as_f64().unwrap();
+    assert!(a1.is_finite(), "{a1}");
+}
+
 #[test]
 fn calculation_options_enable_iterative_calculation() {
     let mut s = s();
@@ -3444,3 +3470,4 @@ fn a_command_that_fails_half_way_leaves_the_workbook_as_it_was() {
     assert!(s.execute("cell.set", json!({"cell": "not a cell!!", "input": "x"})).is_err());
     assert!(std::sync::Arc::ptr_eq(&s.doc().unwrap().wb, &wb));
 }
+

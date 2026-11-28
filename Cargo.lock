@@ -1581,6 +1581,7 @@ version = "0.7.0"
 dependencies = [
  "gridcraft-engine",
  "gridcraft-mcp",
+ "gridcraft-xlsx",
  "image",
  "log",
  "quick-xml",

@@ -433,7 +433,7 @@ fn scenario_add(s: &mut Session, p: &Json) -> Result<Json> {
         return Err(bad(CMD, "no changing cells"));
     }
     let sh = d.wb.sheet(si).ok_or(EngineError::NoDocument)?;
-    let values: Vec<Json> = match p.get("values").and_then(Json::as_array) {
+    let values: Vec<Json> = match any_param(p, "values").and_then(Json::as_array) {
         Some(a) => {
             if a.len() != cells.len() {
                 return Err(bad(CMD, format!("{} values for {} changing cells", a.len(), cells.len())));
@@ -629,9 +629,9 @@ const MAX_TABLE_CELLS: u64 = 100_000;
 fn data_table(s: &mut Session, p: &Json) -> Result<Json> {
     const CMD: &str = "data.dataTable";
     let (si, r) = range_arg(s, p, "range", CMD)?;
-    let row_in = if p.get("rowInput").and_then(Json::as_str).is_some_and(|t| !t.is_empty()) { Some(cell_arg(s, p, "rowInput", CMD)?) } else { None };
+    let row_in = if any_param(p, "rowInput").and_then(Json::as_str).is_some_and(|t| !t.is_empty()) { Some(cell_arg(s, p, "rowInput", CMD)?) } else { None };
     let col_in =
-        if p.get("columnInput").and_then(Json::as_str).is_some_and(|t| !t.is_empty()) { Some(cell_arg(s, p, "columnInput", CMD)?) } else { None };
+        if any_param(p, "columnInput").and_then(Json::as_str).is_some_and(|t| !t.is_empty()) { Some(cell_arg(s, p, "columnInput", CMD)?) } else { None };
     if row_in.is_none() && col_in.is_none() {
         return Err(bad(CMD, "give `rowInput`, `columnInput` or both"));
     }
@@ -994,8 +994,7 @@ fn consolidate(s: &mut Session, p: &Json) -> Result<Json> {
     let top = bool_param(p, "topRow").unwrap_or(false);
     let left = bool_param(p, "leftColumn").unwrap_or(false);
     let d = s.doc()?;
-    let srcs: Vec<String> = p
-        .get("sources")
+    let srcs: Vec<String> = any_param(p, "sources")
         .and_then(Json::as_array)
         .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
         .or_else(|| str_param(p, "sources").map(|t| t.split(';').map(str::to_string).collect()))

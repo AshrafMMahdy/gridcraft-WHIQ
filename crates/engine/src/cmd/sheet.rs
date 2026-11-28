@@ -650,7 +650,7 @@ fn insert_sheet(s: &mut Session, p: &Json) -> Result<Json> {
     };
     s.doc()?.wb.check_sheet_name(&name, None).map_err(EngineError::Other)?;
     let d = s.doc_mut()?;
-    let before = p.get("before").and_then(Json::as_u64).map(|v| v as usize);
+    let before = any_param(p, "before").and_then(Json::as_u64).map(|v| v as usize);
     let idx = edit_doc(d, |cx| {
         // Excel inserts before the active sheet; the "+" button appends after it.
         let at = before.unwrap_or(cx.wb.active_sheet + 1).min(cx.wb.sheets.len());
@@ -854,7 +854,7 @@ fn move_sheet(s: &mut Session, p: &Json) -> Result<Json> {
     super::structure_unlocked(s)?;
     let i = target_sheet(s, p)?;
     let copy = bool_param(p, "copy").unwrap_or(false);
-    let to = p.get("to").and_then(Json::as_u64).map(|v| v as usize).ok_or_else(|| bad("sheet.move", "missing `to`"))?;
+    let to = any_param(p, "to").and_then(Json::as_u64).map(|v| v as usize).ok_or_else(|| bad("sheet.move", "missing `to`"))?;
     edit(s, |cx| {
         let n = cx.wb.sheets.len();
         let Some(src) = cx.wb.sheets.get(i).cloned() else { return Err(bad("sheet.move", "no such sheet")) };
@@ -926,7 +926,7 @@ fn move_sheet(s: &mut Session, p: &Json) -> Result<Json> {
 fn tab_color(s: &mut Session, p: &Json) -> Result<Json> {
     super::structure_unlocked(s)?;
     let i = target_sheet(s, p)?;
-    let c = super::format::color_param(p.get("color"));
+    let c = super::format::color_param(any_param(p, "color"));
     edit(s, |cx| {
         cx.sheet_mut(i)?.tab_color = c.filter(|c| *c != gridcraft_model::Color::Auto);
         Ok(Json::Null)
@@ -950,7 +950,7 @@ fn hide_sheet(s: &mut Session, p: &Json) -> Result<Json> {
 
 fn unhide_sheet(s: &mut Session, p: &Json) -> Result<Json> {
     super::structure_unlocked(s)?;
-    if p.get("sheet").is_none() {
+    if any_param(p, "sheet").is_none() {
         let hidden: Vec<String> = s.doc()?.wb.sheets.iter().filter(|s| s.visibility != Visibility::Visible).map(|s| s.name.clone()).collect();
         if hidden.is_empty() {
             return Err(EngineError::Other("No sheets are hidden.".into()));

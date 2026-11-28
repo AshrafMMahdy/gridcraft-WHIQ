@@ -116,7 +116,7 @@ fn source(s: &Session, p: &Json) -> Result<(usize, Vec<CellRef>, Vec<CellRef>)> 
 
 /// A number parameter given as a number or as text.
 fn number(p: &Json, key: &str) -> Result<Option<f64>> {
-    match p.get(key) {
+    match any_param(p, key) {
         None | Some(Json::Null) => Ok(None),
         Some(Json::Number(n)) => Ok(n.as_f64()),
         Some(Json::String(t)) if t.trim().is_empty() => Ok(None),
@@ -137,7 +137,7 @@ struct Options {
 }
 
 fn options(p: &Json) -> Result<Options> {
-    let seasonality = match p.get("seasonality") {
+    let seasonality = match any_param(p, "seasonality") {
         Some(Json::String(t)) if t.trim().is_empty() || t.trim().eq_ignore_ascii_case("auto") => 1,
         None | Some(Json::Null) => 1,
         _ => match number(p, "seasonality")? {
@@ -224,7 +224,7 @@ fn forecast_sheet(s: &mut Session, p: &Json) -> Result<Json> {
         return Err(EngineError::Other("There are no values to forecast.".into()));
     }
     let time_param = |key: &str| -> Result<Option<f64>> {
-        match p.get(key) {
+        match any_param(p, key) {
             Some(Json::Number(n)) => Ok(n.as_f64()),
             Some(Json::String(t)) if !t.trim().is_empty() => match gridcraft_core::parse::parse_input(t.trim(), sys).value {
                 Value::Number(x) => Ok(Some(x)),

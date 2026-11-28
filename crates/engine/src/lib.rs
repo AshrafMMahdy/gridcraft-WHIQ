@@ -507,9 +507,53 @@ impl Session {
     /// queued a file dialog because it got no file (`file.open`, `file.saveAs`, `file.save` on a workbook with no
     /// file yet, `data.getData`) is an error instead of a silent success — and, like any failure, leaves the
     /// workbook as it was.
+    /// WHIQ (item 26, fault B54): execute_headless for a caller that names a command and its parameters itself (MCP
+    /// execute_command, a batch's command): a parameter the command never read — unknown, or misspelt — refuses the call too, and
+    /// the workbook stays as it was.
+    pub fn execute_headless_all_read(&mut self, id: &str, params: Json) -> Result<Json> {
+        // (a key sent as null is no parameter; a key the command's own description names is its parameter, however it is read)
+        let named = find_command(id).map_or("", |c| c.params);
+        let documented = |k: &str| {
+            named.match_indices(k).any(|(i, _)| {
+                let before = named[..i].chars().next_back();
+                let after = named[i + k.len()..].chars().next();
+                !before.is_some_and(|c| c.is_alphanumeric() || c == '_') && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
+            })
+        };
+        let keys: Vec<String> = params
+            .as_object()
+            .map(|o| o.iter().filter(|(k, v)| !v.is_null() && !documented(k)).map(|(k, _)| k.clone()).collect())
+            .unwrap_or_default();
+        let before = self.mark();
+        let r = self.execute_headless(id, params)?;
+        let unread = cmd::unread(&keys);
+        if unread.is_empty() {
+            return Ok(r);
+        }
+        if let Some(m) = before {
+            self.rollback_to(m);
+        }
+        let list = unread.iter().map(|k| format!("`{k}`")).collect::<Vec<_>>().join(", ");
+        Err(EngineError::BadParams {
+            cmd: id.to_string(),
+            msg: format!("{list} {} not read by `{id}` (unknown or misspelt; list_commands gives its parameters); nothing was changed", if unread.len() == 1 { "is" } else { "are" }),
+        })
+    }
+
     pub fn execute_headless(&mut self, id: &str, params: Json) -> Result<Json> {
         let before = self.mark();
+        cmd::begin_reads();
         let r = self.execute(id, params);
+        // WHIQ (item 26, fault B54): a parameter the command could only read as absent, because of its type, refuses the call and
+        // leaves the workbook as it was (it ran with the default instead, without a word)
+        let wrong = cmd::misreads();
+        if r.is_ok() && !wrong.is_empty() {
+            let _ = self.take_ui_requests();
+            if let Some(m) = before {
+                self.rollback_to(m);
+            }
+            return Err(EngineError::BadParams { cmd: id.to_string(), msg: format!("{}; nothing was changed", wrong.join("; ")) });
+        }
         let requests = self.take_ui_requests();
         let asked_for_file = requests.iter().any(|q| matches!(q, UiRequest::Dialog(name, _) if name == "open" || name == "saveAs"));
         if r.is_ok() && asked_for_file {

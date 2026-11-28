@@ -260,12 +260,18 @@ impl Shared {
 
     /// Writes the snapshot's workbook to `<name>.recovered-<stamp>.xlsx` (write root first).
     fn autosave(&self, snap: &DocSnapshot, why: &str) -> Option<PathBuf> {
+        self.autosave_or_why(snap, why).ok()
+    }
+
+    /// The same, with why it could not be written (WHIQ item 26: an eviction says the work was lost, never "no unsaved changes").
+    fn autosave_or_why(&self, snap: &DocSnapshot, why: &str) -> Result<PathBuf, String> {
         let dir = self
             .config
             .write_root
             .clone()
             .or_else(|| snap.path.as_deref().and_then(|p| Path::new(p).parent().map(Path::to_path_buf)).filter(|d| !d.as_os_str().is_empty()))
-            .or_else(|| std::env::current_dir().ok())?;
+            .or_else(|| std::env::current_dir().ok())
+            .ok_or_else(|| "no folder to write it in (no write root, no folder of its own, no working folder)".to_string())?;
         let stem = Path::new(&snap.title).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Book".into());
         let stem: String = stem.chars().map(|c| if c.is_alphanumeric() || " -_.()".contains(c) { c } else { '_' }).collect();
         // The document's checkpoint file, when it has one, is brought up to date rather than
@@ -309,11 +315,11 @@ impl Shared {
                     un.retain(|r| r["path"] != entry["path"]);
                     un.push(entry);
                 }
-                Some(path)
+                Ok(path)
             }
             Err(e) => {
                 eprintln!("gridcraft-cli: {why}: auto-save to {text} failed: {e}");
-                None
+                Err(format!("writing {text} failed: {e}"))
             }
         }
     }
@@ -1205,16 +1211,24 @@ fn memory_after_call(server: &mut Server, shared: &Shared) -> Option<Value> {
     );
     let ev = lock(&shared.evicted).clone().filter(|e| Some(e) != before.as_ref())?;
     let reopen = ev.recovered.as_ref().map(|p| p.display().to_string()).or_else(|| ev.original.clone());
-    Some(json!({
+    // WHIQ (item 26): unsaved work whose auto-save failed is lost, and said so (never "save_workbook still writes your work")
+    let lost = ev.docs.first().and_then(|d| d.lost.clone());
+    let mut note = json!({
         "reason": ev.reason,
         "recovered_path": ev.recovered.as_ref().map(|p| p.display().to_string()),
         "recovered_paths": ev.recovered.iter().chain(ev.others.iter()).map(|p| p.display().to_string()).collect::<Vec<_>>(),
         "original_path": ev.original,
-        "next_step": match &reopen {
-            Some(p) => format!("this call finished; the workbook is closed now. save_workbook still writes your work (from {p}); open_workbook {{path: \"{p}\"}} carries on editing"),
-            None => "this call finished; the workbook is closed now. new_workbook or open_workbook carries on".to_string(),
+        "next_step": match (&lost, &reopen) {
+            (Some(why), Some(o)) => format!("this call finished; the workbook is closed now and its unsaved work could NOT be auto-saved ({why}): the changes since it was last saved are lost. Tell the user; open_workbook {{path: \"{o}\"}} opens the last saved state"),
+            (Some(why), None) => format!("this call finished; the workbook is closed now and its unsaved work could NOT be auto-saved ({why}): it is lost (it was never saved). Tell the user; new_workbook starts again"),
+            (None, Some(p)) => format!("this call finished; the workbook is closed now. save_workbook still writes your work (from {p}); open_workbook {{path: \"{p}\"}} carries on editing"),
+            (None, None) => "this call finished; the workbook is closed now. new_workbook or open_workbook carries on".to_string(),
         },
-    }))
+    });
+    if let Some(why) = lost {
+        note["unsaved_work_lost"] = json!(why);
+    }
+    Some(note)
 }
 
 /// Adds `closed_after_this_call` to a call's answer (its structured content and its text).
@@ -1243,10 +1257,14 @@ fn evict(server: &mut Server, shared: &Shared, reason: String) {
     let recoveries: Vec<crate::whiq::EvictedDoc> = snap
         .iter()
         .flat_map(|s| s.all())
-        .map(|d| crate::whiq::EvictedDoc {
-            handle: d.handle.clone(),
-            recovered: d.dirty.then(|| shared.autosave(d, kind)).flatten(),
-            original: d.path.clone(),
+        .map(|d| {
+            let saved = d.dirty.then(|| shared.autosave_or_why(d, kind));
+            crate::whiq::EvictedDoc {
+                handle: d.handle.clone(),
+                recovered: saved.as_ref().and_then(|r| r.as_ref().ok().cloned()),
+                lost: saved.and_then(Result::err),
+                original: d.path.clone(),
+            }
         })
         .collect();
     let recovered = recoveries.first().and_then(|d| d.recovered.clone());

@@ -69,6 +69,9 @@ pub fn specs() -> Vec<CommandSpec> {
 /// Sheet geometry is in pixels at 96 dpi; PDF units are points.
 pub(crate) const PX_TO_PT: f32 = 0.75;
 /// Most pages one export produces.
+// AGREED LIMIT (owner, 2026-11-28): 2,000 pages — one PDF export or print stops there and its answer says so (`pages_cut`, `note`) —
+// why: item 26 rule 5, "Timers, memory, and safety - agreed" — necessary because a layout can run to billions of pages (a cell at
+// XFD1048576 at 400 %); it was silent (item 26, B36).
 pub const MAX_PAGES: usize = 2000;
 /// Cells in a page block above which only stored cells are visited (not every grid position).
 const DENSE_BLOCK: u64 = 60_000;
@@ -121,6 +124,8 @@ pub struct SheetLayout {
     pub heading_h: f32,
     /// Manual page breaks apply (they don't when the sheet is fitted to pages).
     pub manual_breaks: bool,
+    /// WHIQ (item 26, B36): the layout has more pages than [`MAX_PAGES`] let it keep.
+    pub cut: bool,
 }
 
 impl SheetLayout {
@@ -283,14 +288,18 @@ pub fn layout_sheet(wb: &Workbook, si: usize, opts: &PrintOptions, range_overrid
         heading_w,
         heading_h,
         manual_breaks: fit.is_none(),
+        cut: false,
     };
     let paginate = |lay: &mut SheetLayout, manual: bool| {
         lay.manual_breaks = manual;
         (lay.row_bands, lay.col_bands) = split_bands(sh, lay, MAX_PAGES);
         lay.pages.clear();
+        // (bands stop at the cap too: a sheet with as many bands may have more)
+        lay.cut = lay.row_bands.len() >= MAX_PAGES || lay.col_bands.len() >= MAX_PAGES;
         'outer: for ci in 0..lay.col_bands.len() {
             for ri in 0..lay.row_bands.len() {
                 if lay.pages.len() >= MAX_PAGES {
+                    lay.cut = true;
                     break 'outer;
                 }
                 lay.pages.push((ri, ci));
@@ -357,7 +366,7 @@ pub(crate) fn split_bands(sh: &Sheet, lay: &SheetLayout, cap: usize) -> (Vec<(u3
 
 /// Lays out every sheet a print command covers.
 pub fn layouts(wb: &Workbook, opts: &PrintOptions) -> Vec<SheetLayout> {
-    let mut out = Vec::new();
+    let mut out: Vec<SheetLayout> = Vec::new();
     let mut pages = 0usize;
     let sheets: Vec<usize> = if opts.all_sheets {
         (0..wb.sheets.len()).filter(|i| wb.sheet(*i).is_some_and(|s| s.visibility == Visibility::Visible)).collect()
@@ -366,6 +375,9 @@ pub fn layouts(wb: &Workbook, opts: &PrintOptions) -> Vec<SheetLayout> {
     };
     for si in sheets {
         if pages >= MAX_PAGES {
+            if let Some(l) = out.last_mut() {
+                l.cut = true;
+            }
             break;
         }
         let ovr = if si == wb.active_sheet { opts.range } else { None };
@@ -373,6 +385,9 @@ pub fn layouts(wb: &Workbook, opts: &PrintOptions) -> Vec<SheetLayout> {
             continue;
         }
         if let Some(mut l) = layout_sheet(wb, si, opts, ovr) {
+            if l.pages.len() > MAX_PAGES - pages {
+                l.cut = true;
+            }
             l.pages.truncate(MAX_PAGES - pages);
             pages += l.pages.len();
             out.push(l);
@@ -1891,7 +1906,7 @@ pub fn render_pdf_with(
 
 // ---------------------------------------------------------------- commands
 
-fn build_pdf(s: &Session, p: &Json, cmd: &str) -> Result<(Vec<u8>, usize)> {
+fn build_pdf(s: &Session, p: &Json, cmd: &str) -> Result<(Vec<u8>, usize, bool)> {
     let opts = PrintOptions::from_params(p, cmd)?;
     // WHIQ: embedded subset fonts for every string by default (the PDF looks the same on every
     // machine); `standardFonts: true` for the smallest file (PDF base fonts for WinAnsi text,
@@ -1907,7 +1922,7 @@ fn build_pdf(s: &Session, p: &Json, cmd: &str) -> Result<(Vec<u8>, usize)> {
     let lays = layouts(&d.wb, &opts);
     let total: usize = lays.iter().map(|l| l.pages.len()).sum();
     // `pages`: "3", "2-5", [2, 5] — a part of a long export.
-    let pages = match p.get("pages") {
+    let pages = match any_param(p, "pages") {
         None | Some(Json::Null) => None,
         Some(Json::Number(n)) => n.as_u64().map(|n| (n as usize, n as usize)),
         Some(Json::String(t)) => {
@@ -1931,7 +1946,9 @@ fn build_pdf(s: &Session, p: &Json, cmd: &str) -> Result<(Vec<u8>, usize)> {
         return Err(bad(cmd, format!("the export has {total} pages: ask for pages 1-{total}")));
     }
     let path = d.path.clone().unwrap_or_default();
-    Ok(render_pdf_with(&d.wb, &lays, &d.display_title(), &path, mode, pages))
+    let cut = lays.iter().any(|l| l.cut);
+    let (bytes, n) = render_pdf_with(&d.wb, &lays, &d.display_title(), &path, mode, pages);
+    Ok((bytes, n, cut))
 }
 
 // ---------------------------------------------------------------- PNG renders (WHIQ)
@@ -2078,20 +2095,33 @@ fn render_png_cmd(s: &mut Session, p: &Json) -> Result<Json> {
     Ok(out)
 }
 
-pub(crate) fn export_pdf(s: &mut Session, p: &Json) -> Result<Json> {
-    let (bytes, pages) = build_pdf(s, p, "file.exportPdf")?;
-    match str_param(p, "path").filter(|x| !x.is_empty()) {
-        Some(path) => {
-            crate::io::write_file(path, &bytes)?;
-            Ok(json!({"pages": pages, "bytes": bytes.len(), "path": path}))
-        }
-        None => Ok(json!({"pages": pages, "bytes": bytes.len(), "base64": crate::io::base64_encode(&bytes)})),
+/// The answer of a PDF that stopped at [`MAX_PAGES`] says so (item 26, B36).
+fn said_cut(out: &mut Json, cut: bool) {
+    if cut {
+        out["pages_cut"] = json!(true);
+        out["note"] = json!(format!(
+            "The PDF stops at {MAX_PAGES} pages, the most one export makes: what is printed runs to more. Set a print area, fit it to fewer pages, or print the sheets or ranges one at a time for the rest."
+        ));
     }
 }
 
+pub(crate) fn export_pdf(s: &mut Session, p: &Json) -> Result<Json> {
+    let (bytes, pages, cut) = build_pdf(s, p, "file.exportPdf")?;
+    let mut out = match str_param(p, "path").filter(|x| !x.is_empty()) {
+        Some(path) => {
+            crate::io::write_file(path, &bytes)?;
+            json!({"pages": pages, "bytes": bytes.len(), "path": path})
+        }
+        None => json!({"pages": pages, "bytes": bytes.len(), "base64": crate::io::base64_encode(&bytes)}),
+    };
+    said_cut(&mut out, cut);
+    Ok(out)
+}
+
 fn print(s: &mut Session, p: &Json) -> Result<Json> {
-    let (bytes, pages) = build_pdf(s, p, "file.print")?;
+    let (bytes, pages, cut) = build_pdf(s, p, "file.print")?;
     let mut out = json!({"pages": pages, "bytes": bytes.len(), "base64": crate::io::base64_encode(&bytes)});
+    said_cut(&mut out, cut);
     if let Some(path) = str_param(p, "path").filter(|x| !x.is_empty()) {
         crate::io::write_file(path, &bytes)?;
         out["path"] = json!(path);
@@ -2128,9 +2158,13 @@ fn print_preview(s: &mut Session, p: &Json) -> Result<Json> {
     if let Some(page) = u32_param(p, "page") {
         let one =
             list.get((page as usize).saturating_sub(1)).cloned().ok_or_else(|| bad("file.printPreview", format!("there are only {n} pages")))?;
-        return Ok(json!({"pages": n, "page": one}));
+        let mut out = json!({"pages": n, "page": one});
+        said_cut(&mut out, lays.iter().any(|l| l.cut));
+        return Ok(out);
     }
-    Ok(json!({"pages": n, "pageList": list}))
+    let mut out = json!({"pages": n, "pageList": list});
+    said_cut(&mut out, lays.iter().any(|l| l.cut));
+    Ok(out)
 }
 
 fn page_setup(s: &mut Session, p: &Json) -> Result<Json> {
@@ -2149,7 +2183,7 @@ fn page_setup(s: &mut Session, p: &Json) -> Result<Json> {
             Some(name.trim().to_string())
         }
     };
-    let margin_src = p.get("margins").filter(|m| m.is_object()).unwrap_or(p);
+    let margin_src = any_param(p, "margins").filter(|m| m.is_object()).unwrap_or(p);
     let mut margins: [Option<f32>; 6] = [None; 6];
     for (i, key) in ["left", "right", "top", "bottom", "header", "footer"].iter().enumerate() {
         if let Some(v) = f64_param(margin_src, key).or_else(|| f64_param(p, key)) {
@@ -2160,7 +2194,7 @@ fn page_setup(s: &mut Session, p: &Json) -> Result<Json> {
         }
     }
     let parse_rows = |key: &str| -> Result<Option<Option<(u32, u32)>>> {
-        match p.get(key) {
+        match any_param(p, key) {
             None => Ok(None),
             Some(Json::Null) => Ok(Some(None)),
             Some(Json::String(t)) if t.trim().is_empty() => Ok(Some(None)),
@@ -2172,7 +2206,7 @@ fn page_setup(s: &mut Session, p: &Json) -> Result<Json> {
         }
     };
     let parse_cols = |key: &str| -> Result<Option<Option<(u32, u32)>>> {
-        match p.get(key) {
+        match any_param(p, key) {
             None => Ok(None),
             Some(Json::Null) => Ok(Some(None)),
             Some(Json::String(t)) if t.trim().is_empty() => Ok(Some(None)),
@@ -2185,14 +2219,14 @@ fn page_setup(s: &mut Session, p: &Json) -> Result<Json> {
     };
     let title_rows = parse_rows("titleRows")?;
     let title_cols = parse_cols("titleCols")?;
-    let print_area = match p.get("printArea") {
+    let print_area = match any_param(p, "printArea") {
         None => None,
         Some(Json::Null) => Some(None),
         Some(Json::String(t)) if t.trim().is_empty() => Some(None),
         Some(Json::String(t)) => Some(Some(RangeRef::parse(split_sheet(t).1).ok_or_else(|| bad(CMD, format!("`printArea` is not a range: `{t}`")))?)),
         Some(_) => return Err(bad(CMD, "`printArea` must be a range like \"A1:F50\"")),
     };
-    let row_breaks: Option<Vec<u32>> = p.get("rowBreaks").and_then(Json::as_array).map(|a| {
+    let row_breaks: Option<Vec<u32>> = any_param(p, "rowBreaks").and_then(Json::as_array).map(|a| {
         let mut v: Vec<u32> = a
             .iter()
             .filter_map(|x| x.as_u64().or_else(|| x.as_str().and_then(|t| t.trim().parse().ok())))
@@ -2204,7 +2238,7 @@ fn page_setup(s: &mut Session, p: &Json) -> Result<Json> {
         v.dedup();
         v
     });
-    let col_breaks: Option<Vec<u32>> = p.get("colBreaks").and_then(Json::as_array).map(|a| {
+    let col_breaks: Option<Vec<u32>> = any_param(p, "colBreaks").and_then(Json::as_array).map(|a| {
         let mut v: Vec<u32> = a
             .iter()
             .filter_map(|x| match x {
@@ -2220,8 +2254,8 @@ fn page_setup(s: &mut Session, p: &Json) -> Result<Json> {
         v
     });
     let scale = f64_param(p, "scale").filter(|v| v.is_finite()).map(|v| v.clamp(10.0, 400.0).round() as u16);
-    let fit_w = p.get("fitWidth").map(|v| v.as_u64().unwrap_or(0).min(32767) as u16);
-    let fit_h = p.get("fitHeight").map(|v| v.as_u64().unwrap_or(0).min(32767) as u16);
+    let fit_w = any_param(p, "fitWidth").map(|v| v.as_u64().unwrap_or(0).min(32767) as u16);
+    let fit_h = any_param(p, "fitHeight").map(|v| v.as_u64().unwrap_or(0).min(32767) as u16);
     let fit_page = bool_param(p, "fitToPage");
     let header = str_param(p, "header").map(|t| t.chars().take(255).collect::<String>());
     let footer = str_param(p, "footer").map(|t| t.chars().take(255).collect::<String>());
@@ -2765,6 +2799,9 @@ mod tests {
         assert_eq!(pv["pages"].as_u64().unwrap(), MAX_PAGES as u64);
         let r = s.execute("file.exportPdf", json!({})).unwrap();
         assert_eq!(r["pages"], MAX_PAGES);
+        // (item 26, B36: the stop is said)
+        assert_eq!(r["pages_cut"], true);
+        assert!(r["note"].as_str().unwrap().starts_with("The PDF stops at 2000 pages"));
         s.execute("pageLayout.pageSetup", json!({"fitWidth": 1, "fitHeight": 1, "titleRows": "1:1048576", "titleCols": "A:XFD", "headings": true}))
             .unwrap();
         let pv = s.execute("file.printPreview", json!({})).unwrap();

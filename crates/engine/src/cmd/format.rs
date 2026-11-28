@@ -343,12 +343,12 @@ pub(crate) fn color_param(v: Option<&Json>) -> Option<Color> {
 }
 
 fn font_color(s: &mut Session, p: &Json) -> Result<Json> {
-    let c = color_param(p.get("color")).ok_or_else(|| bad("home.fontColor", "missing or invalid `color`"))?;
+    let c = color_param(any_param(p, "color")).ok_or_else(|| bad("home.fontColor", "missing or invalid `color`"))?;
     apply_style(s, p, |st| st.font.color = c)
 }
 
 fn fill_color(s: &mut Session, p: &Json) -> Result<Json> {
-    let c = color_param(p.get("color")).ok_or_else(|| bad("home.fillColor", "missing or invalid `color`"))?;
+    let c = color_param(any_param(p, "color")).ok_or_else(|| bad("home.fillColor", "missing or invalid `color`"))?;
     apply_style(s, p, |st| st.fill = if c == Color::Auto { Fill::default() } else { Fill::solid(c) })
 }
 
@@ -372,7 +372,7 @@ pub(crate) fn border_style(name: &str) -> BorderStyle {
 
 fn borders(s: &mut Session, p: &Json) -> Result<Json> {
     let preset = str_param(p, "preset").unwrap_or("bottom").to_string();
-    let color = color_param(p.get("color")).unwrap_or(Color::Auto);
+    let color = color_param(any_param(p, "color")).unwrap_or(Color::Auto);
     let base = border_style(str_param(p, "style").unwrap_or("thin"));
     let sheet = target_sheet(s, p)?;
     let ranges = target_ranges(s, p)?;
@@ -497,7 +497,7 @@ fn borders(s: &mut Session, p: &Json) -> Result<Json> {
 }
 
 fn format_cells(s: &mut Session, p: &Json) -> Result<Json> {
-    let Some(patch) = p.get("style").cloned() else {
+    let Some(patch) = any_param(p, "style").cloned() else {
         // Menu invocation without params: the UI opens the dialog.
         s.ui_requests.push(crate::UiRequest::Dialog("formatCells".into(), json!({})));
         return ok();
@@ -532,7 +532,7 @@ pub(crate) fn merge_json(mut base: Json, patch: &Json) -> Json {
 fn halign(s: &mut Session, p: &Json, a: HAlign) -> Result<Json> {
     // Clicking the active alignment again returns to General.
     let cur = active_style(s)?.align.h;
-    let a = if cur == a && p.get("on").is_none() { HAlign::General } else { a };
+    let a = if cur == a && any_param(p, "on").is_none() { HAlign::General } else { a };
     apply_style(s, p, |st| st.align.h = a)
 }
 
@@ -561,7 +561,7 @@ fn indent(s: &mut Session, p: &Json, d: i32) -> Result<Json> {
 }
 
 fn orientation(s: &mut Session, p: &Json) -> Result<Json> {
-    let angle: i16 = match p.get("angle") {
+    let angle: i16 = match any_param(p, "angle") {
         Some(Json::Number(n)) => n.as_f64().unwrap_or(0.0).clamp(-90.0, 90.0) as i16,
         Some(Json::String(t)) => match t.as_str() {
             "vertical" => 255,

@@ -115,7 +115,7 @@ pub fn specs() -> Vec<CommandSpec> {
 fn freeze_panes(s: &mut Session, p: &Json) -> Result<Json> {
     let d = s.doc()?;
     let sh = d.wb.active().ok_or(EngineError::NoDocument)?;
-    if sh.freeze.is_some() && p.get("cell").is_none() {
+    if sh.freeze.is_some() && any_param(p, "cell").is_none() {
         return set_freeze(s, None);
     }
     let at = cell_param(s, p, "cell")?.unwrap_or(d.selection.active);
@@ -251,7 +251,7 @@ fn scale_fit(s: &mut Session, p: &Json) -> Result<Json> {
             pr.scale = sc.clamp(10.0, 400.0) as u16;
             pr.fit_to = None;
         }
-        if p.get("width").is_some() || p.get("height").is_some() {
+        if any_param(p, "width").is_some() || any_param(p, "height").is_some() {
             pr.fit_to = Some((u32_param(p, "width").unwrap_or(0).min(32767) as u16, u32_param(p, "height").unwrap_or(0).min(32767) as u16));
         }
         Ok(Json::Null)
@@ -375,8 +375,7 @@ pub fn themes() -> Vec<(&'static str, [u32; 12])> {
 
 fn theme(s: &mut Session, p: &Json) -> Result<Json> {
     let name = str_param(p, "name").unwrap_or("Craft").to_string();
-    let colors = p
-        .get("colors")
+    let colors = any_param(p, "colors")
         .and_then(Json::as_array)
         .and_then(|a| {
             let v: Vec<u32> = a.iter().filter_map(|c| c.as_str().and_then(|h| u32::from_str_radix(h.trim_start_matches('#'), 16).ok())).collect();

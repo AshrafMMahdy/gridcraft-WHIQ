@@ -74,7 +74,7 @@ pub fn specs() -> Vec<CommandSpec> {
             None,
             "{range?, type?, subtype?} (no type: the first of insert.chartRecommendations; the ribbon button opens the dialog)",
             has_doc,
-            |s, p| insert_chart(s, &if p.get("type").is_some() { p.clone() } else { with(p, "type", json!("auto")) })
+            |s, p| insert_chart(s, &if any_param(p, "type").is_some() { p.clone() } else { with(p, "type", json!("auto")) })
         ),
         cmd!(
             query "insert.chartRecommendations",
@@ -221,7 +221,7 @@ fn with(p: &Json, k: &str, v: Json) -> Json {
 }
 
 fn block(s: &Session, p: &Json) -> Result<RangeRef> {
-    if p.get("range").is_some() {
+    if any_param(p, "range").is_some() {
         return target_range(s, p);
     }
     let d = s.doc()?;
@@ -842,7 +842,7 @@ fn insert_chart(s: &mut Session, p: &Json) -> Result<Json> {
             *slot = Some(t.to_string());
         }
     }
-    let specs: Vec<Json> = p.get("series").and_then(Json::as_array).cloned().unwrap_or_default();
+    let specs: Vec<Json> = any_param(p, "series").and_then(Json::as_array).cloned().unwrap_or_default();
     for (i, sp) in specs.iter().enumerate() {
         let Some(se) = chart.series.get_mut(i) else {
             return Err(bad("insert.chart", format!("`series` has {} entries but the range makes {} series", specs.len(), chart.series.len())));
@@ -946,7 +946,7 @@ fn chart_set_series(s: &mut Session, p: &Json) -> Result<Json> {
 fn find_chart(s: &Session, p: &Json) -> Result<(usize, usize)> {
     let d = s.doc()?;
     // WHIQ: `sheet` names the chart's sheet (default the active one).
-    let sheet = if p.get("sheet").is_some() { target_sheet(s, p)? } else { d.wb.active_sheet };
+    let sheet = if any_param(p, "sheet").is_some() { target_sheet(s, p)? } else { d.wb.active_sheet };
     let sh = d.wb.sheet(sheet).ok_or(EngineError::NoDocument)?;
     let idx = match u32_param(p, "chart") {
         Some(id) => sh.charts.iter().position(|c| c.id == id),
@@ -964,7 +964,7 @@ fn chart_set(s: &mut Session, p: &Json) -> Result<Json> {
         if let Some(t) = str_param(p, "type") {
             c.kind = chart_kind(t, str_param(p, "subtype").unwrap_or(""));
         }
-        if let Some(t) = p.get("title") {
+        if let Some(t) = any_param(p, "title") {
             c.title = t.as_str().map(str::to_string);
         }
         if let Some(l) = str_param(p, "legend") {
@@ -985,13 +985,13 @@ fn chart_set(s: &mut Session, p: &Json) -> Result<Json> {
         if let Some(v) = u32_param(p, "style") {
             c.style = v.clamp(1, 16);
         }
-        if let Some(t) = p.get("xTitle") {
+        if let Some(t) = any_param(p, "xTitle") {
             c.x_title = t.as_str().map(str::to_string);
         }
-        if let Some(t) = p.get("yTitle") {
+        if let Some(t) = any_param(p, "yTitle") {
             c.y_title = t.as_str().map(str::to_string);
         }
-        if let Some(t) = p.get("y2Title").or_else(|| p.get("y2_title")) {
+        if let Some(t) = any_param(p, "y2Title").or_else(|| any_param(p, "y2_title")) {
             c.y2_title = t.as_str().map(str::to_string);
         }
         if let Some(at) = at {
@@ -1239,8 +1239,8 @@ fn insert_shape(s: &mut Session, p: &Json) -> Result<Json> {
     let id = d.wb.next_object_id();
     let at = cell_param(s, p, "at")?.unwrap_or(d.selection.active);
     let fill =
-        super::format::color_param(p.get("fill")).unwrap_or(if kind == ShapeKind::TextBox { Color::rgb(255, 255, 255) } else { Color::Theme(4, 0) });
-    let line = super::format::color_param(p.get("line")).unwrap_or(if kind == ShapeKind::TextBox {
+        super::format::color_param(any_param(p, "fill")).unwrap_or(if kind == ShapeKind::TextBox { Color::rgb(255, 255, 255) } else { Color::Theme(4, 0) });
+    let line = super::format::color_param(any_param(p, "line")).unwrap_or(if kind == ShapeKind::TextBox {
         Color::rgb(0x80, 0x80, 0x80)
     } else {
         Color::Theme(4, -250)
@@ -1273,7 +1273,7 @@ const SHAPE_TEXT_MAX_CHARS: usize = 32_767;
 
 fn shape_set_text(s: &mut Session, p: &Json) -> Result<Json> {
     let id =
-        p.get("id").and_then(Json::as_u64).and_then(|id| u32::try_from(id).ok()).ok_or_else(|| bad("shape.setText", "`id` must be a text box id"))?;
+        any_param(p, "id").and_then(Json::as_u64).and_then(|id| u32::try_from(id).ok()).ok_or_else(|| bad("shape.setText", "`id` must be a text box id"))?;
     let text = str_param(p, "text").ok_or_else(|| bad("shape.setText", "`text` must be a string"))?;
     if text.chars().nth(SHAPE_TEXT_MAX_CHARS).is_some() {
         return Err(bad("shape.setText", "`text` is longer than 32,767 characters"));
@@ -1560,7 +1560,7 @@ fn preset_style(name: &str) -> Style {
 fn add_cf(s: &mut Session, p: &Json) -> Result<Json> {
     let ranges = target_ranges(s, p)?;
     let sheet = target_sheet(s, p)?;
-    let Some(rule) = p.get("rule") else {
+    let Some(rule) = any_param(p, "rule") else {
         s.ui_requests.push(crate::UiRequest::Dialog("newFormattingRule".into(), json!({})));
         return ok();
     };
@@ -1698,7 +1698,7 @@ fn clear_cf(s: &mut Session, p: &Json) -> Result<Json> {
 
 fn manage_cf(s: &mut Session, p: &Json) -> Result<Json> {
     let sheet = target_sheet(s, p)?;
-    if p.get("delete").is_none() && p.get("moveUp").is_none() && p.get("moveDown").is_none() {
+    if any_param(p, "delete").is_none() && any_param(p, "moveUp").is_none() && any_param(p, "moveDown").is_none() {
         let list: Vec<Json> = s
             .doc()?
             .wb
@@ -1741,7 +1741,7 @@ fn insert_icon(s: &mut Session, p: &Json) -> Result<Json> {
     let d = s.doc()?;
     let id = d.wb.next_object_id();
     let at = cell_param(s, p, "at")?.unwrap_or(d.selection.active);
-    let color = super::format::color_param(p.get("color")).unwrap_or(Color::Theme(1, 0));
+    let color = super::format::color_param(any_param(p, "color")).unwrap_or(Color::Theme(1, 0));
     let shape = Shape {
         id,
         kind: ShapeKind::Icon,

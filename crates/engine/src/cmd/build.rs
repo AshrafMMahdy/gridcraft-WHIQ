@@ -77,7 +77,7 @@ fn target(key: &str, first_data_row: u32, last_row: u32) -> Option<RangeRef> {
 }
 
 fn build(s: &mut Session, p: &Json) -> Result<Json> {
-    let sheets = p.get("sheets").and_then(Json::as_array).filter(|a| !a.is_empty()).ok_or_else(|| {
+    let sheets = any_param(p, "sheets").and_then(Json::as_array).filter(|a| !a.is_empty()).ok_or_else(|| {
         bad(CMD, "missing `sheets`: give at least one sheet, e.g. {\"sheets\": [{\"name\": \"Data\", \"header\": [\"Item\", \"Qty\"], \"rows\": [[\"Bolts\", 12]]}]}")
     })?;
     let mut total: u64 = 0;
@@ -134,7 +134,7 @@ fn fill(s: &mut Session, p: &Json, sheets: &[Json], names: &[String]) -> Result<
         out_sheets.push(fill_sheet(s, spec, p, name, &mut charts)?);
     }
     // Charts listed at the top level name their sheet (the platform's chart specs).
-    for (k, c) in p.get("charts").and_then(Json::as_array).into_iter().flatten().enumerate() {
+    for (k, c) in any_param(p, "charts").and_then(Json::as_array).into_iter().flatten().enumerate() {
         let sheet = str_param(c, "sheet").map(str::to_string).or_else(|| names.first().cloned()).unwrap_or_default();
         let Some(i) = names.iter().position(|n| n.eq_ignore_ascii_case(&sheet)) else {
             return Err(bad(CMD, format!("chart {}: there is no sheet `{sheet}` (sheets: {})", k + 1, names.join(", "))));
@@ -147,7 +147,7 @@ fn fill(s: &mut Session, p: &Json, sheets: &[Json], names: &[String]) -> Result<
     let mut props = Map::new();
     for (k, key) in [("title", "title"), ("author", "author"), ("company", "company"), ("subject", "subject"), ("last_modified_by", "lastModifiedBy")]
     {
-        if let Some(v) = p.get(k).and_then(Json::as_str) {
+        if let Some(v) = any_param(p, k).and_then(Json::as_str) {
             props.insert(key.into(), json!(v));
         }
     }
@@ -178,7 +178,7 @@ fn fill(s: &mut Session, p: &Json, sheets: &[Json], names: &[String]) -> Result<
 fn fill_sheet(s: &mut Session, spec: &Json, top: &Json, name: &str, charts: &mut usize) -> Result<Json> {
     let step = |what: &str| format!("sheet {name}, {what}");
     // WHIQ: how string cells are read (typed input, or literal text with ISO dates as dates).
-    let flag = |k: &str| spec.get(k).or_else(|| top.get(k)).and_then(Json::as_bool);
+    let flag = |k: &str| spec.get(k).or_else(|| any_param(top, k)).and_then(Json::as_bool);
     let mode = CellMode { literal: flag("literal_strings").unwrap_or(false), iso_dates: flag("iso_dates").unwrap_or(true) };
     let sys = s.doc()?.wb.date_system;
     let start = match str_param(spec, "start") {

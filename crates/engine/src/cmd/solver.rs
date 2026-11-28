@@ -176,7 +176,7 @@ impl Default for EvoOptions {
 
 fn evo_options(p: &Json) -> EvoOptions {
     let d = EvoOptions::default();
-    let num = |k: &str| p.get(k).and_then(Json::as_f64).or_else(|| str_param(p, k).and_then(num_text)).filter(|v| v.is_finite());
+    let num = |k: &str| any_param(p, k).and_then(Json::as_f64).or_else(|| str_param(p, k).and_then(num_text)).filter(|v| v.is_finite());
     EvoOptions {
         population: num("populationSize").map_or(d.population, |v| v.clamp(MIN_POPULATION as f64, MAX_POPULATION as f64) as usize),
         mutation: num("mutationRate").map_or(d.mutation, |v| v.clamp(0.0, 1.0)),
@@ -334,7 +334,7 @@ fn parse_model(s: &Session, p: &Json) -> Result<Model> {
     }
     let mut cons = Vec::new();
     let mut scalar = 0usize;
-    if let Some(list) = p.get("constraints") {
+    if let Some(list) = any_param(p, "constraints") {
         let list = list.as_array().ok_or_else(|| bad(CMD, "`constraints` must be an array"))?;
         if list.len() > MAX_CONSTRAINTS {
             return Err(EngineError::Other(format!("Too many constraints (at most {MAX_CONSTRAINTS}).")));
@@ -1632,7 +1632,7 @@ impl ReportKind {
 
 /// The `reports` list (`None` when absent).
 fn report_kinds(cmd: &'static str, p: &Json) -> Result<Option<Vec<ReportKind>>> {
-    let Some(list) = p.get("reports") else { return Ok(None) };
+    let Some(list) = any_param(p, "reports") else { return Ok(None) };
     let list = list.as_array().ok_or_else(|| bad(cmd, "`reports` must be an array of answer and limits"))?;
     let mut kinds = Vec::new();
     for k in list {
@@ -1931,7 +1931,7 @@ fn report(s: &mut Session, p: &Json) -> Result<Json> {
     }
     let d = s.doc()?;
     // The given model as is, else the saved model with any params given here over it.
-    let params = match p.get("model") {
+    let params = match any_param(p, "model") {
         Some(m @ Json::Object(_)) => m.clone(),
         Some(Json::Null) | None => {
             let mut params = saved_model(&d.wb, d.wb.active_sheet).unwrap_or_else(|| json!({}));
@@ -1952,7 +1952,7 @@ fn report(s: &mut Session, p: &Json) -> Result<Json> {
     // `{cell: number}` maps; cells they leave out keep their current values.
     let point = |key: &str| -> Result<Vec<f64>> {
         let mut x = current.clone();
-        let Some(map) = p.get(key) else { return Ok(x) };
+        let Some(map) = any_param(p, key) else { return Ok(x) };
         let map = map.as_object().ok_or_else(|| bad(REPORT_CMD, format!("`{key}` must map cells to numbers")))?;
         for (cell, v) in map {
             let c = CellRef::parse(&cell.replace('$', "")).ok_or_else(|| bad(REPORT_CMD, format!("not a cell: `{cell}`")))?;
@@ -1965,7 +1965,7 @@ fn report(s: &mut Session, p: &Json) -> Result<Json> {
         Ok(x)
     };
     let solution = point("values")?;
-    let original = if p.get("original").is_some() { point("original")? } else { solution.clone() };
+    let original = if any_param(p, "original").is_some() { point("original")? } else { solution.clone() };
     let budget = params
         .get("maxEvaluations")
         .and_then(Json::as_f64)

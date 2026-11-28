@@ -207,6 +207,11 @@ impl Headless {
                 if !(p.is_object() || p.is_null()) {
                     return Err(format!("engine.execute: `params` of `{id}` must be an object"));
                 }
+                // WHIQ (item 26, fault B54): `unread_refused` (execute_command, a batch's command): a parameter the command never
+                // read (unknown or misspelt) refuses the call too
+                if params.get("unread_refused").and_then(Value::as_bool) == Some(true) {
+                    return self.session.execute_headless_all_read(&id, p).map_err(|e| e.to_string());
+                }
                 self.execute(&id, p)
             }
             "engine.commands" => Ok(self.commands(&params)),

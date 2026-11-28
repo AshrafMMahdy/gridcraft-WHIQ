@@ -132,7 +132,7 @@ fn col_param(v: Option<&Json>, base: u32) -> Option<u32> {
 fn data_range(s: &Session, p: &Json) -> Result<RangeRef> {
     let d = s.doc()?;
     let sh = d.wb.active().ok_or(EngineError::NoDocument)?;
-    if p.get("range").is_some() {
+    if any_param(p, "range").is_some() {
         return target_range(s, p);
     }
     if let Some(t) = sh.table_at(d.selection.active) {
@@ -184,7 +184,7 @@ struct SortKey {
 
 fn quick_sort(s: &mut Session, p: &Json, asc: bool) -> Result<Json> {
     let r = data_range(s, p)?;
-    let col = col_param(p.get("column"), r.start.col).unwrap_or(s.doc()?.selection.active.col).clamp(r.start.col, r.end.col);
+    let col = col_param(any_param(p, "column"), r.start.col).unwrap_or(s.doc()?.selection.active.col).clamp(r.start.col, r.end.col);
     let d = s.doc()?;
     let sh = d.wb.active().ok_or(EngineError::NoDocument)?;
     let header = guess_header(&d.wb, sh, r);
@@ -199,7 +199,7 @@ fn sort(s: &mut Session, p: &Json) -> Result<Json> {
     let by_cols = str_param(p, "orientation") == Some("columns");
     let case = bool_param(p, "matchCase").unwrap_or(false);
     let mut keys: Vec<SortKey> = Vec::new();
-    for k in p.get("keys").and_then(Json::as_array).map(Vec::as_slice).unwrap_or_default() {
+    for k in any_param(p, "keys").and_then(Json::as_array).map(Vec::as_slice).unwrap_or_default() {
         let col = if by_cols {
             let row = match k.get("row").and_then(Json::as_u64) {
                 // Worksheet rows are 1-based; 0 (or a value past u32) has no coordinate.
@@ -476,7 +476,7 @@ fn install_filter(s: &mut Session, p: &Json) -> Result<Json> {
     let sheet = s.doc()?.wb.active_sheet;
     let mut r = data_range(s, p)?;
     // A selected header row filters the data below it (#201).
-    if p.get("range").is_none() && r.height() == 1 {
+    if any_param(p, "range").is_none() && r.height() == 1 {
         let d = s.doc()?;
         let sh = d.wb.active().ok_or(EngineError::NoDocument)?;
         let below = current_region(sh, r.start).end.row;
@@ -500,10 +500,10 @@ fn filter_by(s: &mut Session, p: &Json) -> Result<Json> {
             s.doc()?.wb.sheet(sheet).and_then(|sh| sh.autofilter.clone()).ok_or_else(|| EngineError::Other("no filter".into()))?
         }
     };
-    let col = match col_param(p.get("column"), af.range.start.col) {
+    let col = match col_param(any_param(p, "column"), af.range.start.col) {
         Some(c) => c,
         // A number too large to be a column is outside the filter range, not a missing parameter.
-        None if p.get("column").is_some_and(|v| v.as_u64().is_some()) => return Err(bad("data.filterBy", "column outside the filter range")),
+        None if any_param(p, "column").is_some_and(|v| v.as_u64().is_some()) => return Err(bad("data.filterBy", "column outside the filter range")),
         None => return Err(bad("data.filterBy", "missing `column`")),
     };
     if col < af.range.start.col || col > af.range.end.col {
@@ -512,16 +512,16 @@ fn filter_by(s: &mut Session, p: &Json) -> Result<Json> {
     let off = col - af.range.start.col;
     let crit = if bool_param(p, "clear").unwrap_or(false) {
         None
-    } else if let Some(vals) = p.get("values").and_then(Json::as_array) {
+    } else if let Some(vals) = any_param(p, "values").and_then(Json::as_array) {
         Some(FilterCriterion::Values {
             values: vals.iter().map(super::edit::json_to_input).collect(),
             blanks: bool_param(p, "blanks").unwrap_or(false),
         })
-    } else if let Some(c) = p.get("custom") {
+    } else if let Some(c) = any_param(p, "custom") {
         let a = (c.get("op").and_then(Json::as_str).unwrap_or("=").to_string(), c.get("value").map(super::edit::json_to_input).unwrap_or_default());
         let b = c.get("op2").and_then(Json::as_str).map(|o| (o.to_string(), c.get("value2").map(super::edit::json_to_input).unwrap_or_default()));
         Some(FilterCriterion::Custom { a, b, and: c.get("and").and_then(Json::as_bool).unwrap_or(true) })
-    } else if let Some(t) = p.get("top") {
+    } else if let Some(t) = any_param(p, "top") {
         Some(FilterCriterion::Top10 {
             bottom: t.get("bottom").and_then(Json::as_bool).unwrap_or(false),
             percent: t.get("percent").and_then(Json::as_bool).unwrap_or(false),
@@ -743,8 +743,7 @@ fn remove_duplicates(s: &mut Session, p: &Json) -> Result<Json> {
     // columns compared a million blank rows and reported them as removed duplicates).
     let r = sh.used_range().and_then(|u| r.intersection(&u)).unwrap_or(RangeRef::cell(r.start));
     let header = bool_param(p, "header").unwrap_or_else(|| guess_header(&d.wb, sh, r));
-    let cols: Vec<u32> = p
-        .get("columns")
+    let cols: Vec<u32> = any_param(p, "columns")
         .and_then(Json::as_array)
         .map(|a| a.iter().filter_map(|c| col_param(Some(c), r.start.col)).collect())
         .unwrap_or_else(|| (r.start.col..=r.end.col).collect());
@@ -802,8 +801,7 @@ fn remove_duplicates(s: &mut Session, p: &Json) -> Result<Json> {
 fn text_to_columns(s: &mut Session, p: &Json) -> Result<Json> {
     let r = target_range(s, p)?;
     let sheet = target_sheet(s, p)?;
-    let mut delims: Vec<char> = p
-        .get("delimiters")
+    let mut delims: Vec<char> = any_param(p, "delimiters")
         .and_then(Json::as_array)
         .map(|a| a.iter().filter_map(|d| d.as_str().and_then(|x| x.chars().next())).collect())
         .unwrap_or_else(|| vec!['\t']);
@@ -811,7 +809,7 @@ fn text_to_columns(s: &mut Session, p: &Json) -> Result<Json> {
         delims.push(o);
     }
     let fixed: Option<Vec<usize>> =
-        p.get("fixedWidths").and_then(Json::as_array).map(|a| a.iter().filter_map(|x| x.as_u64().map(|v| v as usize)).collect());
+        any_param(p, "fixedWidths").and_then(Json::as_array).map(|a| a.iter().filter_map(|x| x.as_u64().map(|v| v as usize)).collect());
     let consecutive = bool_param(p, "treatConsecutive").unwrap_or(false);
     let quote = str_param(p, "textQualifier").and_then(|q| q.chars().next()).unwrap_or('"');
     let dest = cell_param_on(s, p, "destination", sheet)?.unwrap_or(r.start);
@@ -1173,7 +1171,7 @@ fn group(s: &mut Session, p: &Json, on: bool) -> Result<Json> {
 /// + button, saved to XLSX); showing keeps inner groups that were collapsed on their own collapsed.
 fn detail(s: &mut Session, p: &Json, hide: bool) -> Result<Json> {
     let (rows, a, b) = outline_lines(s, p)?;
-    let want = p.get("level").and_then(Json::as_u64).map(|l| l.min(outline::MAX_LEVEL as u64) as u8);
+    let want = any_param(p, "level").and_then(Json::as_u64).map(|l| l.min(outline::MAX_LEVEL as u64) as u8);
     edit(s, |cx| {
         let si = cx.sheet_index();
         let sh = cx.sheet_mut(si)?;
@@ -1216,7 +1214,7 @@ fn detail(s: &mut Session, p: &Json, hide: bool) -> Result<Json> {
 /// The outline's level buttons: show rows / columns down to outline level `n` (1 = only the
 /// top-level summaries); deeper detail is hidden and its summary lines marked collapsed.
 fn show_levels(s: &mut Session, p: &Json) -> Result<Json> {
-    let level = |k: &str| p.get(k).and_then(Json::as_u64).map(|n| n.clamp(1, outline::MAX_LEVEL as u64 + 1) as u8);
+    let level = |k: &str| any_param(p, k).and_then(Json::as_u64).map(|n| n.clamp(1, outline::MAX_LEVEL as u64 + 1) as u8);
     let (rows, cols) = (level("rows"), level("cols"));
     if rows.is_none() && cols.is_none() {
         return Err(EngineError::BadParams {
@@ -1246,7 +1244,7 @@ fn show_levels(s: &mut Session, p: &Json) -> Result<Json> {
 
 fn subtotal(s: &mut Session, p: &Json) -> Result<Json> {
     let r = data_range(s, p)?;
-    let group_col = col_param(p.get("groupBy"), r.start.col).unwrap_or(r.start.col);
+    let group_col = col_param(any_param(p, "groupBy"), r.start.col).unwrap_or(r.start.col);
     let func = str_param(p, "function").unwrap_or("sum");
     let code = match func {
         "count" => 3,
@@ -1256,8 +1254,7 @@ fn subtotal(s: &mut Session, p: &Json) -> Result<Json> {
         "product" => 6,
         _ => 9,
     };
-    let cols: Vec<u32> = p
-        .get("columns")
+    let cols: Vec<u32> = any_param(p, "columns")
         .and_then(Json::as_array)
         .map(|a| a.iter().filter_map(|c| col_param(Some(c), r.start.col)).collect())
         .unwrap_or_else(|| vec![r.end.col]);

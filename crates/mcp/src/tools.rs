@@ -400,7 +400,7 @@ fn base_definitions() -> Vec<Value> {
             "open_workbook",
             "Open workbook",
             "Open a workbook file (.xlsx, .xlsm, .xls, .xlsb, .ods, .csv, .tsv, .txt, .json) and make it active. Excel 97-2003 .xls imports values, formulas and number formats; XLSB and ODS import worksheet data and cached formula values only; check the returned warnings.",
-            obj(json!({"path": string("File path")}), &["path"]),
+            obj(json!({"path": string("File path"), "password": string("The password of a password-protected workbook (xlsx, xlsm, xls)")}), &["path"]),
             SET,
         ),
         tool(
@@ -521,6 +521,61 @@ pub(crate) fn check_arguments(name: &str, args: &Value) -> Result<(), String> {
         if (p["oneOf"].is_array() || p["items"]["oneOf"].is_array()) && !schema_matches(p, v) {
             return Err(format!("{name}: argument `{k}` does not match the schema: {}", p["description"]));
         }
+        bounds(name, k, p, v)?;
+    }
+    Ok(())
+}
+
+/// WHIQ (item 26, fault A28): the bounds a schema states are checked (they were promised and nobody checked them, so a negative row
+/// was read as absent, a font size past 409 clamped): a number's minimum / maximum (exclusive too), an array's minItems / maxItems,
+/// inside objects and array items as well.
+fn bounds(name: &str, at: &str, p: &Value, v: &Value) -> Result<(), String> {
+    if let Some(n) = v.as_f64() {
+        let shown = v.to_string();
+        if let Some(m) = p["minimum"].as_f64()
+            && n < m
+        {
+            return Err(format!("{name}: `{at}` must be {m} or more (got {shown})"));
+        }
+        if let Some(m) = p["exclusiveMinimum"].as_f64()
+            && n <= m
+        {
+            return Err(format!("{name}: `{at}` must be more than {m} (got {shown})"));
+        }
+        if let Some(m) = p["maximum"].as_f64()
+            && n > m
+        {
+            return Err(format!("{name}: `{at}` must be {m} or less (got {shown})"));
+        }
+        if let Some(m) = p["exclusiveMaximum"].as_f64()
+            && n >= m
+        {
+            return Err(format!("{name}: `{at}` must be less than {m} (got {shown})"));
+        }
+    }
+    if let Some(items) = v.as_array() {
+        if let Some(m) = p["minItems"].as_u64()
+            && (items.len() as u64) < m
+        {
+            return Err(format!("{name}: `{at}` must list at least {m} item{} (got {})", if m == 1 { "" } else { "s" }, items.len()));
+        }
+        if let Some(m) = p["maxItems"].as_u64()
+            && items.len() as u64 > m
+        {
+            return Err(format!("{name}: `{at}` must list at most {m} items (got {})", items.len()));
+        }
+        if p["items"].is_object() && !p["items"]["oneOf"].is_array() {
+            for (i, x) in items.iter().enumerate() {
+                bounds(name, &format!("{at}[{i}]"), &p["items"], x)?;
+            }
+        }
+    }
+    if let (Some(o), Some(props)) = (v.as_object(), p["properties"].as_object()) {
+        for (k, x) in o {
+            if let Some(q) = props.get(k) {
+                bounds(name, &format!("{at}.{k}"), q, x)?;
+            }
+        }
     }
     Ok(())
 }
@@ -615,21 +670,37 @@ fn sort_range(b: &mut dyn Backend, a: &Args) -> Result<Value, String> {
     if keys.is_empty() {
         return Err("`keys` needs at least one sort level".into());
     }
+    // WHIQ (item 26, fault B17): a key whose column is not a column letter, or whose order is not asc / desc, is refused (the engine
+    // skipped such a key, and with none left queued a Sort dialog and answered ok, having sorted nothing)
+    let column = |c: &str| -> Result<String, String> {
+        let t = c.trim();
+        match gridcraft_engine::core::letters_to_col(t.trim_start_matches('$')) {
+            Some(_) => Ok(t.to_string()),
+            None => Err(format!("sort key column \"{c}\" is not a column letter (e.g. \"B\")")),
+        }
+    };
     let mut norm = Vec::with_capacity(keys.len());
     for k in keys {
         norm.push(match k {
             Value::String(c) => {
                 // "B" or "B desc"
                 let mut it = c.split_whitespace();
-                let col = it.next().unwrap_or_default();
+                let col = column(it.next().unwrap_or_default())?;
                 let order = match it.next().map(str::to_ascii_lowercase).as_deref() {
+                    None | Some("asc" | "ascending") => "asc",
                     Some("desc" | "descending") => "desc",
-                    _ => "asc",
+                    Some(x) => return Err(format!("sort key \"{c}\": the order after the column must be asc or desc (got \"{x}\")")),
                 };
+                if it.next().is_some() {
+                    return Err(format!("sort key \"{c}\": give a column and an order only, e.g. \"B desc\""));
+                }
                 json!({"column": col, "order": order})
             }
             Value::Object(o) => {
                 let mut o = o.clone();
+                let col = column(o.get("column").and_then(Value::as_str).ok_or("each sort key object needs `column` (a column letter)")?)?;
+                o.insert("column".into(), json!(col));
+                // AGREED LIMIT (owner, 2026-11-28): ascending when a key gives no order — the sort order of a key — why: item 26 rule 4, "Defaults - agreed", Excel's own default — arbitrary by agreement.
                 o.entry("order").or_insert(json!("asc"));
                 Value::Object(o)
             }
@@ -713,10 +784,20 @@ pub(crate) fn dispatch(b: &mut dyn Backend, name: &str, a: &Args) -> Result<Valu
             }
             exec(b, "insert.chart", p)
         }
-        "create_table" => exec(b, "insert.table", pick(a, &["range", "style", "header", "name"])),
+        // WHIQ (item 26, fault B15): `header` left out is true, as the tool says (the engine guesses like Excel's dialog, and a first row
+        // holding one number was guessed headerless: a Column1… row was inserted and the data pushed down)
+        "create_table" => {
+            let mut p = pick(a, &["range", "style", "header", "name"]);
+            if p.get("header").is_none_or(Value::is_null)
+                && let Some(o) = p.as_object_mut()
+            {
+                o.insert("header".into(), json!(true));
+            }
+            exec(b, "insert.table", p)
+        }
         "sort_range" => sort_range(b, a),
         "filter" => filter(b, a),
-        "open_workbook" => exec(b, "file.open", pick(a, &["path"])),
+        "open_workbook" => exec(b, "file.open", pick(a, &["path", "password"])),
         "save_workbook" => save_workbook(b, a),
         "new_workbook" => exec(b, "file.new", pick(a, &["sample"])),
         "undo" => exec(b, "edit.undo", pick(a, &["steps"])),

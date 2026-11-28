@@ -64,7 +64,7 @@ fn list_comments(s: &mut Session, p: &Json) -> Result<Json> {
 
 /// A 1-based row number (`0` and `1` both mean the first row).
 fn row_param(p: &Json, key: &str) -> Option<u32> {
-    match p.get(key)? {
+    match any_param(p, key)? {
         Json::Number(n) => n.as_u64().map(|v| (v.max(1) - 1).min(u64::from(gridcraft_core::MAX_ROWS - 1)) as u32),
         Json::String(s) => s.trim().parse::<u64>().ok().map(|v| (v.max(1) - 1).min(u64::from(gridcraft_core::MAX_ROWS - 1)) as u32),
         _ => None,
@@ -73,7 +73,7 @@ fn row_param(p: &Json, key: &str) -> Option<u32> {
 
 /// A 1-based column number or letters (`"C"` = 3).
 fn col_param(p: &Json, key: &str) -> Option<u32> {
-    match p.get(key)? {
+    match any_param(p, key)? {
         Json::Number(n) => n.as_u64().map(|v| (v.max(1) - 1).min(u64::from(gridcraft_core::MAX_COLS - 1)) as u32),
         Json::String(s) => {
             let t = s.trim();
@@ -87,7 +87,7 @@ fn col_param(p: &Json, key: &str) -> Option<u32> {
 }
 
 fn count_param(p: &Json, key: &str) -> Option<u32> {
-    match p.get(key)? {
+    match any_param(p, key)? {
         Json::Number(n) => n.as_u64().map(|v| v.clamp(1, u64::from(u32::MAX)) as u32),
         Json::String(s) => s.trim().parse::<u64>().ok().map(|v| v.clamp(1, u64::from(u32::MAX)) as u32),
         _ => None,
@@ -97,7 +97,7 @@ fn count_param(p: &Json, key: &str) -> Option<u32> {
 /// The sheet a call names (by name in any case, or index); `None` when it names none.
 fn sheet_param(s: &Session, p: &Json, cmd: &str) -> Result<Option<usize>> {
     let d = s.doc()?;
-    match p.get("sheet") {
+    match any_param(p, "sheet") {
         None | Some(Json::Null) => Ok(None),
         Some(Json::Number(n)) => {
             let i = n.as_u64().unwrap_or(u64::MAX) as usize;
@@ -133,7 +133,7 @@ fn preview_html(s: &mut Session, p: &Json) -> Result<Json> {
         format,
         headings: bool_param(p, "headings").unwrap_or(true),
         other_sheets: bool_param(p, "other_sheets").unwrap_or(true),
-        max_cells: p.get("max_cells").and_then(Json::as_u64).unwrap_or(crate::preview::DEFAULT_MAX_CELLS),
+        max_cells: any_param(p, "max_cells").and_then(Json::as_u64).unwrap_or(crate::preview::DEFAULT_MAX_CELLS),
         title: str_param(p, "title").map(str::to_string).unwrap_or_else(|| d.display_title()),
     };
     let mut v = crate::preview::render(&d.wb, &o).map_err(|e| bad(CMD, e))?;
@@ -159,7 +159,7 @@ fn sheet_markdown(s: &mut Session, p: &Json) -> Result<Json> {
         row_count: count_param(p, "row_count"),
         col_start: col_param(p, "col_start"),
         col_count: count_param(p, "col_count"),
-        max_bytes: p.get("max_bytes").and_then(Json::as_u64).map_or(262_144, |v| v.clamp(1024, 64 << 20) as usize),
+        max_bytes: any_param(p, "max_bytes").and_then(Json::as_u64).map_or(262_144, |v| v.clamp(1024, 64 << 20) as usize),
         formulas: bool_param(p, "formulas").unwrap_or(false),
         keep_empty_rows: bool_param(p, "keep_empty_rows").unwrap_or(false),
     };

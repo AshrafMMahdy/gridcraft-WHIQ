@@ -405,7 +405,7 @@ fn quick_layout(s: &mut Session, p: &Json) -> Result<Json> {
 
 fn change_colors(s: &mut Session, p: &Json) -> Result<Json> {
     let explicit: Option<Vec<Color>> =
-        p.get("colors").and_then(Json::as_array).map(|a| a.iter().filter_map(|c| c.as_str().and_then(Color::from_hex)).collect());
+        any_param(p, "colors").and_then(Json::as_array).map(|a| a.iter().filter_map(|c| c.as_str().and_then(Color::from_hex)).collect());
     let palette = str_param(p, "palette").unwrap_or("colorful").to_string();
     with_chart(s, p, |c| {
         for (i, se) in c.series.iter_mut().enumerate() {
@@ -464,8 +464,7 @@ fn select_data(s: &mut Session, p: &Json) -> Result<Json> {
             Some(Some(format!("{}!{}:{}", gridcraft_formula::quote_sheet(&name), abs(r.start), abs(r.end))))
         }
     };
-    let mut remove: Vec<usize> = p
-        .get("removeSeries")
+    let mut remove: Vec<usize> = any_param(p, "removeSeries")
         .and_then(Json::as_array)
         .map(|a| a.iter().filter_map(Json::as_u64).filter_map(|i| usize::try_from(i).ok()).collect())
         .unwrap_or_default();
@@ -497,7 +496,7 @@ fn select_data(s: &mut Session, p: &Json) -> Result<Json> {
 
 fn move_chart(s: &mut Session, p: &Json) -> Result<Json> {
     let (si, ci) = find_chart(s, p)?;
-    let target = match p.get("sheet").and_then(Json::as_str) {
+    let target = match any_param(p, "sheet").and_then(Json::as_str) {
         Some(n) => Some(s.doc()?.wb.sheet_index(n).ok_or_else(|| bad("chart.move", "no such sheet"))?),
         None => None,
     };
@@ -620,7 +619,7 @@ fn anchors_of<'a>(sh: &'a mut Sheet, kind: &str) -> Vec<(u32, &'a mut Anchor)> {
 fn align(s: &mut Session, p: &Json) -> Result<Json> {
     let kind = str_param(p, "kind").unwrap_or("shape").to_string();
     let ids: Vec<u32> =
-        p.get("ids").and_then(Json::as_array).map(|a| a.iter().filter_map(|v| v.as_u64().map(|x| x as u32)).collect()).unwrap_or_default();
+        any_param(p, "ids").and_then(Json::as_array).map(|a| a.iter().filter_map(|v| v.as_u64().map(|x| x as u32)).collect()).unwrap_or_default();
     let how = str_param(p, "align").unwrap_or("left").to_string();
     let si = s.doc()?.wb.active_sheet;
     edit(s, |cx| {
@@ -957,7 +956,7 @@ fn record(s: &mut Session, p: &Json) -> Result<Json> {
 
 fn new_script(s: &mut Session, p: &Json) -> Result<Json> {
     let name = str_param(p, "name").ok_or_else(|| bad("automate.newScript", "missing `name`"))?.to_string();
-    let cmds = p.get("commands").cloned().unwrap_or(json!([]));
+    let cmds = any_param(p, "commands").cloned().unwrap_or(json!([]));
     if !cmds.is_array() {
         return Err(bad("automate.newScript", "`commands` must be an array"));
     }
@@ -1092,7 +1091,7 @@ fn theme_colors(s: &mut Session, p: &Json) -> Result<Json> {
 fn theme_fonts(s: &mut Session, p: &Json) -> Result<Json> {
     let name = s.doc()?.wb.theme.name.clone();
     let colors: Vec<String> = s.doc()?.wb.theme.colors.iter().map(|c| format!("#{c:06X}")).collect();
-    s.execute("pageLayout.theme", json!({"name": name, "colors": colors, "majorFont": p.get("major"), "minorFont": p.get("minor")}))
+    s.execute("pageLayout.theme", json!({"name": name, "colors": colors, "majorFont": any_param(p, "major"), "minorFont": any_param(p, "minor")}))
 }
 
 fn background(s: &mut Session, p: &Json) -> Result<Json> {
@@ -1143,7 +1142,7 @@ fn recently_used(s: &mut Session, _: &Json) -> Result<Json> {
         if id != "cell.set" {
             continue;
         }
-        let input = p.get("input").and_then(Json::as_str).unwrap_or("");
+        let input = any_param(p, "input").and_then(Json::as_str).unwrap_or("");
         if let Ok(e) = gridcraft_formula::parse(input.trim_start_matches('=')) {
             for f in e.functions() {
                 if !seen.iter().any(|x| x == f) {

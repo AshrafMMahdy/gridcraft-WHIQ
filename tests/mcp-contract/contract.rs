@@ -289,6 +289,114 @@ fn evicted_work_is_recovered() {
     assert_eq!(m.err("get_cell", json!({"cell": "C1"}))["code"], "evicted");
 }
 
+/// WHIQ (item 26, fault A21): an auto-save that fails is said — the work is lost — and a save after it is refused, never a copy
+/// of the unchanged original reported as saved.
+#[test]
+fn a_failed_auto_save_says_the_work_is_lost_and_refuses_the_save() {
+    let dir = folder("evict-lost");
+    let mut m = start(&dir, &["--idle-evict-secs", "1"]);
+    m.ok("write_range", json!({"range": "A1", "values": [["not saved anywhere"]]}));
+    // the write root is no longer a folder: the auto-save cannot be written
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::write(&dir, b"a file where the folder was").unwrap();
+    std::thread::sleep(Duration::from_millis(2200));
+    let e = m.err("read_range", json!({"range": "A1"}));
+    assert_eq!(e["code"], "evicted", "{e}");
+    let reason = e["reason"].as_str().unwrap();
+    assert!(reason.contains("could NOT be auto-saved") && reason.contains("are lost") && !reason.contains("no unsaved changes"), "{e}");
+    assert!(e.get("recovered_path").is_none(), "{e}");
+    assert!(e["next_step"].as_str().unwrap().starts_with("tell the user"), "{e}");
+    let out = std::env::temp_dir().join(format!("gc-lost-{}.xlsx", std::process::id()));
+    let s = m.err("save_workbook", json!({"path": out.to_str().unwrap()}));
+    assert_eq!(s["code"], "evicted", "{s}");
+    assert!(s["reason"].as_str().unwrap().starts_with("not saved: the server closed this workbook"), "{s}");
+    assert!(!out.exists());
+    std::fs::remove_file(&dir).ok();
+}
+
+/// WHIQ (item 26, fault A31): a password-protected workbook opens with open_workbook's `password`, the next step its refusal names.
+#[test]
+fn a_password_protected_workbook_opens_with_its_password() {
+    let dir = folder("password");
+    let mut s = gridcraft_engine::Session::new();
+    s.new_workbook();
+    s.run("cell.set", json!({"cell": "A1", "input": "42"})).unwrap();
+    let xlsx = gridcraft_engine::io::save_bytes(&s.active().unwrap().wb, "book.xlsx").unwrap();
+    let path = dir.join("Secret.xlsx");
+    std::fs::write(&path, gridcraft_engine::xlsx::testing::encrypt_workbook(&xlsx, "synthetic-pw-8842")).unwrap();
+    let p = path.to_str().unwrap();
+    let mut m = start(&dir, &[]);
+    let e = m.err("open_workbook", json!({"path": p}));
+    assert_eq!(e["code"], "password_required", "{e}");
+    assert!(e["next_step"].as_str().unwrap().contains("`password`"), "{e}");
+    assert_eq!(m.err("open_workbook", json!({"path": p, "password": "wrong"}))["code"], "wrong_password");
+    m.ok("open_workbook", json!({"path": p, "password": "synthetic-pw-8842"}));
+    assert_eq!(m.ok("read_range", json!({"range": "A1"}))["values"], json!([[42.0]]));
+}
+
+/// WHIQ (item 26, faults B50, B15, B17, A28, B54): the arguments a tool reads say what is done, or are refused in words.
+#[test]
+fn item26_arguments_do_what_they_say_or_are_refused() {
+    let dir = folder("item26-args");
+    let mut m = start(&dir, &[]);
+    m.ok("build_workbook", json!({"sheets": [{"name": "Main", "rows": [["m1"], ["m2"], ["m3"]]}, {"name": "Data", "rows": [["d1"], ["d2"], ["d3"]]}]}));
+    // B50: a sheet prefix in rows names the sheet (it deleted rows of the active sheet)
+    m.ok("delete_rows", json!({"rows": "Data!2:2"}));
+    assert_eq!(m.ok("read_range", json!({"range": "Data!A1:A2"}))["values"], json!([["d1"], ["d3"]]));
+    assert_eq!(m.ok("read_range", json!({"range": "Main!A1:A3"}))["values"], json!([["m1"], ["m2"], ["m3"]]));
+    let e = m.err("delete_rows", json!({"rows": "Data!1:1", "sheet": "Main"}));
+    assert!(e["reason"].as_str().unwrap().contains("give one sheet"), "{e}");
+    // B15: header left out is true, as the tool says (a first row holding one number was guessed headerless: data pushed down)
+    m.ok("write_range", json!({"range": "Main!C1", "values": [["Name", 2026], ["a", 1], ["b", 2]]}));
+    m.ok("create_table", json!({"range": "Main!C1:D3"}));
+    // (a table's header cells are text, as in Excel; the data stays where it was)
+    assert_eq!(m.ok("read_range", json!({"range": "Main!C1:D2"}))["values"], json!([["Name", "2026"], ["a", 1.0]]));
+    // B17: a sort key that names no column, or an order that is not asc / desc, is refused (it sorted nothing and answered ok)
+    let e = m.err("sort_range", json!({"range": "Main!A1:A3", "keys": ["Total"]}));
+    assert!(e["reason"].as_str().unwrap().contains("is not a column letter"), "{e}");
+    let e = m.err("sort_range", json!({"range": "Main!A1:A3", "keys": ["A xyz"]}));
+    assert!(e["reason"].as_str().unwrap().contains("must be asc or desc"), "{e}");
+    m.ok("sort_range", json!({"range": "Main!A1:A3", "keys": ["A desc"], "header": false}));
+    assert_eq!(m.ok("read_range", json!({"range": "Main!A1:A3"}))["values"], json!([["m3"], ["m2"], ["m1"]]));
+    // A28: the schema's bounds are checked (a negative count was read as absent, a font size past 409 clamped)
+    let e = m.err("format_range", json!({"range": "Main!A1", "fontSize": 500}));
+    assert!(e["reason"].as_str().unwrap().contains("must be 409 or less"), "{e}");
+    let e = m.err("sort_range", json!({"range": "Main!A1:A3", "keys": []}));
+    assert!(e["reason"].as_str().unwrap().contains("at least 1 item"), "{e}");
+    // B54: through execute_command a parameter of the wrong type, or one the command never reads, is refused and nothing changes
+    let e = m.err("execute_command", json!({"command": "home.bold", "params": {"range": "Main!A1", "on": "yes"}}));
+    assert!(e["reason"].as_str().unwrap().contains("`on` must be true or false"), "{e}");
+    let e = m.err("execute_command", json!({"command": "cell.set", "params": {"cell": "Main!B1", "input": "x", "colour": "red"}}));
+    assert!(e["reason"].as_str().unwrap().contains("`colour` is not read by `cell.set`"), "{e}");
+    assert_eq!(m.ok("read_range", json!({"range": "Main!B1"}))["values"], json!([[null]]));
+    m.ok("execute_command", json!({"command": "cell.set", "params": {"cell": "Main!B1", "input": "x"}}));
+}
+
+/// WHIQ (item 26, fault A8): a read_range part larger than the answer-size rule is cut to whole rows, and the next range starts
+/// right after them: following next_range reads every row once.
+#[test]
+fn a_size_cut_read_range_names_the_rows_it_holds_and_skips_none() {
+    let dir = folder("item26-read");
+    let mut m = start(&dir, &[]);
+    let rows: Vec<Value> = (1..=300).map(|i| json!([format!("{i:04} {}", "x".repeat(1000))])).collect();
+    m.ok("write_range", json!({"range": "A1", "values": rows}));
+    let mut seen: Vec<String> = Vec::new();
+    let mut range = "A1:A300".to_string();
+    for _ in 0..20 {
+        let r = m.ok("read_range", json!({"range": range}));
+        assert!(r.to_string().len() <= 131_072, "{}", r.to_string().len());
+        for row in r["values"].as_array().unwrap() {
+            seen.push(row[0].as_str().unwrap()[..4].to_string());
+        }
+        match r["next_range"].as_str() {
+            Some(n) => range = n.to_string(),
+            None => break,
+        }
+    }
+    let want: Vec<String> = (1..=300).map(|i| format!("{i:04}")).collect();
+    assert_eq!(seen, want);
+}
+
 #[test]
 fn memory_limit_evicts_with_recovery() {
     let dir = folder("memory");

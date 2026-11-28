@@ -198,17 +198,76 @@ fn test_commands() -> std::sync::MutexGuard<'static, Vec<&'static CommandSpec>> 
 pub(crate) fn bad(cmd: &str, msg: impl Into<String>) -> EngineError {
     EngineError::BadParams { cmd: cmd.into(), msg: msg.into() }
 }
+// WHIQ (item 26, fault B54): the parameters a command read as absent because they had the wrong type ("steps": "3", "bold": "yes",
+// -1 for a count), and those it read as given (by any helper). A headless call (MCP, CLI: Session::execute_headless) with a
+// parameter read only as absent is refused and undone, naming it; the desktop app's own calls are as before.
+thread_local! {
+    static READS: std::cell::RefCell<(Vec<(String, String)>, std::collections::HashSet<String>)> = std::cell::RefCell::new(Default::default());
+}
+pub(crate) fn read_ok(key: &str) {
+    READS.with(|r| {
+        r.borrow_mut().1.insert(key.to_string());
+    });
+}
+fn misread(key: &str, want: &str, v: &Json) {
+    READS.with(|r| r.borrow_mut().0.push((key.to_string(), format!("`{key}` must be {want} (got {v})"))));
+}
+/// Starts a call's record of the parameters read.
+pub(crate) fn begin_reads() {
+    READS.with(|r| *r.borrow_mut() = Default::default());
+}
+/// The parameters of the call that were read only as absent because of their type, in words (each once).
+pub(crate) fn misreads() -> Vec<String> {
+    READS.with(|r| {
+        let r = r.borrow();
+        let mut out: Vec<String> = Vec::new();
+        for (k, m) in &r.0 {
+            if !r.1.contains(k) && !out.contains(m) {
+                out.push(m.clone());
+            }
+        }
+        out
+    })
+}
+/// The keys of `keys` the call never read (by any helper).
+pub(crate) fn unread(keys: &[String]) -> Vec<String> {
+    READS.with(|r| {
+        let r = r.borrow();
+        keys.iter().filter(|k| !r.1.contains(*k) && !r.0.iter().any(|(m, _)| m == *k)).cloned().collect()
+    })
+}
+/// A parameter read as it is (any type): it counts as read.
+pub(crate) fn any_param<'a>(p: &'a Json, key: &str) -> Option<&'a Json> {
+    let v = p.get(key);
+    if v.is_some_and(|x| !x.is_null()) {
+        read_ok(key);
+    }
+    v
+}
+fn typed<'a, T>(p: &'a Json, key: &str, want: &str, f: impl Fn(&'a Json) -> Option<T>) -> Option<T> {
+    let v = p.get(key).filter(|v| !v.is_null())?;
+    match f(v) {
+        Some(x) => {
+            read_ok(key);
+            Some(x)
+        }
+        None => {
+            misread(key, want, v);
+            None
+        }
+    }
+}
 pub(crate) fn str_param<'a>(p: &'a Json, key: &str) -> Option<&'a str> {
-    p.get(key).and_then(Json::as_str)
+    typed(p, key, "text", Json::as_str)
 }
 pub(crate) fn f64_param(p: &Json, key: &str) -> Option<f64> {
-    p.get(key).and_then(Json::as_f64)
+    typed(p, key, "a number", Json::as_f64)
 }
 pub(crate) fn bool_param(p: &Json, key: &str) -> Option<bool> {
-    p.get(key).and_then(Json::as_bool)
+    typed(p, key, "true or false", Json::as_bool)
 }
 pub(crate) fn u32_param(p: &Json, key: &str) -> Option<u32> {
-    p.get(key).and_then(Json::as_u64).map(|v| v.min(u32::MAX as u64) as u32)
+    typed(p, key, "a whole number of 0 or more", Json::as_u64).map(|v| v.min(u32::MAX as u64) as u32)
 }
 
 /// An object anchor mode from Excel's wording or the model's: `"moveAndSize"`/`"twoCell"`,
@@ -259,7 +318,7 @@ pub(crate) fn target_range(s: &Session, p: &Json) -> Result<RangeRef> {
 /// The sheet a call names (`sheet` param or a `Sheet!` prefix on `range`), else the active one.
 pub(crate) fn target_sheet(s: &Session, p: &Json) -> Result<usize> {
     let d = s.doc()?;
-    if let Some(v) = p.get("sheet") {
+    if let Some(v) = any_param(p, "sheet") {
         if let Some(i) = v.as_u64() {
             return if (i as usize) < d.wb.sheets.len() { Ok(i as usize) } else { Err(bad("sheet", "no such sheet")) };
         }
@@ -292,7 +351,7 @@ pub(crate) fn cell_param(s: &Session, p: &Json, key: &str) -> Result<Option<Cell
 
 /// Like [`cell_param`], for a command that operates on `sheet` (a `Sheet!` prefix must name it).
 pub(crate) fn cell_param_on(s: &Session, p: &Json, key: &str, sheet: usize) -> Result<Option<CellRef>> {
-    let t = match p.get(key) {
+    let t = match any_param(p, key) {
         None | Some(Json::Null) => return Ok(None),
         Some(Json::String(t)) => t,
         Some(v) => return Err(bad("cell", format!("invalid cell reference `{v}` for `{key}`"))),

@@ -50,8 +50,7 @@ fn parse_points(t: &str) -> Vec<[f32; 2]> {
 }
 
 fn stroke(s: &mut Session, p: &Json) -> Result<Json> {
-    let pts: Vec<[f64; 2]> = p
-        .get("points")
+    let pts: Vec<[f64; 2]> = any_param(p, "points")
         .and_then(Json::as_array)
         .map(|a| {
             a.iter()
