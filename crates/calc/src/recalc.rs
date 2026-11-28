@@ -63,6 +63,7 @@ const PENDING: usize = 32;
 
 /// Formula evaluations iterative calculation may spend on one recalculation (passes × formulas
 /// evaluated again), however high Maximum Iterations is.
+// AGREED LIMIT (owner, 2026-11-28): 10,000,000 formula evaluations — iterative calculation stops there whatever Maximum Iterations says — why: item 26 rule 5, "Timers, memory, and safety - agreed" — arbitrary by agreement (a recalculation must end).
 const MAX_ITERATION_WORK: usize = 10_000_000;
 
 /// Row intervals `[r0, r1]`, each with a payload, answering "which intervals overlap rows

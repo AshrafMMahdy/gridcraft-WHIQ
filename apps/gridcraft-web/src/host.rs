@@ -26,6 +26,7 @@ use wasm_bindgen::closure::Closure;
 const WORKBOOK_EXTS: &[&str] = &["xlsx"];
 
 /// The longest user name taken from `?author=`.
+// AGREED LIMIT (owner, 2026-11-28): an author name of at most 200 characters (the web build) — why: item 26 rule 8 (the desktop app) and rule 5 — arbitrary by agreement (harmless).
 const MAX_AUTHOR_CHARS: usize = 200;
 
 #[derive(Clone)]

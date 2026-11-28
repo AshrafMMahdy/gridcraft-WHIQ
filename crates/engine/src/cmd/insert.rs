@@ -271,7 +271,7 @@ fn insert_table(s: &mut Session, p: &Json) -> Result<Json> {
     if !header && d.wb.sheet(sheet).is_some_and(moves_a_table) {
         return Err(EngineError::Other("This operation isn't allowed: it would shift cells in a table on your worksheet.".into()));
     }
-    let style = str_param(p, "style").unwrap_or("TableStyleMedium2").to_string();
+    let style = table_style_named(p)?;
     let id = d.wb.next_object_id();
     edit(s, |cx| {
         // Without a header row, insert one with generic names.
@@ -465,7 +465,7 @@ fn table_total_fn(s: &mut Session, p: &Json) -> Result<Json> {
 
 fn table_style(s: &mut Session, p: &Json) -> Result<Json> {
     let (si, ti) = find_table(s, p)?;
-    let style = str_param(p, "style").unwrap_or("TableStyleMedium2").to_string();
+    let style = table_style_named(p)?;
     edit(s, |cx| {
         if let Some(t) = cx.sheet_mut(si)?.tables.get_mut(ti) {
             t.style = style.clone();
@@ -675,6 +675,7 @@ pub fn scatter_x_from_first(kind: ChartKind, series: &mut Vec<Series>) {
 }
 
 /// Most cells a chart's source block may span (bounds the series it builds).
+// AGREED LIMIT (owner, 2026-11-28): 1,000,000 cells — a chart source larger is refused ("range too large for a chart"); a table over 50,000,000 cells likewise — why: item 26 rule 5, "Timers, memory, and safety - agreed" — arbitrary by agreement.
 const MAX_CHART_CELLS: u64 = 1_000_000;
 
 /// Chart types that suit the shape of the data, best first, as `(type, subtype, label)` for
@@ -1828,4 +1829,19 @@ mod tests {
         let rules = s.execute("home.manageRules", json!({})).unwrap();
         assert_eq!(rules["rules"].as_array().map(Vec::len), Some(0));
     }
+}
+
+/// WHIQ (item 26, B16): a table style is one of Excel's built-in ones (TableStyleLight1-21, TableStyleMedium1-28, TableStyleDark1-11;
+/// GridCraft keeps no custom table styles); another name is refused (it was stored as given, and the table drawn unstyled).
+// AGREED LIMIT (owner, 2026-11-28): TableStyleMedium2 when `style` is not given — Excel's default — why: item 26 rule 4, "Defaults -
+// agreed" — arbitrary by agreement.
+fn table_style_named(p: &Json) -> Result<String> {
+    let Some(name) = str_param(p, "style") else { return Ok("TableStyleMedium2".into()) };
+    let builtin = [("TableStyleLight", 21u32), ("TableStyleMedium", 28), ("TableStyleDark", 11)]
+        .iter()
+        .any(|(stem, n)| name.strip_prefix(stem).and_then(|k| k.parse::<u32>().ok()).is_some_and(|k| (1..=*n).contains(&k)));
+    if builtin || name.eq_ignore_ascii_case("none") {
+        return Ok(name.to_string());
+    }
+    Err(bad("insert.table", format!("unknown table style `{name}`: Excel's are TableStyleLight1-21, TableStyleMedium1-28, TableStyleDark1-11")))
 }

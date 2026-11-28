@@ -477,6 +477,9 @@ fn load_sst(cx: &mut Ctx<'_>, target: Option<&str>) -> Result<(), IoError> {
 }
 
 /// A worksheet part at least this big (inflated) is a candidate for staying in the file.
+// AGREED LIMIT (owner, 2026-11-28): 256 KB — a worksheet at least this big may stay on disk when the sheets, inflated, pass a quarter
+// of the memory budget; such a workbook opens without recalculating, and the open says so — why: item 26 rule 7, "agreed as long as
+// it is visible" — arbitrary by agreement (memory).
 const LAZY_MIN_PART: u64 = 256 * 1024;
 
 /// The plan for leaving cells in the file, when the package is a file and its worksheets, inflated,

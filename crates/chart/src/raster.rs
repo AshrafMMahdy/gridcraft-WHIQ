@@ -5,6 +5,7 @@
 use crate::{Prim, Rgba};
 
 /// Largest image we allocate (pixels).
+// AGREED LIMIT (owner, 2026-11-28): 64 megapixels — the largest chart picture; larger is refused — why: item 26 rule 6, "Necessary limits - agreed" — necessary because the picture is drawn in memory.
 const MAX_PIXELS: u64 = 64 * 1024 * 1024;
 const SUB: usize = 4;
 

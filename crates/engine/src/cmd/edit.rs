@@ -439,7 +439,6 @@ fn range_set_values(s: &mut Session, p: &Json) -> Result<Json> {
     let mut count = 0;
     let mut corrected: Vec<Json> = vec![];
     let mut warnings: Vec<String> = vec![];
-    let (mut more_corrected, mut more_warnings) = (0usize, 0usize);
     edit(s, |cx| {
         for (ri, row) in rows.iter().enumerate() {
             // WHIQ: a safe point for `cancel` (the runner restores the workbook).
@@ -476,20 +475,11 @@ fn range_set_values(s: &mut Session, p: &Json) -> Result<Json> {
                     _ => {
                         let mut notes = EntryNotes::default();
                         let cell = input_to_cell_noted(&input, sheet, at, &mut cx.wb, &mut notes)?;
+                        // (item 26, B4: every one is listed; a caller's answer-size and list rules cut long lists, saying so)
                         if let Some(c) = notes.corrected_to {
-                            if corrected.len() < 100 {
-                                corrected.push(json!({"cell": at.a1(), "corrected_to": c}));
-                            } else {
-                                more_corrected += 1;
-                            }
+                            corrected.push(json!({"cell": at.a1(), "corrected_to": c}));
                         }
-                        for w in notes.warnings {
-                            if warnings.len() < 50 {
-                                warnings.push(w);
-                            } else {
-                                more_warnings += 1;
-                            }
-                        }
+                        warnings.extend(notes.warnings);
                         cell
                     }
                 };
@@ -510,12 +500,6 @@ fn range_set_values(s: &mut Session, p: &Json) -> Result<Json> {
     // WHIQ: formulas the entry corrected, and functions nobody knows.
     if !corrected.is_empty() {
         out["corrected"] = json!(corrected);
-        if more_corrected > 0 {
-            out["corrected_more"] = json!(more_corrected);
-        }
-    }
-    if more_warnings > 0 {
-        warnings.push(format!("{more_warnings} more cells call functions Excel does not know"));
     }
     if !warnings.is_empty() {
         out["warnings"] = json!(warnings);
@@ -785,13 +769,24 @@ fn coalesce(cells: &[CellRef]) -> Vec<RangeRef> {
 
 // ---------------------------------------------------------------- history
 
+// WHIQ (item 26, B25): `steps` is 1 or more (0 was 1), and the answer says how many were undone or redone when fewer were there.
+fn history_steps(p: &Json, cmd: &str) -> Result<u32> {
+    match u32_param(p, "steps") {
+        None => Ok(1),
+        Some(n) if n >= 1 => Ok(n),
+        Some(n) => Err(bad(cmd, format!("`steps` is 1 or more (got {n})"))),
+    }
+}
+
 fn undo(s: &mut Session, p: &Json) -> Result<Json> {
-    let steps = u32_param(p, "steps").unwrap_or(1).max(1);
+    let steps = history_steps(p, "edit.undo")?;
     let d = s.doc_mut()?;
     let mut label = String::new();
     let now = d.wb.clone();
+    let mut done = 0u32;
     for _ in 0..steps {
         let Some(e) = d.undo.pop() else { break };
+        done += 1;
         let cur = crate::HistoryEntry { label: e.label.clone(), wb: d.wb.clone(), selection: d.selection.clone() };
         d.redo.push(cur);
         label = e.label.clone();
@@ -801,16 +796,22 @@ fn undo(s: &mut Session, p: &Json) -> Result<Json> {
     super::extra::keep_watch_list(&now, &mut d.wb);
     d.calc.rebuild(&d.wb);
     d.revision += 1;
-    Ok(json!({"undone": label}))
+    let mut out = json!({"undone": label, "steps": done});
+    if done < steps {
+        out["note"] = json!(format!("{done} of the {steps} steps asked were undone: the history holds no more (it keeps the last 100)"));
+    }
+    Ok(out)
 }
 
 fn redo(s: &mut Session, p: &Json) -> Result<Json> {
-    let steps = u32_param(p, "steps").unwrap_or(1).max(1);
+    let steps = history_steps(p, "edit.redo")?;
     let d = s.doc_mut()?;
     let mut label = String::new();
     let now = d.wb.clone();
+    let mut done = 0u32;
     for _ in 0..steps {
         let Some(e) = d.redo.pop() else { break };
+        done += 1;
         let cur = crate::HistoryEntry { label: e.label.clone(), wb: d.wb.clone(), selection: d.selection.clone() };
         d.undo.push(cur);
         label = e.label.clone();
@@ -820,7 +821,11 @@ fn redo(s: &mut Session, p: &Json) -> Result<Json> {
     super::extra::keep_watch_list(&now, &mut d.wb);
     d.calc.rebuild(&d.wb);
     d.revision += 1;
-    Ok(json!({"redone": label}))
+    let mut out = json!({"redone": label, "steps": done});
+    if done < steps {
+        out["note"] = json!(format!("{done} of the {steps} steps asked were redone: there was no more to redo"));
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------- clipboard

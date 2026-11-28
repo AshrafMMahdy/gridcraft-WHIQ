@@ -1423,6 +1423,7 @@ fn insert_pivot_chart(s: &mut Session, p: &Json) -> Result<Json> {
         return Err(other("Add a field to the Values area and one to Rows or Columns before creating a PivotChart."));
     }
     let series = pv::chart_series(&sh.name, area.start, &out);
+    let rows_total = out.chart_rows.len();
     let t = str_param(p, "type").unwrap_or("column");
     let kind = super::insert::chart_kind(t, str_param(p, "subtype").unwrap_or(""))?;
     let at =
@@ -1462,7 +1463,12 @@ fn insert_pivot_chart(s: &mut Session, p: &Json) -> Result<Json> {
     };
     edit(s, |cx| {
         cx.sheet_mut(si)?.charts.push(chart);
-        Ok(json!({"chart": id, "pivot": pivot_name, "series": n}))
+        // (item 26, C27: a report of more category rows than a PivotChart plots says so)
+        let mut out = json!({"chart": id, "pivot": pivot_name, "series": n});
+        if rows_total > pv::MAX_CHART_ROWS {
+            out["note"] = json!(format!("the PivotTable has {rows_total} category rows: the chart plots the first {}", pv::MAX_CHART_ROWS));
+        }
+        Ok(out)
     })
 }
 

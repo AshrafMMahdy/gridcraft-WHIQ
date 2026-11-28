@@ -30,6 +30,7 @@ use log::LevelFilter;
 /// The current log file's name inside the log directory.
 pub const LOG_FILE: &str = "gridcraft.log";
 /// How many previous logs are kept (`gridcraft.1.log` … `gridcraft.<KEEP>.log`).
+// AGREED LIMIT (owner, 2026-11-28): 2 log files of 16 MB each, 512 lines held until the file is open — why: item 26 rule 8 (the desktop app) and rule 5 — arbitrary by agreement (harmless) (a runaway warning cannot fill the disk).
 pub const KEEP: usize = 2;
 /// The log file stops growing past this size (a runaway warning can't fill the disk).
 pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;

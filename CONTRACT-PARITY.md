@@ -82,8 +82,8 @@ are still read.
 
 - Domain tools and domain arguments (`render_page` / `render_range` / `render_slide`, …), and
   domain job thresholds (`--job-cells`, `--export-job-slides`).
-- GC `read_range` continues with a cell address: `continue_from` is the next cell and
-  `next_range` the range to ask for (a 2-D range is not a list).
+- GC `read_range` continues with a range, not an offset (a 2-D range is not a list): `next_range` is the range to ask for
+  next and, after a row cut, `then_range` the rows after that row (item 26).
 - All three hold several documents per process (`documents` lists them, one `active`), named by
   `document` handles (2026-10-20; WC held one before, GC and DC had no handles). DC opens and exports on job threads, so its document tools answer `busy` (with the
   `job_id`) while a presentation is still opening.

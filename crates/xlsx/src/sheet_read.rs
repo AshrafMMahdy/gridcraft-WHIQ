@@ -37,6 +37,7 @@ struct RowState {
     rows: u64,
 }
 
+// AGREED LIMIT (owner, 2026-11-28): hyperlinks of the first 10,000 cells of a sheet — the rest are dropped and the open says so — why: item 26 rule 5, "Timers, memory, and safety - agreed" — arbitrary by agreement.
 const MAX_HYPERLINK_CELLS: u64 = 10_000;
 
 pub fn read_sheet(cx: &mut Ctx<'_>, part: &str, name: &str) -> Result<Sheet, IoError> {

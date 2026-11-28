@@ -15,6 +15,7 @@ pub struct ParseError {
     pub pos: usize,
 }
 
+// AGREED LIMIT (owner, 2026-11-28): 256 levels — a formula nested deeper is refused when entered ("nested too deeply") — why: item 26 rule 6, "Necessary limits - agreed" — necessary because the parser recurses (Excel allows 64).
 pub(crate) const MAX_DEPTH: usize = 256;
 
 /// Longest formula accepted, in characters: Excel's limit for formula contents. It also bounds

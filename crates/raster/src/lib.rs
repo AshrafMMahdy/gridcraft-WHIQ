@@ -15,6 +15,7 @@ use tiny_skia::{
 pub type Rgb = [u8; 3];
 
 /// Largest canvas side and area accepted (hostile ranges and scales are refused, not allocated).
+// AGREED LIMIT (owner, 2026-11-28): 16,384 pixels a side and 100 megapixels — a larger picture is refused, naming its size — why: item 26 rule 6, "Necessary limits - agreed" — necessary because it is drawn in memory.
 pub const MAX_SIDE: u32 = 16_384;
 pub const MAX_PIXELS: u64 = 100_000_000;
 

@@ -69,6 +69,7 @@ fn known(s: &Session, w: &str) -> bool {
 
 /// Longest word we generate suggestions for. Candidate text grows with the square of the word length, so longer
 /// tokens (no real word is this long) get no suggestions instead of an unbounded allocation.
+// AGREED LIMIT (owner, 2026-11-28): 64 characters — no spelling suggestions for a longer word — why: item 26 rule 5, "Timers, memory, and safety - agreed" — arbitrary by agreement (harmless).
 const MAX_SUGGEST_LEN: usize = 64;
 
 fn edits1(w: &str) -> Vec<String> {

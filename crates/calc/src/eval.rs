@@ -13,6 +13,7 @@ use gridcraft_model::Workbook;
 
 /// Largest array a reference may expand to at the smallest memory budget. WHIQ: the working
 /// limit ([`max_cells`]) is one cell per 32 bytes of the memory budget when that is more.
+// AGREED LIMIT (owner, 2026-11-28): 16,000,000 cells (or one per 32 bytes of the memory budget) — the largest array a reference or a function makes; larger is #NUM! — why: item 26 rule 6, "Necessary limits - agreed" — necessary because an array is held in memory.
 pub const MAX_CELLS: u64 = 16_000_000;
 
 /// The largest array a reference may expand to in this process.
@@ -23,6 +24,7 @@ pub fn max_cells() -> u64 {
 /// reserved for data to come such as `$A$2:$A$50000`) stop at the sheet's used range, so that
 /// formulas over them stay fast.
 const FULL_SIZE_CELLS: u64 = 16_384;
+// AGREED LIMIT (owner, 2026-11-28): 400 — an expression nested deeper evaluates to #CALC! — why: item 26 rule 6, "Necessary limits - agreed" — necessary because each level is a frame on the stack (Excel allows 64).
 const MAX_DEPTH: usize = 400;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

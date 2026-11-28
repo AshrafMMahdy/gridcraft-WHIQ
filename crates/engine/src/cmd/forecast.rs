@@ -16,6 +16,9 @@ use crate::selection::current_region;
 
 const CMD: &str = "data.forecastSheet";
 /// Most history rows a forecast sheet copies.
+// AGREED LIMIT (owner, 2026-11-28): 10,000 rows of history, 10,000 forecast rows, 500,000 history rows x forecast rows; a third of the history forecast when
+// `periods` is not given — more is refused, naming the most — why: item 26 rules 4 and 5 — necessary because every forecast row refits
+// the model over the whole history (the numbers bound a sheet's recalculation to seconds).
 const MAX_HISTORY: u64 = 10_000;
 /// Most forecast rows.
 const MAX_PERIODS: u32 = 10_000;

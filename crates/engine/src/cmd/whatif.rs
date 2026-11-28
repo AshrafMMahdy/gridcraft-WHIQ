@@ -218,12 +218,17 @@ pub(crate) struct Seek {
     pub fx: f64,
     pub iterations: u32,
     pub converged: bool,
+    /// the Maximum Change and Maximum Iterations the search ran with
+    pub tol: f64,
+    pub max_iter: u32,
 }
 
 /// Finds `x` with `|f(x)| <= tol`: secant steps (with growing steps while nothing is
 /// bracketed), switching to secant-or-bisection inside a sign-change bracket. Returns the best
 /// point seen. `f` returns NaN where the model errors.
 pub(crate) fn seek(x0: f64, f: &mut dyn FnMut(f64) -> f64, max_iter: u32, tol: f64) -> Seek {
+    // AGREED LIMIT (owner, 2026-11-28): Goal Seek runs the workbook's Maximum Iterations (1 to 10,000) and stops within its Maximum Change (0.001 when that is 0),
+    // and answers `converged` — why: item 26 rule 4, "Defaults - agreed" — Excel's own settings; the 10,000 is arbitrary by agreement.
     let tol = if tol.is_finite() && tol > 0.0 { tol } else { 0.001 };
     let max_iter = max_iter.clamp(1, 10_000);
     let x0 = if x0.is_finite() { x0 } else { 0.0 };
@@ -234,7 +239,7 @@ pub(crate) fn seek(x0: f64, f: &mut dyn FnMut(f64) -> f64, max_iter: u32, tol: f
             *best = (x, fx);
         }
     };
-    let done = |best: &(f64, f64), it: u32| Seek { x: best.0, fx: best.1, iterations: it, converged: best.1.is_finite() && best.1.abs() <= tol };
+    let done = |best: &(f64, f64), it: u32| Seek { x: best.0, fx: best.1, iterations: it, converged: best.1.is_finite() && best.1.abs() <= tol, tol, max_iter };
     if f0.is_finite() && f0.abs() <= tol {
         return done(&best, 0);
     }
@@ -321,7 +326,7 @@ fn goal_seek(s: &mut Session, p: &Json) -> Result<Json> {
         return Err(EngineError::Other("Cell must contain a value.".into()));
     }
     let x0 = d.wb.sheet(csi).map(|sh| sh.value(chg)).and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let (max_iter, tol) = (d.wb.calc.max_iterations, d.wb.calc.max_change);
+    let (max_iter, tol) = (d.wb.calc.max_iterations, d.wb.calc.max_change); // (as the search ran them: in its answer)
     let mut trial = Trial::new(d);
     let mut f = |x: f64| -> f64 {
         trial.run(&[(csi, chg, Value::number(x))], &[(ssi, set)]).first().and_then(Value::as_f64).map(|v| v - target).unwrap_or(f64::NAN)
@@ -335,7 +340,18 @@ fn goal_seek(s: &mut Session, p: &Json) -> Result<Json> {
         Ok(())
     })?;
     let result = s.doc()?.wb.sheet(ssi).map(|sh| sh.value(set)).unwrap_or_default();
-    Ok(json!({"value": r.x, "result": value_json(&result), "iterations": r.iterations, "converged": r.converged}))
+    let mut out = json!({"value": r.x, "result": value_json(&result), "iterations": r.iterations, "converged": r.converged});
+    // (item 26, rule 7: the limit that stopped it is said)
+    if !r.converged {
+        out["note"] = json!(format!(
+            "{} was not brought to {target} within the workbook's Maximum Change ({}) in {} iterations (its Maximum Iterations: {}; formulas.calculationOptions sets both)",
+            set.a1(),
+            r.tol,
+            r.iterations,
+            r.max_iter
+        ));
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------- scenarios
@@ -1183,6 +1199,7 @@ mod tests {
         let r = s.execute("data.goalSeek", json!({"set": "A3", "to": -4, "changing": "A1"})).unwrap();
         assert_eq!(r["converged"], false);
         assert!(r["iterations"].as_u64().unwrap() <= 100);
+        assert!(r["note"].as_str().unwrap().contains("within the workbook's Maximum Change (0.001)"), "{r}");
     }
 
     #[test]

@@ -330,6 +330,7 @@ pub struct Page {
 
 /// Most bytes of content per page before further drawing is dropped (keeps hostile inputs from
 /// exhausting memory).
+// AGREED LIMIT (owner, 2026-11-28): 64 MB of drawing a page, 40 megapixels a picture, 1,024 characters of a title — why: item 26 rule 6, "Necessary limits - agreed" — necessary against hostile input; a page that large has nothing more to show.
 const MAX_PAGE_CONTENT: usize = 64 * 1024 * 1024;
 /// Largest image (pixels) embedded.
 const MAX_IMAGE_PIXELS: u64 = 40_000_000;

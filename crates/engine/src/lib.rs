@@ -141,6 +141,8 @@ pub struct DocState {
 }
 
 static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+// AGREED LIMIT (owner, 2026-11-28): 100 undo steps — older ones are dropped; an undo of more says how many it could — why: item 26
+// rule 5, "Timers, memory, and safety - agreed" — necessary because each step holds a copy of the workbook's changed sheets.
 const UNDO_LIMIT: usize = 100;
 
 impl DocState {
@@ -567,6 +569,23 @@ impl Session {
             };
             let msg = format!("missing {what}: programmatic calls never open dialogs");
             return Err(EngineError::BadParams { cmd: id.to_string(), msg });
+        }
+        // WHIQ (item 26, B56): a command that only asked for a dialog (it was given too little to act) and changed nothing is refused,
+        // naming the dialog; it answered ok having done nothing
+        // (a change makes a new workbook: the same one is no change)
+        let changed = match (before.as_ref(), self.active()) {
+            (Some(m), Some(d)) => !Arc::ptr_eq(&m.wb, &d.wb) || m.uid != d.uid,
+            (None, None) => false,
+            _ => true,
+        };
+        if r.is_ok()
+            && !changed
+            && let Some(UiRequest::Dialog(name, _)) = requests.iter().find(|q| matches!(q, UiRequest::Dialog(..)))
+        {
+            return Err(EngineError::BadParams {
+                cmd: id.to_string(),
+                msg: format!("it would open the {name} dialog: give its parameters instead (list_commands shows them); nothing was changed"),
+            });
         }
         r
     }

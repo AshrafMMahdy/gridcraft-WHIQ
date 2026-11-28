@@ -691,6 +691,13 @@ fn mcp(args: &[String]) -> Result<(), String> {
             .map(|v| v.parse::<f64>().ok().filter(|n| n.is_finite() && *n >= 0.0).ok_or_else(|| format!("mcp: --{name} needs a number, not `{v}`")))
             .transpose()
     };
+    // WHIQ (item 26): a flag outside its range is refused, naming the range (they were raised, lowered or cut without a word)
+    let within = |name: &str, lo: f64, hi: f64| -> Result<Option<f64>, String> {
+        match num(name)? {
+            Some(n) if n < lo || n > hi => Err(format!("mcp: --{name} is from {lo} to {hi} (got {n})")),
+            n => Ok(n),
+        }
+    };
     // WHIQ: the folders the headless server may read and write.
     let roots = gridcraft_engine::file_access::AutomationRoots::new(
         a.opt("automation-read-root").map(std::path::Path::new),
@@ -702,11 +709,11 @@ fn mcp(args: &[String]) -> Result<(), String> {
     // WHIQ: a supervisor that keeps the backups itself turns the OLD_ copies off.
     config.settings.old_copies = !a.has("automation-no-old-copies");
     // WHIQ parity pass: the flag names every craft app takes (older names still read).
-    if let Some(n) = num("job-after-ms")? {
-        config.call_timeout = std::time::Duration::from_millis(n.max(10.0) as u64);
+    if let Some(n) = within("job-after-ms", 10.0, f64::MAX)? {
+        config.call_timeout = std::time::Duration::from_millis(n as u64);
     }
-    if let Some(n) = num("busy-after-ms")? {
-        config.busy_grace = std::time::Duration::from_millis(n.min(600_000.0) as u64);
+    if let Some(n) = within("busy-after-ms", 0.0, 600_000.0)? {
+        config.busy_grace = std::time::Duration::from_millis(n as u64);
     }
     if let Some(n) = num("max-memory-mb")? {
         config.max_memory_bytes = Some((n * 1024.0 * 1024.0) as u64);
@@ -720,8 +727,8 @@ fn mcp(args: &[String]) -> Result<(), String> {
     if swept > 0 {
         eprintln!("gridcraft-cli: removed {swept} stale spill file(s) from {}", gridcraft_engine::model::spill::spill_base().display());
     }
-    if let Some(n) = num("idle-evict-secs")? {
-        config.idle_evict = Some(std::time::Duration::from_secs_f64(n.max(0.05)));
+    if let Some(n) = within("idle-evict-secs", 0.05, f64::MAX)? {
+        config.idle_evict = Some(std::time::Duration::from_secs_f64(n));
     }
     if let Some(n) = num("open-job-mb")? {
         config.job_open_bytes = (n * 1024.0 * 1024.0) as u64;
@@ -729,15 +736,18 @@ fn mcp(args: &[String]) -> Result<(), String> {
     if let Some(n) = num("job-cells")? {
         config.job_cells = n as u64;
     }
-    if let Some(n) = num("max-read-cells")? {
-        config.settings.max_read_cells = (n as u64).max(1);
+    if let Some(n) = within("max-read-cells", 1.0, 1_000_000.0)? {
+        config.settings.max_read_cells = n as u64;
     }
     // WHIQ: periodic checkpoints of unsaved work to the recovered file (0 turns one off).
     if let Some(n) = num("checkpoint-edits")? {
         config.checkpoint_edits = n as u64;
     }
     if let Some(n) = num("checkpoint-secs")? {
-        config.checkpoint_interval = (n > 0.0).then(|| std::time::Duration::from_secs_f64(n.max(0.2)));
+        if n > 0.0 && n < 0.2 {
+            return Err(format!("mcp: --checkpoint-secs is 0 (off) or 0.2 or more (got {n})"));
+        }
+        config.checkpoint_interval = (n > 0.0).then(|| std::time::Duration::from_secs_f64(n));
     }
     config.handle_signals = !a.has("no-signals");
     if let Some(r) = &roots {

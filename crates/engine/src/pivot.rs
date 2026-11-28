@@ -1564,7 +1564,9 @@ fn rows_ref(sheet: &str, origin: CellRef, col: u32, rows: &[u32]) -> Option<Stri
 }
 
 /// Most category rows a PivotChart plots.
-const MAX_CHART_ROWS: usize = 10_000;
+// AGREED LIMIT (owner, 2026-11-28): 10,000 — a PivotChart plots the first 10,000 category rows of its report, and says so — why: item 26 rule 6, "Necessary
+// limits - agreed" — necessary because a chart past it cannot be read (and Excel's own charts slow to a stop).
+pub const MAX_CHART_ROWS: usize = 10_000;
 
 /// A PivotChart's series for a report written at `origin`: categories are the innermost row
 /// items, one series per item column (column items × value fields); totals are left out.

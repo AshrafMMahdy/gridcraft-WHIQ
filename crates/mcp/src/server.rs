@@ -21,6 +21,8 @@ const INTERNAL_ERROR: i64 = -32603;
 const RESOURCE_NOT_FOUND: i64 = -32002;
 
 /// Longest accepted message line (16 MB): bigger payloads belong in files.
+// AGREED LIMIT (owner, 2026-11-28): 16 MB — the longest request line Server::serve reads (the runtime the platform uses reads whole JSON lines) — why: item
+// 26 rule 5, "Timers, memory, and safety - agreed" — necessary because a request is held in memory.
 const MAX_LINE: usize = 16 * 1024 * 1024;
 
 const INSTRUCTIONS: &str = "GridCraft is a spreadsheet app (an Excel clone). Cells use A1 notation (\"B2\", \"A1:D10\", \

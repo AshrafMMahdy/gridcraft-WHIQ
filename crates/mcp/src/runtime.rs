@@ -72,7 +72,12 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             settings: Settings::default(),
+            // AGREED LIMIT (owner, 2026-11-28): 15 s — a call still running then answers its job id and goes on as a job (--job-after-ms sets another) —
+            // why: item 26 rule 5, "Timers, memory, and safety - agreed" — arbitrary by agreement; the answer says it is a job.
             call_timeout: Duration::from_secs(15),
+            // AGREED LIMIT (owner, 2026-11-28): a file of 20 MB or more opens as a job at once, and recalculate / export_pdf / render_sheet on more than
+            // 250,000 cells (build_workbook past 25,000 rows) start as jobs — why: item 26 rule 7, "agreed as long as it is visible"
+            // (the answer is a job id and says so) — arbitrary by agreement.
             job_open_bytes: 20 * 1024 * 1024,
             job_cells: 250_000,
             max_memory_bytes: None,
@@ -80,8 +85,12 @@ impl Default for RuntimeConfig {
             write_root: None,
             read_root: None,
             handle_signals: true,
+            // AGREED LIMIT (owner, 2026-11-28): 300 ms — a call arriving while another runs waits this long, then answers `busy` with a retry time —
+            // why: item 26 rule 5 — arbitrary by agreement.
             busy_grace: Duration::from_millis(300),
             has_ui: false,
+            // AGREED LIMIT (owner, 2026-11-28): every 20 edits or 60 s of unsaved work it is written to its recovered file (server_status lists them)
+            // — why: item 26 rule 5 — arbitrary by agreement.
             checkpoint_edits: 20,
             checkpoint_interval: Some(Duration::from_secs(60)),
         }
@@ -233,6 +242,7 @@ impl Shared {
         }
         let now = Instant::now();
         let counted = p.total > 0 && (p.done as f64) > note.1;
+        // AGREED LIMIT (owner, 2026-11-28): a progress notification at least once a second while a call runs — why: item 26 rule 5 — arbitrary by agreement.
         let beat = note.2.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1));
         if !counted && !beat {
             return None;
@@ -531,7 +541,7 @@ impl Shared {
                 None => {
                     let ids: Vec<String> = jobs.map.keys().map(|n| job_name(*n)).collect();
                     ToolResult::failure(
-                        &ToolError::new(code::NOT_FOUND, format!("there is no job `{t}`"), "use a job_id a call returned; list_jobs lists the jobs")
+                        &ToolError::new(code::NOT_FOUND, format!("there is no job `{t}` (a finished job is forgotten once 200 newer ones have run)"), "use a job_id a call returned; list_jobs lists the jobs")
                             .with("closest", json!(contract::closest(&t, ids.iter().map(String::as_str), 5))),
                     )
                 }
@@ -558,7 +568,7 @@ impl Shared {
         let Some((n, j)) = parse_job(&text).and_then(|n| jobs.map.get(&n).map(|j| (n, j))) else {
             let ids: Vec<String> = jobs.map.keys().map(|n| job_name(*n)).collect();
             return ToolResult::failure(
-                &ToolError::new(code::NOT_FOUND, format!("there is no job `{text}`"), "use a job_id a call returned; list_jobs lists the jobs")
+                &ToolError::new(code::NOT_FOUND, format!("there is no job `{text}` (a finished job is forgotten once 200 newer ones have run)"), "use a job_id a call returned; list_jobs lists the jobs")
                     .with("closest", json!(contract::closest(&text, ids.iter().map(String::as_str), 5))),
             );
         };
@@ -636,6 +646,8 @@ fn rfc3339_now() -> String {
 }
 
 fn retry_after(elapsed_ms: u64) -> u64 {
+    // AGREED LIMIT (owner, 2026-11-28): a quarter of the time the call has run, from 250 ms to 5 s — the retry time a busy answer gives — why: item 26
+    // rule 5 — arbitrary by agreement.
     (elapsed_ms / 4).clamp(250, 5000)
 }
 
@@ -905,6 +917,8 @@ pub fn serve(
         }
     }
     // The client hung up: finish the call in progress (for a while), then keep any unsaved work.
+    // AGREED LIMIT (owner, 2026-11-28): 60 s — after the client hangs up, a running call gets this long before the server saves the last state and exits
+    // — why: item 26 rule 5 — arbitrary by agreement.
     let deadline = Instant::now() + Duration::from_secs(60);
     while lock(&shared.busy).is_some() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
@@ -988,6 +1002,7 @@ fn submit(shared: &Arc<Shared>, work_tx: &mpsc::Sender<Work>, msg: Value, id: Va
             },
         );
         // Old finished jobs are forgotten (the newest 200 stay).
+        // AGREED LIMIT (owner, 2026-11-28): 200 jobs kept — an older finished one is forgotten, and job_status says so — why: item 26 rule 5 — arbitrary by agreement.
         while jobs.map.len() > 200 {
             let Some(oldest) = jobs.map.iter().find(|(_, j)| j.state != JobState::Running).map(|(k, _)| *k) else { break };
             jobs.map.remove(&oldest);

@@ -17,6 +17,7 @@ use std::sync::OnceLock;
 /// A font file is skipped by the scan past this size: a catalog only needs each face's name, and a
 /// damaged or enormous file must not turn startup into a long read.
 #[cfg(not(target_arch = "wasm32"))]
+// AGREED LIMIT (owner, 2026-11-28): font files of up to 64 MB are loaded — why: item 26 rule 8 (the desktop app) and rule 5 — arbitrary by agreement (harmless).
 const MAX_FONT_FILE: u64 = 64 << 20;
 
 /// One face of one installed font file.

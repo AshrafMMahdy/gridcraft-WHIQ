@@ -10,6 +10,7 @@ use std::time::Duration;
 /// How often [`DesktopTheme::start`] re-reads the desktop's answer. The portal also publishes a
 /// change signal, but subscribing needs a connection kept alive for the life of every window; one
 /// round trip every few seconds is cheap and reacts soon enough after a theme switch.
+// AGREED LIMIT (owner, 2026-11-28): the system theme is checked every 4 s — why: item 26 rule 8 (the desktop app) and rule 5 — arbitrary by agreement (harmless).
 const POLL: Duration = Duration::from_secs(4);
 
 /// Whether the desktop asks applications to draw dark. `None` when it says nothing, and when

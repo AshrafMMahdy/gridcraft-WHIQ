@@ -19,6 +19,7 @@ use super::*;
 const CMD: &str = "data.analysisToolPak";
 /// Most input cells a tool reads at the smallest memory budget. WHIQ: one per 32 bytes of the
 /// memory budget when that is more (inputs are read into memory as numbers).
+// AGREED LIMIT (owner, 2026-11-28): 1,000,000 input cells and 4,000,000 output cells (or the memory budget's shares), 256 matrix variables, 16 regressors (Excel's), 100,000 bins (sqrt(n), 1 to 1,000, when not given) — larger is refused, naming the most — why: item 26 rules 4, 5 and 6 — necessary because the inputs are read into memory.
 const MAX_INPUT_CELLS: u64 = 1_000_000;
 /// Most cells a report may write at the smallest memory budget; one per 100 bytes of the
 /// budget when that is more.

@@ -190,14 +190,14 @@ fn oversized_results_are_trimmed() {
         let v = m.ok("read_range", args);
         got.extend(v["values"].as_array().unwrap().iter().cloned());
         if v["truncated"] == true {
-            assert!(v["continue_from"].is_string(), "{v}");
+            assert!(v.get("continue_from").is_none(), "{v}");
             assert!(v["next_step"].as_str().unwrap().contains("read_range"));
             next = Some(v["next_range"].as_str().unwrap().to_string());
         } else {
             break;
         }
     }
-    assert_eq!(got.len(), 120, "all rows reached through continue_from");
+    assert_eq!(got.len(), 120, "all rows reached through next_range");
     assert_eq!(got[119][9], json!(1199.0));
     // Lists page with offset / limit and say where to continue.
     let p = m.ok("list_functions", json!({"limit": 5}));
@@ -248,18 +248,19 @@ fn answer_size_rule_pages_reads_and_saves_the_rest() {
     assert_eq!(w["continue_from"], 13);
     let w = m.ok("list_commands", json!({"continue_from": 13, "limit": 3}));
     assert_eq!(w["offset"], 13);
-    // a batch of 4,000 writes: its results are over the rule
+    // a batch of 4,000 writes: its results list shows 25 (the list rule), the count, and the file that holds every one
     let ops: Vec<Value> = (1..=4000).map(|i| json!({"op": "set", "cell": format!("A{i}"), "input": format!("row {i} of the long batch")})).collect();
     let r = m.ok("batch", json!({"ops": ops}));
-    let t = &r["result_truncated"];
-    assert!(t.is_object(), "{}", r.to_string().chars().take(300).collect::<String>());
+    assert_eq!(r["results"].as_array().map(Vec::len), Some(25), "{}", r.to_string().chars().take(300).collect::<String>());
+    assert_eq!(r["results_total"], 4000);
     assert!(r.get("continue_from").is_none() && r.get("truncated").is_none());
     assert!(r.to_string().len() <= 131_072);
-    let path = std::path::PathBuf::from(t["full_result_path"].as_str().unwrap());
+    let note = r["results_note"].as_str().unwrap();
+    assert!(note.starts_with("25 of 4000 shown; all 4000 in "), "{note}");
+    let path = std::path::PathBuf::from(note.trim_start_matches("25 of 4000 shown; all 4000 in ").trim_end_matches('.'));
     assert!(path.starts_with(&dir), "in the write root: {}", path.display());
     let whole: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert!(whole.to_string().len() > 131_072);
-    assert!(t["note"].as_str().unwrap().contains("read the file for the rest"));
+    assert_eq!(whole["results"].as_array().map(Vec::len), Some(4000));
     // the size knob and the shared max_bytes are gone; export_markdown's page size is refused outside 1024..131072
     let e = m.err("export_markdown", json!({"max_bytes": 500_000}));
     assert_eq!(e["code"], "invalid_argument", "{e}");
@@ -402,6 +403,81 @@ fn a_size_cut_read_range_names_the_rows_it_holds_and_skips_none() {
     }
     let want: Vec<String> = (1..=300).map(|i| format!("{i:04}")).collect();
     assert_eq!(seen, want);
+}
+
+/// Reads `range` the way the answers say — next_range, and after a row cut then_range — and answers every cell read by its
+/// address, with the answers that cut a cell.
+fn read_all(m: &mut Mcp, range: &str) -> (std::collections::BTreeMap<String, Value>, Vec<Value>) {
+    let mut cells = std::collections::BTreeMap::new();
+    let mut cut = Vec::new();
+    let mut after: Vec<String> = Vec::new();
+    let mut next = Some(range.to_string());
+    for _ in 0..200 {
+        let Some(range) = next.take() else { break };
+        let r = m.ok("read_range", json!({"range": range}));
+        assert!(r.to_string().len() <= 131_072, "{}", r.to_string().len());
+        let part = r["range"].as_str().map(str::to_string).unwrap_or_else(|| range.rsplit('!').next().unwrap().to_string());
+        let start = part.split(':').next().unwrap();
+        let col0 = start.chars().take_while(char::is_ascii_alphabetic).fold(0u32, |n, c| n * 26 + (c as u32 - 64)) - 1;
+        let row0: u32 = start.trim_start_matches(|c: char| c.is_ascii_alphabetic()).parse().unwrap();
+        for (i, row) in r["values"].as_array().unwrap().iter().enumerate() {
+            for (j, v) in row.as_array().unwrap().iter().enumerate() {
+                let (c, n) = (col0 + j as u32, row0 + i as u32);
+                let name = if c < 26 { format!("{}{n}", (b'A' + c as u8) as char) } else { format!("A{}{n}", (b'A' + (c - 26) as u8) as char) };
+                assert!(cells.insert(name.clone(), v.clone()).is_none(), "{name} read twice");
+            }
+        }
+        if r.get("cell_cut").is_some() {
+            cut.push(r["cell_cut"].clone());
+        }
+        if r["truncated"] == true {
+            if let Some(t) = r["then_range"].as_str() {
+                after.push(t.to_string());
+            }
+            next = Some(r["next_range"].as_str().unwrap().to_string());
+        } else {
+            next = after.pop();
+        }
+    }
+    (cells, cut)
+}
+
+/// WHIQ (item 26, fault A8): a row cut — wider than one read, or larger than one answer — names the rest of that row and then
+/// the rows after it; following them reads every cell once. A cell larger than one answer comes as the start of its text, said.
+#[test]
+fn a_cut_row_names_the_rows_after_it_and_a_cut_cell_is_said() {
+    let dir = folder("item26-row-cut");
+    // wider than one read: 3 rows of 8 cells, 5 cells a read
+    let mut m = start(&dir, &["--max-read-cells", "5"]);
+    let rows: Vec<Value> = (1..=3).map(|r| Value::Array((0..8).map(|c| json!(format!("r{r}c{c}"))).collect())).collect();
+    m.ok("write_range", json!({"range": "A1", "values": rows}));
+    let first = m.ok("read_range", json!({"range": "A1:H3"}));
+    assert_eq!(first["range"], "A1:E1", "{first}");
+    assert_eq!(first["next_range"], "Sheet1!F1:H1");
+    assert_eq!(first["then_range"], "Sheet1!A2:H3");
+    let (cells, cut) = read_all(&mut m, "A1:H3");
+    assert_eq!(cells.len(), 24, "{cells:?}");
+    assert_eq!(cells["H3"], "r3c7");
+    assert!(cut.is_empty());
+    drop(m);
+    // larger than one answer: row 1 of three 60,000-character cells, a 200,000-character cell in row 2, a short row 3
+    let mut m = start(&dir, &[]);
+    let long = |ch: char, n: usize| ch.to_string().repeat(n);
+    m.ok("write_range", json!({"range": "A1", "values": [[long('a', 60_000), long('b', 60_000), long('c', 60_000)], [long('d', 200_000), "e", "f"], ["g", "h", "i"]]}));
+    let first = m.ok("read_range", json!({"range": "A1:C3"}));
+    assert_eq!(first["range"], "A1:B1", "{}", first.to_string().chars().take(300).collect::<String>());
+    assert_eq!(first["next_range"], "Sheet1!C1");
+    assert_eq!(first["then_range"], "Sheet1!A2:C3");
+    let (cells, cut) = read_all(&mut m, "A1:C3");
+    assert_eq!(cells.len(), 9, "{:?}", cells.keys().collect::<Vec<_>>());
+    assert_eq!(cells["C1"].as_str().map(str::len), Some(60_000));
+    assert_eq!((cells["B2"].clone(), cells["C3"].clone()), (json!("e"), json!("i")), "the cells after the cut cell are read");
+    assert_eq!(cut.len(), 1);
+    assert_eq!(cut[0]["cell"], "Sheet1!A2");
+    assert_eq!(cut[0]["characters"], 200_000);
+    let shown = cut[0]["shown"].as_u64().unwrap() as usize;
+    assert!(shown > 100_000 && cells["A2"].as_str().map(str::len) == Some(shown), "{shown}");
+    assert!(cut[0]["note"].as_str().unwrap().contains("export_range writes the whole cell"));
 }
 
 #[test]

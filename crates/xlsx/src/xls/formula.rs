@@ -184,6 +184,7 @@ fn function_name(name: &str) -> String {
 
 /// Expression nesting at most, as in the formula parser: deeper trees would overflow the stack
 /// when printed, evaluated or dropped (a hostile file can chain thousands of PtgParen tokens).
+// AGREED LIMIT (owner, 2026-11-28): 256 levels — an older .xls formula nested deeper is not read — why: item 26 rule 6, "Necessary limits - agreed" — necessary against a hostile file.
 const MAX_DEPTH: usize = 256;
 
 /// Operand stack entries: an expression and its nesting depth.

@@ -68,6 +68,8 @@ pub fn specs() -> Vec<CommandSpec> {
 
 /// Sheet geometry is in pixels at 96 dpi; PDF units are points.
 pub(crate) const PX_TO_PT: f32 = 0.75;
+/// Most rows or columns repeated as print titles.
+const MAX_TITLES: u32 = 500;
 /// Most pages one export produces.
 // AGREED LIMIT (owner, 2026-11-28): 2,000 pages — one PDF export or print stops there and its answer says so (`pages_cut`, `note`) —
 // why: item 26 rule 5, "Timers, memory, and safety - agreed" — necessary because a layout can run to billions of pages (a cell at
@@ -236,8 +238,10 @@ fn title_span(t: Option<(u32, u32)>, max: u32) -> Option<(u32, u32)> {
     if a >= max {
         return None;
     }
-    // Repeated titles are capped (Excel needs them to fit on a page anyway).
-    Some((a, b.min(max - 1).min(a.saturating_add(499))))
+    // Repeated titles are capped (Excel needs them to fit on a page anyway); page setup refuses more (item 26, B35).
+    // AGREED LIMIT (owner, 2026-11-28): 500 rows or columns of print titles — more is refused when set — why: item 26 rule 6,
+    // "Necessary limits - agreed" — necessary because titles repeat on every page and must leave room for the page's own rows.
+    Some((a, b.min(max - 1).min(a.saturating_add(MAX_TITLES - 1))))
 }
 
 /// Paginates one sheet.
@@ -1072,6 +1076,8 @@ fn wrap_lines_by(text: &str, width: f32, measure: &dyn Fn(&str) -> f32) -> Vec<S
                 out.push(cut);
                 line = rest;
             }
+            // AGREED LIMIT (owner, 2026-11-28): 2,000 wrapped lines of a cell's text are laid out (500 of a shape's) — why: item 26 rule 6, "Necessary
+            // limits - agreed" — necessary and never visible: a row is at most 409 points high, about 30 lines.
             if out.len() > 2000 {
                 return out;
             }
@@ -2075,7 +2081,13 @@ fn render_png_cmd(s: &mut Session, p: &Json) -> Result<Json> {
     o.gridlines = bool_param(p, "gridlines").unwrap_or(true);
     o.headings = bool_param(p, "headings").unwrap_or(false);
     // `fit`: shrink the scale so the picture's longer side stays within this many pixels.
-    if let Some(fit) = f64_param(p, "maxPixels").filter(|v| v.is_finite() && *v >= 16.0) {
+    // (item 26, B27: below 16 pixels it is refused; it was ignored)
+    if let Some(v) = f64_param(p, "maxPixels")
+        && !(v.is_finite() && v >= 16.0)
+    {
+        return Err(bad(CMD, format!("`maxPixels` is a number of pixels of 16 or more (got {v})")));
+    }
+    if let Some(fit) = f64_param(p, "maxPixels") {
         let r = range.or_else(|| print_range(sh)).unwrap_or(RangeRef::new(CellRef::new(0, 0), CellRef::new(19, 9)));
         let (w, h) = png_size(sh, r, &o);
         let long = w.max(h);
@@ -2221,6 +2233,14 @@ fn page_setup(s: &mut Session, p: &Json) -> Result<Json> {
     };
     let title_rows = parse_rows("titleRows")?;
     let title_cols = parse_cols("titleCols")?;
+    // (item 26, B35: more than 500 repeated rows or columns are refused; they were cut to 500 without a word)
+    for (key, t) in [("titleRows", title_rows), ("titleCols", title_cols)] {
+        if let Some(Some((a, b))) = t
+            && b.abs_diff(a) >= MAX_TITLES
+        {
+            return Err(bad(CMD, format!("`{key}` repeats {} on every page: at most {MAX_TITLES} fit", b.abs_diff(a) + 1)));
+        }
+    }
     let print_area = match any_param(p, "printArea") {
         None => None,
         Some(Json::Null) => Some(None),
@@ -2822,7 +2842,12 @@ mod tests {
         // (item 26, B36: the stop is said)
         assert_eq!(r["pages_cut"], true);
         assert!(r["note"].as_str().unwrap().starts_with("The PDF stops at 2000 pages"));
-        s.execute("pageLayout.pageSetup", json!({"fitWidth": 1, "fitHeight": 1, "titleRows": "1:1048576", "titleCols": "A:XFD", "headings": true}))
+        // (item 26, B35: more repeated rows or columns than a page holds are refused in words, not cut to 500)
+        let e = s.execute("pageLayout.pageSetup", json!({"titleRows": "1:1048576"})).unwrap_err().to_string();
+        assert!(e.contains("`titleRows` repeats 1048576 on every page: at most 500 fit"), "{e}");
+        let e = s.execute("pageLayout.pageSetup", json!({"titleCols": "A:XFD"})).unwrap_err().to_string();
+        assert!(e.contains("`titleCols` repeats 16384 on every page"), "{e}");
+        s.execute("pageLayout.pageSetup", json!({"fitWidth": 1, "fitHeight": 1, "titleRows": "1:500", "titleCols": "A:SF", "headings": true}))
             .unwrap();
         let pv = s.execute("file.printPreview", json!({})).unwrap();
         assert!(pv["pages"].as_u64().unwrap() <= MAX_PAGES as u64);

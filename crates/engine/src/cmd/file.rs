@@ -90,11 +90,18 @@ fn adopt_opened(
     p: &Json,
     name: String,
     mut wb: gridcraft_model::Workbook,
-    warnings: Vec<String>,
+    mut warnings: Vec<String>,
     imported: bool,
     encrypted: bool,
     sniffed: gridcraft_xlsx::Format,
 ) -> Result<Json> {
+    // WHIQ (item 26, C10): a large workbook whose sheets stay on disk is not recalculated at open (its formulas show the values the
+    // file stored); a smaller one is. The open says which.
+    if wb.sheets.iter().any(|sh| !sh.cells.is_resident()) {
+        warnings.push(
+            "the workbook is large: its sheets stay on disk until used, and its formulas show the values the file stored (it was not recalculated at open); recalculate to compute them".to_string(),
+        );
+    }
     wb.source_dir = str_param(p, "path").and_then(crate::io::source_dir);
     let title = if imported {
         format!("{} (imported).xlsx", std::path::Path::new(&name).file_stem().and_then(|n| n.to_str()).unwrap_or("Book"))

@@ -113,6 +113,9 @@ pub trait Backend {
 }
 
 /// Read/write timeout on the control connection.
+// AGREED LIMIT (owner, 2026-11-28): 30 s for the app to answer a command, 2 s to connect, a reply of at most 256 MB (--connect mode
+// only) — why: item 26 rule 5, "Timers, memory, and safety - agreed" — arbitrary by agreement; past 30 s the answer says the command may
+// have run.
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 /// Longest reply line accepted from the app (guards against a runaway peer).
 const MAX_REPLY: u64 = 256 * 1024 * 1024;
@@ -122,12 +125,14 @@ pub struct Remote {
     addr: String,
     conn: Option<(BufReader<TcpStream>, TcpStream)>,
     next_id: u64,
+    /// The request of the call in progress reached the app (it may have run).
+    sent: bool,
 }
 
 impl Remote {
     /// Connect to `addr` (`127.0.0.1:7979`), failing fast when nothing is listening.
     pub fn connect(addr: &str) -> std::io::Result<Self> {
-        let mut r = Self { addr: addr.to_string(), conn: None, next_id: 1 };
+        let mut r = Self { addr: addr.to_string(), conn: None, next_id: 1, sent: false };
         r.reconnect()?;
         Ok(r)
     }
@@ -165,6 +170,7 @@ impl Remote {
         writer.write_all(line.as_bytes())?;
         writer.write_all(b"\n")?;
         writer.flush()?;
+        self.sent = true;
         let mut reply = String::new();
         let n = std::io::Read::take(reader, MAX_REPLY).read_line(&mut reply)?;
         if n == 0 {
@@ -179,9 +185,18 @@ impl Backend for Remote {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         let line = json!({"id": id, "method": method, "params": params}).to_string();
-        // One retry with a fresh connection (the app may have restarted).
+        // One retry with a fresh connection (the app may have restarted) — only when the request was never sent: one the app received
+        // may have run, and is never sent twice (WHIQ item 26, A38: a call that timed out was sent again and could run twice).
+        self.sent = false;
         let reply = match self.roundtrip(&line) {
             Ok(r) => r,
+            Err(e) if self.sent => {
+                self.conn = None;
+                return Err(format!(
+                    "the GridCraft app at {} did not answer ({e}): the command may have run there; inspect_workbook shows the workbook before you try again",
+                    self.addr
+                ));
+            }
             Err(_) => {
                 self.conn = None;
                 self.roundtrip(&line).map_err(|e| {

@@ -8,6 +8,9 @@ use gridcraft_numfmt::{NumberFormat, format_value};
 use crate::{ChartData, Rgba, SeriesData, TrendlineData};
 
 /// Cap on points per series (keeps whole-column references from exploding).
+// AGREED LIMIT (owner, 2026-11-28): a chart picture draws the first 100,000 points of a series, 255 series (Excel's) and 16 trendlines a series — the chart in
+// the workbook keeps all its data — why: item 26 rule 6, "Necessary limits - agreed" — necessary because a whole-column reference
+// would otherwise draw a million points.
 pub(crate) const MAX_POINTS: usize = 100_000;
 /// Cap on series per chart.
 pub(crate) const MAX_SERIES: usize = 255;

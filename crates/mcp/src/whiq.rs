@@ -278,6 +278,7 @@ fn tool(name: &str, title: &str, desc: &str, schema: Value, hints: Hints) -> Val
 }
 
 /// WHIQ: tools whose answer carries one large text (kept whole, sent as its own content block).
+// AGREED LIMIT (owner, 2026-11-28): the preview's HTML and the Markdown read are not cut by the answer-size rule: they page by their own window (2,000,000 cells at most) and part size (1 KB to 64 MB) — why: item 26 rule 6, "Necessary limits - agreed" — necessary because a cut page cannot be drawn.
 const BIG_TEXT: &[(&str, &str)] = &[("render_preview", "html"), ("export_markdown", "markdown")];
 
 /// Tools that write files: they take `overwrite`.
@@ -841,9 +842,14 @@ pub(crate) fn dispatch_extra(b: &mut dyn Backend, name: &str, a: &Args) -> Resul
         "close_workbook" => {
             let handle = b.active_document();
             let discard = a.get("discard").and_then(Value::as_bool).unwrap_or(false);
-            let r = exec(b, "file.close", json!({"force": discard}))?;
-            if r["closed"] != true {
+            // (item 26, B56: closing unsaved work without `discard` only queued the desktop's "save changes?" dialog, which a call
+            // with no window refuses — so the unsaved work is said here, before the close)
+            if !discard && exec(b, "document.inspect", json!({}))?["dirty"] == true {
                 return Err("the workbook has unsaved changes: save_workbook it first, or pass discard: true to close it anyway".into());
+            }
+            let r = exec(b, "file.close", json!({"force": true}))?;
+            if r["closed"] != true {
+                return Err(format!("the workbook was not closed: {r}"));
             }
             Ok(json!({"closed": handle, "active_document": b.active_document()}))
         }
@@ -1168,12 +1174,9 @@ pub fn with_globals(mut tools: Vec<Value>) -> Vec<Value> {
             // WHIQ (item 26): a read-only tool pages a long answer by size (continue_from; calling it again changes nothing). Any other
             // tool's long answer is cut by structure and saved whole to a file (answer_cap): it takes no continue_from, as calling it
             // again would repeat its changes.
-            if read_only {
-                props.entry("continue_from").or_insert(int(if name == "read_range" {
-                    "Where to resume a part cut by size (its numeric continue_from: the rows of the part already read)"
-                } else {
-                    "Where to resume an answer cut by size (its continue_from)"
-                }));
+            // (read_range pages by range: its answer names the next range to read)
+            if read_only && name != "read_range" {
+                props.entry("continue_from").or_insert(int("Where to resume an answer cut by size (its continue_from)"));
             }
             if name == "export_markdown" {
                 props.insert(
@@ -1367,7 +1370,9 @@ pub fn run_tool(b: &mut dyn Backend, st: &mut CallState, name: &str, args: &Valu
             let mut v = if read_only {
                 contract::trim_from(v, from as usize, crate::answer_cap::MAX_ANSWER_CHARS)
             } else {
-                crate::answer_cap::cap(v, name, b.roots().1.as_deref(), "")
+                // (the list rule first: a tool that changes the workbook lists 25 of a long list, with the total and the file)
+                let dir = b.roots().1;
+                crate::answer_cap::cap(crate::answer_cap::listed(v, name, dir.as_deref()), name, dir.as_deref(), "")
             };
             warnings.append(&mut st.notices);
             if !v.is_object() && (reports.iter().any(|r| r.previous_renamed_to.is_some()) || !warnings.is_empty()) {
@@ -2070,8 +2075,8 @@ fn export_range(b: &mut dyn Backend, a: &Args) -> Result<Value, ToolError> {
     Ok(v)
 }
 
-/// read_range that never floods the caller: at most `max_cells` cells per call; the answer says
-/// `truncated`, `continue_from` (the first cell not returned) and `next_range` to ask for next.
+/// read_range that never floods the caller: at most `max_cells` cells per call, and no answer over the answer-size rule; a cut
+/// answer says `truncated`, the part it holds (`range`), `next_range` to ask for next and, after a row cut, `then_range`.
 fn read_range(b: &mut dyn Backend, st: &CallState, a: &Args) -> Result<Value, ToolError> {
     let cap = a.get("max_cells").and_then(Value::as_u64).unwrap_or(st.settings.max_read_cells).max(1);
     let mut p = pick(a, &["range", "sheet", "formulas", "formatted"]);
@@ -2122,45 +2127,25 @@ fn read_range(b: &mut dyn Backend, st: &CallState, a: &Args) -> Result<Value, To
         }
     }
     let q = quote_sheet(&sheet_name);
-    if r.count() <= cap {
-        let mut v = b.call("sheet.read", p).map_err(|e| classify(b, "read_range", a, &e))?;
-        let whole = v["range"].as_str().and_then(RangeRef::parse).unwrap_or(r);
-        if let Some(fit) = fit_read(&mut v, whole) {
-            said_part(&mut v, &q, whole, fit.part, fit.next_start, fit.next_range);
-            // (one row cut: the rows below it come after the rest of it)
-            if fit.part.end.row < whole.end.row && fit.next_range.end.row == fit.part.end.row {
-                let then = format!("{q}!{}", RangeRef::new(CellRef::new(fit.part.end.row + 1, whole.start.col), whole.end).a1());
-                v["then_range"] = json!(then);
-                v["next_step"] = json!(format!("call read_range with range \"{}\" for the rest of this row, then \"{then}\" for the rows after it", v["next_range"].as_str().unwrap_or_default()));
-            }
-        }
-        if let Some(n) = narrowed {
-            v["note"] = json!(n);
-        }
-        return Ok(v);
-    }
+    // the part this call reads: the whole range when it is no larger than one read; else its first rows, or, for a row wider than
+    // one read, the first cells of that row
     let width = u64::from(r.width());
-    let part = if width > cap {
+    let part = if r.count() <= cap {
+        r
+    } else if width > cap {
         RangeRef::new(r.start, CellRef::new(r.start.row, r.start.col.saturating_add(cap as u32 - 1)))
     } else {
         let rows = (cap / width).max(1) as u32;
         RangeRef::new(r.start, CellRef::new(r.start.row.saturating_add(rows - 1).min(r.end.row), r.end.col))
-    };
-    let (next_start, next_range) = if width > cap {
-        let c = CellRef::new(part.start.row, part.end.col + 1);
-        (c, RangeRef::new(c, CellRef::new(part.start.row, r.end.col)))
-    } else {
-        let c = CellRef::new(part.end.row + 1, r.start.col);
-        (c, RangeRef::new(c, r.end))
     };
     p["range"] = json!(format!("{q}!{}", part.a1()));
     if let Some(o) = p.as_object_mut() {
         o.remove("sheet");
     }
     let mut v = b.call("sheet.read", p).map_err(|e| classify(b, "read_range", a, &e))?;
-    match fit_read(&mut v, if width > cap { RangeRef::new(part.start, CellRef::new(part.start.row, r.end.col)) } else { r }) {
-        Some(fit) => said_part(&mut v, &q, r, fit.part, fit.next_start, fit.next_range),
-        None => said_part(&mut v, &q, r, part, next_start, next_range),
+    let kept = fit_read(&mut v, part, &q);
+    if kept != r {
+        said_part(&mut v, &q, r, kept);
     }
     if let Some(n) = narrowed {
         v["note"] = json!(n);
@@ -2168,41 +2153,52 @@ fn read_range(b: &mut dyn Backend, st: &CallState, a: &Args) -> Result<Value, To
     Ok(v)
 }
 
-/// The answer says the part it holds of `whole` and the range that comes next.
-fn said_part(v: &mut Value, q: &str, whole: RangeRef, part: RangeRef, next_start: CellRef, next_range: RangeRef) {
-    let next = format!("{q}!{}", next_range.a1());
+/// WHIQ (item 26, fault A8): the answer says the part of `whole` it holds and what to read next — the rows after it, or, when it
+/// holds the first cells of a row, the rest of that row (`next_range`) and then the rows after it (`then_range`). (A row cut in a
+/// range of several rows named only the rest of that row: an agent that followed it never read the rows below.)
+fn said_part(v: &mut Value, q: &str, whole: RangeRef, part: RangeRef) {
+    let rest_of_row = (part.end.col < whole.end.col)
+        .then(|| RangeRef::new(CellRef::new(part.end.row, part.end.col + 1), CellRef::new(part.end.row, whole.end.col)));
+    let rows_after = (part.end.row < whole.end.row).then(|| RangeRef::new(CellRef::new(part.end.row + 1, whole.start.col), whole.end));
+    let (next, then) = match rest_of_row {
+        Some(n) => (Some(n), rows_after),
+        None => (rows_after, None),
+    };
+    let name = |x: RangeRef| format!("{q}!{}", x.a1());
     v["range"] = json!(part.a1());
-    v["truncated"] = json!(true);
     v["total_cells"] = json!(whole.count());
     v["returned_cells"] = json!(part.count());
-    v["continue_from"] = json!(format!("{q}!{}", next_start.a1()));
-    v["next_range"] = json!(next);
-    v["next_step"] = json!(format!("call read_range with range \"{next}\" for the next part"));
-}
-
-struct Fit {
-    part: RangeRef,
-    next_start: CellRef,
-    next_range: RangeRef,
+    let Some(next) = next else { return };
+    v["truncated"] = json!(true);
+    v["next_range"] = json!(name(next));
+    v["next_step"] = json!(match then {
+        Some(t) => {
+            v["then_range"] = json!(name(t));
+            format!("call read_range with range \"{}\" for the rest of this row, then \"{}\" for the rows after it", name(next), name(t))
+        }
+        None => format!("call read_range with range \"{}\" for the next part", name(next)),
+    });
 }
 
 /// WHIQ (item 26, fault A8): an answer of read_range larger than the answer-size rule is cut HERE to the whole rows that fit (one
-/// row too large: the cells of it that fit), so that the answer names exactly the part it holds and the next range starts right
-/// after it. (The size trim after it cut the rows and kept the next range of the whole part: an agent that followed it skipped
-/// rows.) `whole`: the range the rest is in — the rows below, or for one row the rest of that row. None: the answer fits.
-fn fit_read(v: &mut Value, whole: RangeRef) -> Option<Fit> {
+/// row too large: the cells of it that fit; one cell too large: the start of its text, said in `cell_cut`), so that the answer
+/// names exactly the part it holds and the next range starts right after it. (The size trim after it cut the rows and kept the
+/// next range of the whole part: an agent that followed it skipped rows; a cell larger than the answer came back as no rows, and
+/// the next range skipped it.) Answers the part the answer holds: `part` when it fits.
+fn fit_read(v: &mut Value, part: RangeRef, q: &str) -> RangeRef {
     let budget = crate::answer_cap::MAX_ANSWER_CHARS - 4096;
     let size = |x: &Value| serde_json::to_string(x).map_or(0, |t| t.len());
     if size(v) <= budget {
-        return None;
+        return part;
     }
-    let part = v["range"].as_str().and_then(RangeRef::parse)?;
-    let rows = v["values"].as_array()?.clone();
-    let mut room = budget.saturating_sub(size(&{
-        let mut o = v.clone();
-        o["values"] = json!([]);
-        o
-    }) + 1024);
+    let Some(rows) = v["values"].as_array().cloned() else { return part };
+    let mut room = budget.saturating_sub(
+        size(&{
+            let mut o = v.clone();
+            o["values"] = json!([]);
+            o
+        }) + 1024,
+    );
     let mut k = 0;
     for row in &rows {
         let n = size(row) + 1;
@@ -2213,27 +2209,51 @@ fn fit_read(v: &mut Value, whole: RangeRef) -> Option<Fit> {
         k += 1;
     }
     if k > 0 {
-        let kept = RangeRef::new(part.start, CellRef::new(part.start.row + k as u32 - 1, part.end.col));
         v["values"] = Value::Array(rows[..k].to_vec());
-        let next_start = CellRef::new(kept.end.row + 1, whole.start.col);
-        return Some(Fit { part: kept, next_start, next_range: RangeRef::new(next_start, whole.end) });
+        return RangeRef::new(part.start, CellRef::new(part.start.row + k as u32 - 1, part.end.col));
     }
-    // one row larger than the answer can hold: the cells of it that fit (at least one: a cell larger than the answer is cut by the
-    // size trim after this, and said there)
-    let cells = rows.first()?.as_array()?.clone();
+    // one row larger than the answer can hold: the cells of it that fit
+    let Some(mut cells) = rows.first().and_then(Value::as_array).cloned() else { return part };
     let mut m = 0;
     for c in &cells {
         let n = size(c) + 1;
-        if n > room && m > 0 {
+        if n > room {
             break;
         }
-        room = room.saturating_sub(n);
+        room -= n;
         m += 1;
     }
-    let kept = RangeRef::new(part.start, CellRef::new(part.start.row, part.start.col + m as u32 - 1));
+    if m == 0 {
+        // one cell larger than the answer can hold: the start of its text, and the cell said (no other read holds more of it;
+        // export_range writes the whole cell to a file)
+        let at = format!("{q}!{}", part.start.a1());
+        if let Some(t) = cells.first().and_then(Value::as_str).map(str::to_string) {
+            let (mut used, mut shown) = (2usize, 0usize);
+            for ch in t.chars() {
+                let w = match ch {
+                    '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
+                    c if (c as u32) < 0x20 => 6,
+                    c => c.len_utf8(),
+                };
+                if used + w > room {
+                    break;
+                }
+                used += w;
+                shown += 1;
+            }
+            let total = t.chars().count();
+            cells[0] = json!(t.chars().take(shown).collect::<String>());
+            v["cell_cut"] = json!({
+                "cell": at,
+                "characters": total,
+                "shown": shown,
+                "note": format!("{at} holds {total} characters, more than one answer holds: the first {shown} are here; export_range writes the whole cell to a CSV file"),
+            });
+        }
+        m = 1;
+    }
     v["values"] = json!([cells[..m].to_vec()]);
-    let next_start = CellRef::new(part.start.row, kept.end.col + 1);
-    Some(Fit { part: kept, next_start, next_range: RangeRef::new(next_start, CellRef::new(part.start.row, whole.end.col)) })
+    RangeRef::new(part.start, CellRef::new(part.start.row, part.start.col + m as u32 - 1))
 }
 
 // ---------------------------------------------------------------- errors

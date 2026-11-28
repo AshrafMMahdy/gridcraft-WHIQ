@@ -35,6 +35,7 @@ use crate::{Arg, Ctx, FnSpec};
 type C<'a> = &'a mut dyn Ctx;
 
 /// Longest timeline (after completing missing points) the functions accept.
+// AGREED LIMIT (owner, 2026-11-28): 200,000 points for FORECAST.ETS (more is an error), 10 starting points and 400 optimiser steps — why: item 26 rule 5, "Timers, memory, and safety - agreed" — arbitrary by agreement; the season of 8,760 and 30 % missing points are Excel's.
 pub(crate) const MAX_POINTS: usize = 200_000;
 /// Longest seasonality Excel supports (hours in a year).
 pub(crate) const MAX_SEASON: usize = 8_760;

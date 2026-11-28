@@ -15,6 +15,9 @@ use crate::xml::{self, El};
 
 /// Largest decompressed part read into memory at the smallest budget (half the memory budget
 /// when that is more). Worksheets are streamed, not read into memory.
+// AGREED LIMIT (owner, 2026-11-28): 512 MB a part, 1 GB a package, 200,000 entries (or the memory budget's shares when larger) — a package past them is
+// refused, naming the numbers — why: item 26 rule 6, "Necessary limits - agreed" — necessary because these parts are read into memory
+// (zip bombs too).
 pub const MAX_PART: u64 = 512 * 1024 * 1024;
 /// Largest total decompressed size read into memory from one package at the smallest budget
 /// (twice the memory budget when that is more).

@@ -20,6 +20,7 @@ const MAX_IMAGE: u64 = 16 * 1024 * 1024;
 const MAX_IMAGES_TOTAL: usize = 128 * 1024 * 1024;
 const MAX_RECORDS: usize = 100_000;
 const MAX_XML: u64 = 16 * 1024 * 1024;
+// AGREED LIMIT (owner, 2026-11-28): cell pictures of 16 MB, 8,192 pixels a side and 16 megapixels each, 128 MB in all — a larger one keeps its fallback value, said when opened — why: item 26 rule 6, "Necessary limits - agreed" — necessary because they are held in memory.
 const MAX_PIXELS: u64 = 16_000_000;
 
 /// Header dimensions bound decode allocations in consumers. Full decoding is left to the UI.

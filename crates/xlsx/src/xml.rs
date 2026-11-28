@@ -8,6 +8,7 @@ use quick_xml::events::{BytesStart, Event};
 use crate::IoError;
 
 /// Maximum element nesting accepted in any part.
+// AGREED LIMIT (owner, 2026-11-28): 256 levels of XML nesting — a deeper file is refused — why: item 26 rule 6, "Necessary limits - agreed" — necessary against a hostile file.
 pub const MAX_DEPTH: usize = 256;
 
 /// An element: local name (namespace prefix dropped), attributes by local name, children and

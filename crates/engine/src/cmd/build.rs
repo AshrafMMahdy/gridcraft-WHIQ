@@ -41,6 +41,7 @@ const CMD: &str = "file.build";
 /// Largest workbook a spec may describe (cells written) at the smallest memory budget. WHIQ: the
 /// working limit is one cell per 64 bytes of the memory budget when that is more (a spec arrives
 /// whole in one call; larger workbooks are built in parts with write_range).
+// AGREED LIMIT (owner, 2026-11-28): 5,000,000 cells (or one per 64 bytes of the memory budget) — a build_workbook spec over them is refused, naming both — why: item 26 rule 5, "Timers, memory, and safety - agreed" — necessary because the spec is built in memory.
 const MAX_CELLS_FLOOR: u64 = 5_000_000;
 
 fn max_cells() -> u64 {
@@ -922,9 +923,8 @@ fn recalculate(s: &mut Session, _: &Json) -> Result<Json> {
             formulas += 1;
             if let gridcraft_core::Value::Error(e) = sh.value(c) {
                 error_count += 1;
-                if errors.len() < 100 {
-                    errors.push(json!({"cell": format!("{}{}", q(&sh.name), c.a1()), "error": e.as_str()}));
-                }
+                // (item 26, B49: every error cell is listed; the MCP cuts the list to 25 with the total and a file)
+                errors.push(json!({"cell": format!("{}{}", q(&sh.name), c.a1()), "error": e.as_str()}));
             }
         }
     }

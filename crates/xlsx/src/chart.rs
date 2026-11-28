@@ -320,6 +320,7 @@ fn group_for(k: ChartKind) -> G {
     }
 }
 
+// AGREED LIMIT (owner, 2026-11-28): 100,000 cells — a series longer than this is saved without its value cache (Excel recomputes it) — why: item 26 rule 5, "Timers, memory, and safety - agreed" — arbitrary by agreement.
 const MAX_CACHE: u64 = 100_000;
 
 /// Values of a same-workbook reference (`Sheet1!$B$2:$B$9`), row-major.

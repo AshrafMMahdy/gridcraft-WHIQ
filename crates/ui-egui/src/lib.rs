@@ -78,6 +78,7 @@ pub struct UiState {
     pub interface_scale: u16,
 }
 
+// AGREED LIMIT (owner, 2026-11-28): interface scale 75 % to 200 % — why: item 26 rule 8 (the desktop app) and rule 5 — arbitrary by agreement (harmless).
 pub const INTERFACE_SCALE_MIN: u16 = 75;
 pub const INTERFACE_SCALE_MAX: u16 = 200;
 
@@ -779,6 +780,7 @@ impl SheetApp {
         if let Some(path) = path {
             self.ui.recent.retain(|p| p != path);
             self.ui.recent.insert(0, path.to_string());
+            // AGREED LIMIT (owner, 2026-11-28): 20 recent files on the File menu — why: item 26 rule 8 (the desktop app) and rule 5 — arbitrary by agreement (harmless).
             self.ui.recent.truncate(20);
         }
         self.show_open_warnings(r);
@@ -1154,7 +1156,14 @@ impl SheetApp {
         {
             self.grid.last_autosave = now;
             self.store_view_state();
-            let _ = self.session.run("file.save", json!({}));
+            // WHIQ (item 26, D1): a failed AutoSave is said (it was silent: the work looked saved)
+            // AGREED LIMIT (owner, 2026-11-28): 2 s after a change, AutoSave saves an .xlsx with a file — why: item 26 rule 8 (desktop)
+            // and rule 5 — arbitrary by agreement.
+            if let Err(e) = self.session.run("file.save", json!({}))
+                && self.message.is_none()
+            {
+                self.message = Some(("AutoSave".into(), format!("AutoSave could not save the workbook: {}", clean_error(&e))));
+            }
         }
         // Window title.
         if let Some(d) = self.session.active() {

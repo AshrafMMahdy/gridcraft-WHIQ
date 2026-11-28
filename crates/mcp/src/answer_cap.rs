@@ -119,6 +119,37 @@ fn save(dir: &Path, tool: &str, text: &str) -> Result<PathBuf, String> {
     }
 }
 
+// AGREED LIMIT (owner, 2026-11-28): 25 — a list in the answer of a tool that changes the workbook shows its first 25, with
+// `<list>_total` and `<list>_note` naming the file that holds every item — why: item 26 rule 3, "Lists inside Answers, Agreed" — the
+// platform's and the P6 clone's list rule, arbitrary by agreement. Reading tools return what is asked (and page).
+pub const LISTED: usize = 25;
+
+/// The list rule on an answer: each top-level list longer than [`LISTED`] is cut to its first [`LISTED`] items, with `<list>_total`
+/// and `<list>_note`; the whole answer is written once to `<tool>-result-<stamp>.json` in `dir` (else the system temp folder).
+pub fn listed(v: Value, tool: &str, dir: Option<&Path>) -> Value {
+    let Value::Object(mut o) = v else { return v };
+    let long: Vec<String> = o.iter().filter(|(_, x)| x.as_array().is_some_and(|a| a.len() > LISTED)).map(|(k, _)| k.clone()).collect();
+    if long.is_empty() {
+        return Value::Object(o);
+    }
+    let folder = dir.map(Path::to_path_buf).unwrap_or_else(|| std::env::temp_dir().join("gridcraft-results"));
+    let saved = save(&folder, tool, &serde_json::to_string(&Value::Object(o.clone())).unwrap_or_default());
+    for k in long {
+        let Some(Value::Array(items)) = o.remove(&k) else { continue };
+        let n = items.len();
+        o.insert(k.clone(), Value::Array(items.into_iter().take(LISTED).collect()));
+        o.insert(format!("{k}_total"), json!(n));
+        o.insert(
+            format!("{k}_note"),
+            json!(match &saved {
+                Ok(p) => format!("{LISTED} of {n} shown; all {n} in {}.", p.display()),
+                Err(e) => format!("{LISTED} of {n} shown; the whole list could not be written to a file ({e})."),
+            }),
+        );
+    }
+    Value::Object(o)
+}
+
 /// The rule applied to a tool's answer: `v` as it is when it fits; else the cut answer with `result_truncated`
 /// {original_chars, kept_chars, full_result_path | full_result_missing, note} (the platform's words), the whole answer saved
 /// in `dir` (the write root; else the system temp folder). `ask`: how to ask the tool for less, when it can be asked.
@@ -164,6 +195,21 @@ pub fn cap_at(v: Value, tool: &str, dir: Option<&Path>, ask: &str, max: usize) -
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn a_long_list_shows_25_with_its_total_and_the_file() {
+        let dir = std::env::temp_dir().join(format!("gc-list-{}", std::process::id()));
+        let v = json!({"errors": (0..40).collect::<Vec<_>>(), "count": 40, "short": [1, 2]});
+        let out = listed(v, "recalculate", Some(&dir));
+        assert_eq!(out["errors"].as_array().unwrap().len(), 25);
+        assert_eq!(out["errors_total"], 40);
+        assert_eq!(out["short"], json!([1, 2]));
+        let note = out["errors_note"].as_str().unwrap();
+        let path = note.rsplit_once(" in ").unwrap().1.trim_end_matches('.');
+        let whole: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(whole["errors"].as_array().unwrap().len(), 40);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn small_answers_pass_whole() {

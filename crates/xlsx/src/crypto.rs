@@ -14,6 +14,7 @@ use crate::cfb::Compound;
 use crate::xml::El;
 
 /// Spin counts above this are refused (the cap sheet-protection hashes use too).
+// AGREED LIMIT (owner, 2026-11-28): 10,000,000 hash rounds — see model/src/password.rs — why: item 26 rule 6, "Necessary limits - agreed" — necessary against a hostile file.
 const MAX_SPIN_COUNT: u32 = 10_000_000;
 /// Standard encryption always iterates this many times.
 const STANDARD_SPIN_COUNT: u32 = 50_000;

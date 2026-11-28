@@ -781,6 +781,7 @@ fn print(app: &mut SheetApp, ui: &mut Ui, bs: &mut Backstage, out: &mut Outcome)
 }
 
 /// Most rows and columns one preview page draws (a page holds far fewer at any readable scale).
+// AGREED LIMIT (owner, 2026-11-28): a print preview page draws 200 rows x 60 columns, 96 pages painted, 2,000 page frames a frame — why: item 26 rule 8 (the desktop app) and rule 5 — arbitrary by agreement (harmless); the printout itself is whole.
 const PREVIEW_ROWS: u32 = 200;
 const PREVIEW_COLS: u32 = 60;
 

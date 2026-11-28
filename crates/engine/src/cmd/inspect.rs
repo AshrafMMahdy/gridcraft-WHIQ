@@ -75,8 +75,11 @@ fn inspect(s: &mut Session, _: &Json) -> Result<Json> {
         "structureProtected": wb.protected_structure,
         "codeName": wb.code_name,
         "macros": wb.vba_project.is_some(),
-        "undo": d.undo.iter().rev().take(20).map(|e| e.label.clone()).collect::<Vec<_>>(),
-        "redo": d.redo.iter().rev().take(20).map(|e| e.label.clone()).collect::<Vec<_>>(),
+        // (item 26, B60: the last 25 of each, the list rule, with how many there are)
+        "undo": d.undo.iter().rev().take(25).map(|e| e.label.clone()).collect::<Vec<_>>(),
+        "undoCount": d.undo.len(),
+        "redo": d.redo.iter().rev().take(25).map(|e| e.label.clone()).collect::<Vec<_>>(),
+        "redoCount": d.redo.len(),
         "theme": wb.theme.name,
         "mode": format!("{:?}", s.mode),
     }))
@@ -160,7 +163,7 @@ pub(crate) fn chart_json(c: &gridcraft_model::Chart) -> Json {
 
 /// WHIQ: the cells a protected sheet still lets anyone edit: unlocked cells (and unlocked whole
 /// rows and columns) as ranges, at most `cap`, and how many more there are.
-pub(crate) fn unlocked_ranges(wb: &gridcraft_model::Workbook, sh: &gridcraft_model::Sheet, cap: usize) -> (Vec<String>, usize) {
+pub(crate) fn unlocked_ranges(wb: &gridcraft_model::Workbook, sh: &gridcraft_model::Sheet, cap: usize) -> (Vec<String>, usize, Option<&'static str>) {
     let unlocked = |st: gridcraft_model::StyleId| !wb.styles.get(st).protection.locked;
     let mut out: Vec<String> = vec![];
     for (c, info) in &sh.cols {
@@ -175,8 +178,19 @@ pub(crate) fn unlocked_ranges(wb: &gridcraft_model::Workbook, sh: &gridcraft_mod
         }
     }
     // Cells by column, rows in order; runs down a column, then side-by-side equal runs joined.
+    // AGREED LIMIT (owner, 2026-11-28): the first 200,000 unlocked cells of a sheet are joined into ranges — past them, and for a
+    // sheet still on disk, the answer says the list is partial (`unlockedPartial`) — why: item 26 rule 5, "Timers, memory, and
+    // safety - agreed" — arbitrary by agreement (an inspect stays quick).
     let mut cells: Vec<CellRef> =
-        if sh.cells.is_resident() { sh.cells.iter().filter(|(_, x)| unlocked(x.style)).map(|(c, _)| c).take(200_000).collect() } else { vec![] };
+        if sh.cells.is_resident() { sh.cells.iter().filter(|(_, x)| unlocked(x.style)).map(|(c, _)| c).take(UNLOCKED_SCAN + 1).collect() } else { vec![] };
+    let partial = if !sh.cells.is_resident() {
+        Some("the sheet is still on disk: its unlocked cells are listed once it is read")
+    } else if cells.len() > UNLOCKED_SCAN {
+        cells.truncate(UNLOCKED_SCAN);
+        Some("the sheet has more than 200,000 unlocked cells: the ranges are those of the first 200,000")
+    } else {
+        None
+    };
     cells.sort_by_key(|c| (c.col, c.row));
     let mut runs: Vec<RangeRef> = vec![];
     for c in cells {
@@ -196,13 +210,15 @@ pub(crate) fn unlocked_ranges(wb: &gridcraft_model::Workbook, sh: &gridcraft_mod
     out.extend(blocks.iter().map(|b| b.a1()));
     let more = out.len().saturating_sub(cap);
     out.truncate(cap);
-    (out, more)
+    (out, more, partial)
 }
+const UNLOCKED_SCAN: usize = 200_000;
 
 /// WHIQ: what a sheet's protection allows and what can still be edited (`null` unprotected).
 pub(crate) fn protection_json(wb: &gridcraft_model::Workbook, sh: &gridcraft_model::Sheet) -> Json {
     let Some(p) = &sh.protection else { return Json::Null };
-    let (cells, more) = unlocked_ranges(wb, sh, 20);
+    // (25 shown, the list rule; `unlockedMore` counts the rest)
+    let (cells, more, partial) = unlocked_ranges(wb, sh, 25);
     let allowed: Vec<&str> = [
         ("formatCells", p.format_cells),
         ("formatColumns", p.format_columns),
@@ -226,6 +242,7 @@ pub(crate) fn protection_json(wb: &gridcraft_model::Workbook, sh: &gridcraft_mod
         "password": p.password.is_some() || p.legacy_password_hash.is_some(),
         "unlockedCells": cells,
         "unlockedMore": more,
+        "unlockedPartial": partial,
         "editRanges": sh.edit_ranges.iter().map(|r| json!({"title": r.title, "ranges": r.ranges.iter().map(|x| x.a1()).collect::<Vec<_>>(), "password": r.password.is_some()})).collect::<Vec<_>>(),
         "allowed": allowed,
     })
@@ -234,7 +251,7 @@ pub(crate) fn protection_json(wb: &gridcraft_model::Workbook, sh: &gridcraft_mod
 /// WHIQ: one line saying what a protected sheet still lets anyone edit, for agents.
 pub(crate) fn protection_summary(wb: &gridcraft_model::Workbook, sh: &gridcraft_model::Sheet) -> Option<String> {
     sh.protection.as_ref()?;
-    let (cells, more) = unlocked_ranges(wb, sh, 20);
+    let (cells, more, _) = unlocked_ranges(wb, sh, 25);
     let mut parts = vec![];
     if !cells.is_empty() {
         parts.push(format!("its unlocked cells {}{}", cells.join(", "), if more > 0 { format!(" and {more} more") } else { String::new() }));

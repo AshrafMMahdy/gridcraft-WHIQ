@@ -42,6 +42,7 @@ use crate::write::{NS_REL, Out, Rels, XML_DECL};
 use crate::xml::{self, esc_attr};
 
 /// Most bytes kept for one workbook.
+// AGREED LIMIT (owner, 2026-11-28): parts GridCraft does not model are kept as written up to 256 MB in all, 64 MB a part, 4,096 parts — past them they are dropped on save — why: item 26 rule 5, "Timers, memory, and safety - agreed" — necessary because they are held in memory.
 pub const MAX_KEPT_TOTAL: usize = 256 * 1024 * 1024;
 /// Largest single kept part.
 pub const MAX_KEPT_PART: u64 = 64 * 1024 * 1024;

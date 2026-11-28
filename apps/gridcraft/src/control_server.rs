@@ -13,6 +13,7 @@ use std::time::Duration;
 use gridcraft_ui_egui::ControlRequest;
 use serde_json::{Value as Json, json};
 
+// AGREED LIMIT (owner, 2026-11-28): a control request of at most 64 MB (--connect mode) — why: item 26 rule 5 — necessary because a request is held in memory.
 const MAX_LINE: usize = 64 * 1024 * 1024;
 
 pub fn start(port: u16, ctx: egui::Context) -> std::io::Result<Receiver<ControlRequest>> {

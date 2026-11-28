@@ -16,6 +16,7 @@ pub const MAX_FORMULA_LEN: usize = 8_192;
 /// Most calculated fields per PivotTable.
 pub const MAX_CALC_FIELDS: usize = 256;
 /// Deepest chain of calculated fields using calculated fields.
+// AGREED LIMIT (owner, 2026-11-28): 256 calculated fields (more refused when added), 64 levels of fields naming fields, 8,192-character formulas (Excel's) — why: item 26 rule 6, "Necessary limits - agreed" — necessary because the evaluation is bounded.
 const MAX_DEPTH: usize = 64;
 const PREFIX: &str = "__pcf";
 

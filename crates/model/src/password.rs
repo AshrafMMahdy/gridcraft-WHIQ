@@ -11,6 +11,7 @@ use sha2::Digest;
 pub const DEFAULT_SPIN_COUNT: u32 = 100_000;
 /// Largest spin count accepted when verifying (the documented maximum); a file asking for more
 /// would only make verification hang.
+// AGREED LIMIT (owner, 2026-11-28): 10,000,000 hash rounds — an encrypted file asking for more is refused — why: item 26 rule 6, "Necessary limits - agreed" — necessary against a hostile file (Excel writes 100,000).
 pub const MAX_SPIN_COUNT: u32 = 10_000_000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -23,6 +23,9 @@ const TITLE_SIZE: f32 = 14.0;
 const LABEL_SIZE: f32 = 9.0;
 const AXIS_TITLE_SIZE: f32 = 10.0;
 /// Most categories drawn by category-axis charts.
+// AGREED LIMIT (owner, 2026-11-28): a chart picture draws at most 20,000 categories, lines of more than 2,000 points thinned to their extremes per pixel,
+// 5,000 markers and the labels of series of up to 200 points — the chart in the workbook keeps all its data — why: item 26 rule 6,
+// "Necessary limits - agreed" — necessary because a picture has only so many pixels to draw them in.
 const MAX_CATS: usize = 20_000;
 /// Lines with more points than this are decimated (min/max per pixel column).
 const MAX_LINE_PTS: usize = 2000;

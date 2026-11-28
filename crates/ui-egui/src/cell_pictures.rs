@@ -8,6 +8,7 @@ use egui::{Color32, Painter, Rect, TextureHandle, pos2, vec2};
 use gridcraft_engine::model::CellPicture;
 
 const MAX_ENCODED: usize = 16 * 1024 * 1024;
+// AGREED LIMIT (owner, 2026-11-28): the desktop shows cell pictures of up to 16 megapixels, a 64 MB cache of 4,096 pictures — why: item 26 rule 8 (desktop) and item 26 rule 5, "Timers, memory, and safety - agreed" — arbitrary by agreement (harmless).
 const MAX_PIXELS: u64 = 16_000_000;
 const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 // The byte budget controls texture memory; sparse entries have a separate modest bound.

@@ -985,16 +985,28 @@ fn run_script(s: &mut Session, p: &Json) -> Result<Json> {
     let name = str_param(p, "name").ok_or_else(|| bad("automate.runScript", "missing `name`"))?;
     let all = stash_get(&s.doc()?.wb, SCRIPTS_NAME);
     let steps = all.get(name).and_then(Json::as_array).cloned().ok_or_else(|| bad("automate.runScript", "no such script"))?;
-    let mut n = 0;
-    for st in steps.iter().take(100_000) {
+    // AGREED LIMIT (owner, 2026-11-28): 100,000 steps — a recorded script longer than this is refused — why: item 26 rule 5, "Timers,
+    // memory, and safety - agreed" — arbitrary by agreement. (Item 26, C25: it ran the first 100,000 without a word; the script steps
+    // that record or run scripts are skipped, and the answer counts them.)
+    if steps.len() > 100_000 {
+        return Err(bad("automate.runScript", format!("the script has {} steps: at most 100,000 run", steps.len())));
+    }
+    let (mut n, mut skipped) = (0, 0);
+    for st in &steps {
         let id = st["command"].as_str().unwrap_or("");
         if id.starts_with("automate.") {
+            skipped += 1;
             continue;
         }
         s.execute(id, st["params"].clone())?;
         n += 1;
     }
-    Ok(json!({"ran": n}))
+    let mut out = json!({"ran": n});
+    if skipped > 0 {
+        out["skipped"] = json!(skipped);
+        out["note"] = json!(format!("{skipped} steps that record or run scripts were skipped: a script does not run scripts"));
+    }
+    Ok(out)
 }
 
 fn delete_script(s: &mut Session, p: &Json) -> Result<Json> {

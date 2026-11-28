@@ -74,7 +74,7 @@ pipeline every `tools/call` goes through, `server_status`, `job_status`, error c
   `evicted` naming the file to reopen; a new process finds recovered files in the write root and
   names them on its first call and in `server_status`.
 - **Oversized results are trimmed.** `read_range` returns at most `--max-read-cells` (10 000) cells
-  (`max_cells` per call) with `truncated: true`, `continue_from`, `next_range` and a `next_step`;
+  (`max_cells` per call) with `truncated: true`, `next_range` and a `next_step` (item 26: `then_range` after a row cut);
   any result over `--max-result-kb` (256) is cut at its largest list with `truncated`,
   `continue_from` (an `offset`); `list_commands` / `list_functions` take `offset` / `limit`.
 - **server_status**: version, memory (RSS on Linux, an estimate elsewhere), open document (title,
@@ -995,3 +995,47 @@ listed as before, annotations unchanged. `crates/mcp/src/whiq.rs` (`DESKTOP_ONLY
 Test: `crates/mcp/src/tests.rs` `desktop_only_tools_are_listed_only_with_the_app` (headless every tool but those named, a
 hidden call still answers that it needs the app; with an app every tool, the hidden ones' annotations checked) and
 `the_stdio_loop_lists_desktop_only_tools_only_with_the_app` (the same through `runtime::serve`).
+
+## Item 26: no limit of ours the caller is not told about (2026-11-28)
+
+The platform's ledger item 26 (the owner's nine rules for the limits inside the engines we own, 2026-11-28). Every number found
+in the inventory (`docs/item26-inventory/gridcraft.md` in the platform) is now one of: refused in words, said in the answer,
+marked `AGREED LIMIT (owner, 2026-11-28)` with its reason, or removed.
+
+- **One answer rule** (rule 2) — `crates/mcp/src/answer_cap.rs`: an answer over 131,072 characters (sized as sent: escaped
+  length) is cut by structure, `result_truncated` says what was kept, and the whole answer is saved in the write root. A picture is
+  its own content block, outside the rule; an inline PDF too large for it is refused with the way to get it as a file. Reading
+  tools page by size instead: their continuation repeats nothing.
+- **Lists in answers** (rule 3) — `answer_cap::listed`: a tool that changes the workbook shows the first 25 items of each list
+  in its answer, with `<list>_total` and `<list>_note` naming the file that holds every one. Reading tools return what is asked.
+  The lists the engine capped itself without a word are no longer capped there (corrected formulas, warnings, recalculation
+  errors: the rule cuts them and says so) or show 25 with their count (unlocked ranges, undo and redo labels).
+- **read_range** (fault A8) — an answer larger than the rule is cut to the whole rows that fit, a row larger than it to the
+  cells that fit, a cell larger than it to the start of its text (`cell_cut`, which names `export_range` for the whole cell). The
+  answer names the part it holds (`range`), `next_range`, and after a row cut `then_range` — the rows after that row, which were
+  never named (an agent that followed `next_range` stopped at the end of the row). read_range takes no `continue_from`.
+- **Wrong input refused in words** (rule 1) — a parameter of the wrong type, a number out of its range, an unknown style or
+  preset, a cell or list past the sheet's edge, a sort key outside the range, an unknown file kind: refused with what was sent and
+  what is accepted; text sent for a number is refused ("send it without quotes"), never converted. A command call whose parameter
+  is not read is refused (`execute_command`: an unread top-level key, unless the command's help names it), and one that only opened
+  a dialog and changed nothing is refused and undone. `delete_sheet` and `delete_chart` need their target.
+- **Defaults said** (rule 4) — insert_chart answers where it put the chart and its size; an empty export answers
+  `written: false`; a narrowed read, a lazily opened file, a blank workbook, a CSV's encoding, separator and cut, a recalculation
+  cut at the nesting limit, a PDF cut at 2,000 pages, a script's skipped steps: each said in the answer.
+- **Faults fixed** — work lost to an eviction is said (`unsaved_work_lost`, `evicted`), never "saved"; open_workbook takes the
+  file's `password`; sheet-prefixed ranges honoured; formula chains deeper than 256 calculated bottom-first in both calculation
+  modes (an existing stack overflow at 2,000 levels); a request is never sent twice to a running app after it was sent; closing
+  unsaved work says so before the close.
+- **Timers, memory and necessary limits marked** (rules 5, 6) — every timer, memory budget and format limit carries its
+  `AGREED LIMIT` comment, and a timer that is hit is said (`job_status`, eviction, checkpoints). The CLI's flags refuse values
+  outside what works (`within()` in `apps/gridcraft-cli/src/main.rs`).
+- **Thresholds visible** (rule 7) — the Solver's ±100 bound is said in its answer; Goal Seek that stops short says the
+  Maximum Change and Maximum Iterations it ran with; the forecast answers the periods it made.
+- **The desktop** (rule 9 of the clone's list; the same rule here) — a failed AutoSave shows a message; the desktop's own caps
+  are marked.
+
+Tests: `tests/mcp-contract/contract.rs` `answer_size_rule_pages_reads_and_saves_the_rest`,
+`a_size_cut_read_range_names_the_rows_it_holds_and_skips_none`, `a_cut_row_names_the_rows_after_it_and_a_cut_cell_is_said`,
+`item26_arguments_do_what_they_say_or_are_refused`, `a_failed_auto_save_says_the_work_is_lost_and_refuses_the_save`;
+`crates/mcp/src/answer_cap.rs` tests; `crates/engine/src/cmd/print.rs` `hostile_settings_never_panic_and_cap_pages`; the
+recalculation depth tests in `crates/calc`.
