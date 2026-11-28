@@ -14,7 +14,7 @@
 use serde_json::{Map, Value, json};
 
 /// Arguments every tool accepts besides its own: the same in every craft app (CONTRACT-PARITY.md).
-pub const GLOBAL_ARGS: &[&str] = &["caller", "async", "overwrite", "continue_from", "max_bytes"];
+pub const GLOBAL_ARGS: &[&str] = &["caller", "async", "overwrite"];
 
 /// The error codes an agent can branch on: the same set in WordCraft, GridCraft and DeckCraft
 /// (CONTRACT-PARITY.md). Every error a tool answers carries one of these.

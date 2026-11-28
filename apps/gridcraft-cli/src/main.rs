@@ -64,11 +64,10 @@ const USAGE: &str = "usage:
   gridcraft-cli mcp [--connect PORT] [--in FILE | --sample NAME] [--author NAME]
                     [--automation-read-root DIR] [--automation-write-root DIR]
                     [--job-after-ms N (15000)] [--busy-after-ms N (300)] [--max-memory-mb N]
-                    [--idle-evict-secs N] [--open-job-mb N (20)] [--job-cells N] [--max-result-bytes N]
+                    [--idle-evict-secs N] [--open-job-mb N (20)] [--job-cells N]
                     [--max-read-cells N] [--checkpoint-edits N (20)] [--checkpoint-secs N (60)]
                     [--automation-no-old-copies]
-                     (the flag names WordCraft and DeckCraft take; the older --call-timeout-ms,
-                     --evict-idle-secs, --job-open-mb and --max-result-kb are still read)
+                     (the flag names WordCraft and DeckCraft take)
                      --automation-*-root confine every file the headless server reads/writes;
                      saves never replace an existing file silently (it becomes OLD_<name>);
                      --automation-no-old-copies turns OLD_ copies off (saves replace files:
@@ -674,17 +673,12 @@ fn mcp(args: &[String]) -> Result<(), String> {
             "automation-read-root",
             "automation-write-root",
             "author",
-            "call-timeout-ms",
             "job-after-ms",
             "busy-after-ms",
             "max-memory-mb",
-            "evict-idle-secs",
             "idle-evict-secs",
-            "job-open-mb",
             "open-job-mb",
             "job-cells",
-            "max-result-kb",
-            "max-result-bytes",
             "max-read-cells",
             "checkpoint-edits",
             "checkpoint-secs",
@@ -708,8 +702,7 @@ fn mcp(args: &[String]) -> Result<(), String> {
     // WHIQ: a supervisor that keeps the backups itself turns the OLD_ copies off.
     config.settings.old_copies = !a.has("automation-no-old-copies");
     // WHIQ parity pass: the flag names every craft app takes (older names still read).
-    let either = |a: &str, b: &str| -> Result<Option<f64>, String> { Ok(num(a)?.or(num(b)?)) };
-    if let Some(n) = either("job-after-ms", "call-timeout-ms")? {
+    if let Some(n) = num("job-after-ms")? {
         config.call_timeout = std::time::Duration::from_millis(n.max(10.0) as u64);
     }
     if let Some(n) = num("busy-after-ms")? {
@@ -727,20 +720,14 @@ fn mcp(args: &[String]) -> Result<(), String> {
     if swept > 0 {
         eprintln!("gridcraft-cli: removed {swept} stale spill file(s) from {}", gridcraft_engine::model::spill::spill_base().display());
     }
-    if let Some(n) = either("idle-evict-secs", "evict-idle-secs")? {
+    if let Some(n) = num("idle-evict-secs")? {
         config.idle_evict = Some(std::time::Duration::from_secs_f64(n.max(0.05)));
     }
-    if let Some(n) = either("open-job-mb", "job-open-mb")? {
+    if let Some(n) = num("open-job-mb")? {
         config.job_open_bytes = (n * 1024.0 * 1024.0) as u64;
-    }
-    if let Some(n) = num("max-result-bytes")? {
-        config.settings.max_result_bytes = (n as usize).max(1024);
     }
     if let Some(n) = num("job-cells")? {
         config.job_cells = n as u64;
-    }
-    if let Some(n) = num("max-result-kb")? {
-        config.settings.max_result_bytes = ((n * 1024.0) as usize).max(4096);
     }
     if let Some(n) = num("max-read-cells")? {
         config.settings.max_read_cells = (n as u64).max(1);

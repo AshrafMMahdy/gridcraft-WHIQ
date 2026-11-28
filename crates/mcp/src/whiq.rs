@@ -19,8 +19,6 @@ use crate::tools::{Args, Hints, ToolResult, check_arguments, exec, pick};
 pub struct Settings {
     /// `--author NAME`: who the work is done for, unless a call names its own `caller`.
     pub author: Option<String>,
-    /// Results above this many bytes of JSON are trimmed with a continue marker.
-    pub max_result_bytes: usize,
     /// read_range returns at most this many cells per call (the rest via `continue_from`).
     pub max_read_cells: u64,
     /// `GRIDCRAFT_MCP_TEST_HOOKS=1`: the `debug_sleep` / `debug_panic` tools exist (contract tests).
@@ -34,7 +32,6 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             author: None,
-            max_result_bytes: contract::MAX_RESULT_BYTES,
             max_read_cells: 10_000,
             test_hooks: test_hooks_from_env(),
             old_copies: true,
@@ -1086,6 +1083,7 @@ pub fn with_globals(mut tools: Vec<Value>) -> Vec<Value> {
         if let Some(files) = files_meta(&name) {
             t["_meta"] = json!({"whiq/files": files});
         }
+        let read_only = t["annotations"]["readOnlyHint"].as_bool() == Some(true);
         let Some(props) = t["inputSchema"]["properties"].as_object_mut() else { continue };
         props.insert(
             "caller".into(),
@@ -1094,10 +1092,22 @@ pub fn with_globals(mut tools: Vec<Value>) -> Vec<Value> {
         if !CONTROL_TOOLS.contains(&name.as_str()) {
             props
                 .insert("async".into(), boolean("Run as a job: answer at once with a job_id and poll job_status (default: automatic for long work)"));
-            if name != "read_range" {
-                props.entry("continue_from").or_insert(int("Where to resume a trimmed result (its continue_from)"));
+            // WHIQ (item 26): a read-only tool pages a long answer by size (continue_from; calling it again changes nothing). Any other
+            // tool's long answer is cut by structure and saved whole to a file (answer_cap): it takes no continue_from, as calling it
+            // again would repeat its changes.
+            if read_only {
+                props.entry("continue_from").or_insert(int(if name == "read_range" {
+                    "Where to resume a part cut by size (its numeric continue_from: the rows of the part already read)"
+                } else {
+                    "Where to resume an answer cut by size (its continue_from)"
+                }));
             }
-            props.entry("max_bytes").or_insert(int("Largest result to return before trimming (default --max-result-bytes)"));
+            if name == "export_markdown" {
+                props.insert(
+                    "max_bytes".into(),
+                    int("Largest page of Markdown to return (default and most: 131072, the answer-size rule; at least 1024)"),
+                );
+            }
         }
         if !CONTROL_TOOLS.contains(&name.as_str()) && !OPENS_DOCUMENT.contains(&name.as_str()) && !NEEDS_NO_DOCUMENT.contains(&name.as_str()) {
             props.insert(
@@ -1252,9 +1262,12 @@ pub fn run_tool(b: &mut dyn Backend, st: &mut CallState, name: &str, args: &Valu
             if let (Some(h), Some(o)) = (&handle, v.as_object_mut()) {
                 o.insert("document".into(), json!(h));
             }
-            let max = raw.get("max_bytes").and_then(Value::as_u64).map_or(st.settings.max_result_bytes, |m| (m as usize).clamp(1024, 64 << 20));
-            let from =
-                raw.get("continue_from").and_then(Value::as_u64).filter(|_| !def["inputSchema"]["properties"]["offset"].is_object()).unwrap_or(0);
+            let read_only = def["annotations"]["readOnlyHint"].as_bool() == Some(true);
+            let from = raw
+                .get("continue_from")
+                .and_then(Value::as_u64)
+                .filter(|_| read_only && !def["inputSchema"]["properties"]["offset"].is_object())
+                .unwrap_or(0);
             // WHIQ: a preview's HTML and a read's Markdown are paged by their tools (window,
             // max_bytes), not cut by the result trim; they also come as their own content block.
             let mut big = None;
@@ -1263,7 +1276,13 @@ pub fn run_tool(b: &mut dyn Backend, st: &mut CallState, name: &str, args: &Valu
             {
                 big = Some((key, t));
             }
-            let mut v = contract::trim_from(v, from as usize, max);
+            // WHIQ (item 26): the answer-size rule, the platform's (answer_cap). A read-only tool pages by size under it; any other
+            // tool's answer over it is cut by structure, the whole answer saved in the write root.
+            let mut v = if read_only {
+                contract::trim_from(v, from as usize, crate::answer_cap::MAX_ANSWER_CHARS)
+            } else {
+                crate::answer_cap::cap(v, name, b.roots().1.as_deref(), "")
+            };
             warnings.append(&mut st.notices);
             if !v.is_object() && (reports.iter().any(|r| r.previous_renamed_to.is_some()) || !warnings.is_empty()) {
                 v = json!({"result": v});
@@ -1563,7 +1582,20 @@ fn render_preview(b: &mut dyn Backend, st: &CallState, a: &Args) -> Result<Value
 /// export_markdown: the engine's `sheet.markdown`, paged by rows and bytes.
 fn export_markdown(b: &mut dyn Backend, st: &CallState, a: &Args) -> Result<Value, ToolError> {
     let mut p = pick(a, &["sheet", "continue_sheets", "row_start", "row_count", "col_start", "col_count", "formulas", "keep_empty_rows"]);
-    p["max_bytes"] = json!(a.get("max_bytes").and_then(Value::as_u64).map_or(st.settings.max_result_bytes as u64, |m| m.clamp(1024, 64 << 20)));
+    // a page size the answer-size rule can carry: 1,024 to 131,072, refused otherwise (it was clamped silently)
+    let most = crate::answer_cap::MAX_ANSWER_CHARS as u64;
+    let max_bytes = match a.get("max_bytes").and_then(Value::as_u64) {
+        None => most,
+        Some(m) if (1024..=most).contains(&m) => m,
+        Some(m) => {
+            return Err(ToolError::new(
+                "invalid_argument",
+                format!("max_bytes {m} is outside 1024..{most}"),
+                format!("give max_bytes from 1024 to {most} (the answer-size rule), or leave it out"),
+            ));
+        }
+    };
+    p["max_bytes"] = json!(max_bytes);
     let (mut v, file) = on_file(b, st, a, "export_markdown", |b| exec(b, "sheet.markdown", p).map_err(|e| classify(b, "export_markdown", a, &e)))?;
     if let Some(f) = file {
         v["document"] = f["document"].clone();
@@ -2345,7 +2377,7 @@ pub fn status_value(snap: Option<&DocSnapshot>, roots: (Option<PathBuf>, Option<
         "jobs": [],
         "recovered_files": [],
         "evicted": [],
-        "limits": {"max_result_bytes": settings.max_result_bytes, "max_read_cells": settings.max_read_cells, "old_copies": settings.old_copies},
+        "limits": {"max_answer_chars": crate::answer_cap::MAX_ANSWER_CHARS, "max_read_cells": settings.max_read_cells, "old_copies": settings.old_copies},
     });
     if let (Some(o), Value::Object(e)) = (v.as_object_mut(), extra) {
         for (k, x) in e {

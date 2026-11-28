@@ -453,7 +453,7 @@ impl Shared {
             "calls": self.calls.load(Ordering::Relaxed),
             "busy_replies": self.busy_replies.load(Ordering::Relaxed),
             "limits": {
-                "max_result_bytes": self.config.settings.max_result_bytes,
+                "max_answer_chars": crate::answer_cap::MAX_ANSWER_CHARS,
                 "max_read_cells": self.config.settings.max_read_cells,
                 "max_memory_mb": self.config.max_memory_bytes.map(|b| b / (1024 * 1024)),
                 "busy_after_ms": self.config.busy_grace.as_millis() as u64,

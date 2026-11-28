@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 mod backend;
+pub mod answer_cap;
 pub mod contract;
 mod headless;
 pub mod roundtrip;

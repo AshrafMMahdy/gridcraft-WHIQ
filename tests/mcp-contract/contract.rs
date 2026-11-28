@@ -234,22 +234,35 @@ fn oversized_results_are_trimmed() {
 
 // A result too big in bytes (whatever the tool) is cut to fit.
 #[test]
-fn byte_budget_trims_any_result() {
+fn answer_size_rule_pages_reads_and_saves_the_rest() {
+    // WHIQ (item 26): the platform's answer-size rule, 131,072 characters. A read-only tool pages a long answer by size
+    // (continue_from); a tool that changes the workbook has its answer cut by structure, the whole answer saved in the write
+    // root, and no continue_from (calling it again would repeat its changes).
     let dir = folder("bytes");
-    let mut m = start(&dir, &["--max-result-bytes", "8192"]);
+    let mut m = start(&dir, &[]);
+    // the whole command catalogue fits the rule: it comes whole; a part is read with offset / limit (continue_from too)
     let v = m.ok("list_commands", json!({}));
-    assert_eq!(v["truncated"], true, "{}", v.to_string().len());
-    assert!(v.to_string().len() < 9 * 1024);
-    let from = v["continue_from"].as_u64().unwrap();
-    let w = m.ok("list_commands", json!({"offset": from, "limit": 3}));
-    assert_eq!(w["offset"], from);
-    // `continue_from` passed back works as well (the shared continuation).
-    let w = m.ok("list_commands", json!({"continue_from": from, "limit": 3}));
-    assert_eq!(w["offset"], from);
-    // A per-call limit.
-    let small = m.ok("list_functions", json!({"max_bytes": 2048}));
-    assert_eq!(small["truncated"], true);
-    assert!(small.to_string().len() < 3 * 1024, "{}", small.to_string().len());
+    assert!(v.get("truncated").is_none_or(|t| t == false) && v.to_string().len() <= 131_072, "{}", v.to_string().len());
+    let w = m.ok("list_commands", json!({"offset": 10, "limit": 3}));
+    assert_eq!(w["offset"], 10);
+    assert_eq!(w["continue_from"], 13);
+    let w = m.ok("list_commands", json!({"continue_from": 13, "limit": 3}));
+    assert_eq!(w["offset"], 13);
+    // a batch of 4,000 writes: its results are over the rule
+    let ops: Vec<Value> = (1..=4000).map(|i| json!({"op": "set", "cell": format!("A{i}"), "input": format!("row {i} of the long batch")})).collect();
+    let r = m.ok("batch", json!({"ops": ops}));
+    let t = &r["result_truncated"];
+    assert!(t.is_object(), "{}", r.to_string().chars().take(300).collect::<String>());
+    assert!(r.get("continue_from").is_none() && r.get("truncated").is_none());
+    assert!(r.to_string().len() <= 131_072);
+    let path = std::path::PathBuf::from(t["full_result_path"].as_str().unwrap());
+    assert!(path.starts_with(&dir), "in the write root: {}", path.display());
+    let whole: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(whole.to_string().len() > 131_072);
+    assert!(t["note"].as_str().unwrap().contains("read the file for the rest"));
+    // the size knob and the shared max_bytes are gone; export_markdown's page size is refused outside 1024..131072
+    let e = m.err("export_markdown", json!({"max_bytes": 500_000}));
+    assert_eq!(e["code"], "invalid_argument", "{e}");
 }
 
 // 3. Eviction: the work is auto-saved inside the write root and the next call names it.
